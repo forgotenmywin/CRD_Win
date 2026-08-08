@@ -1,19 +1,28 @@
-name: Kaggle GPU Worker Test
+name: Kaggle GPU Worker Network Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  start-worker:
+  network-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
+
+      # ==========================================
+      # 1. Install Kaggle CLI
+      # ==========================================
 
       - name: Install Kaggle CLI
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade kaggle
           kaggle --version
+
+      # ==========================================
+      # 2. Kaggle authentication
+      # ==========================================
 
       - name: Configure Kaggle authentication
         env:
@@ -34,39 +43,51 @@ jobs:
 
           echo "Kaggle authentication configured."
 
-      - name: Verify Kaggle
-        run: |
-          kaggle competitions list --page-size 1
-          echo "Kaggle authentication OK."
+      # ==========================================
+      # 3. Verify Kaggle
+      # ==========================================
 
-      - name: Create GPU Worker
+      - name: Verify Kaggle API
+        run: |
+          set -euo pipefail
+
+          kaggle competitions list --page-size 1
+
+          echo "Kaggle API OK."
+
+      # ==========================================
+      # 4. Create Worker
+      # ==========================================
+
+      - name: Create Kaggle network worker
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
           set -euo pipefail
 
-          mkdir -p kaggle_worker
+          mkdir -p kaggle_network_worker
 
-          cat > kaggle_worker/worker.py <<'PY'
+          cat > kaggle_network_worker/worker.py <<'PY'
           import json
-          import os
           import socket
           import subprocess
           import time
+          import urllib.request
           from datetime import datetime, timezone
 
-          print("========================================")
-          print("       KAGGLE GPU WORKER TEST")
-          print("========================================")
+          print("==========================================")
+          print("      KAGGLE GPU NETWORK WORKER")
+          print("==========================================")
 
-          print("Hostname:", socket.gethostname())
-          print("PID:", os.getpid())
+          hostname = socket.gethostname()
 
-          # -----------------------------
-          # Check NVIDIA GPU
-          # -----------------------------
+          print("Hostname:", hostname)
 
-          print("\n=== GPU CHECK ===")
+          # ======================================
+          # GPU CHECK
+          # ======================================
+
+          print("\n=== GPU ===")
 
           smi = subprocess.run(
               [
@@ -82,17 +103,15 @@ jobs:
 
           if smi.returncode != 0:
               print("NVIDIA-SMI FAILED")
-              print(smi.stderr)
               raise SystemExit(1)
 
-          # -----------------------------
-          # CUDA
-          # -----------------------------
+          # ======================================
+          # CUDA CHECK
+          # ======================================
 
-          print("=== CUDA CHECK ===")
+          print("=== CUDA ===")
 
           from numba import cuda
-          import numpy as np
 
           if not cuda.is_available():
               print("CUDA NOT AVAILABLE")
@@ -107,125 +126,236 @@ jobs:
 
           print("CUDA GPU:", gpu_name)
 
-          # -----------------------------
-          # CUDA worker function
-          # -----------------------------
+          # ======================================
+          # INTERNET CHECK
+          # ======================================
 
-          @cuda.jit
-          def vector_add(a, b, c):
+          print("\n=== INTERNET CHECK ===")
 
-              i = cuda.grid(1)
+          urls = [
+              "https://www.google.com",
+              "https://api.github.com",
+              "https://www.kaggle.com"
+          ]
 
-              if i < c.size:
-                  c[i] = a[i] + b[i]
+          internet_results = []
 
-          # -----------------------------
-          # Prepare GPU memory
-          # -----------------------------
+          for url in urls:
 
-          N = 1 << 24
+              try:
 
-          a = np.ones(N, dtype=np.float32)
-          b = np.ones(N, dtype=np.float32)
+                  start = time.perf_counter()
 
-          d_a = cuda.to_device(a)
-          d_b = cuda.to_device(b)
-          d_c = cuda.device_array_like(a)
+                  request = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "Kaggle-GPU-Worker-Test"
+                      }
+                  )
 
-          threads = 256
-          blocks = (N + threads - 1) // threads
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=10
+                  ) as response:
 
-          print("\nGPU memory initialized.")
+                      status = response.status
 
-          # -----------------------------
-          # Worker loop
-          # -----------------------------
+                  latency = (
+                      time.perf_counter() - start
+                  ) * 1000
 
-          START = time.time()
+                  print(
+                      f"{url} -> "
+                      f"HTTP {status} "
+                      f"{latency:.2f} ms"
+                  )
 
-          MAX_RUNTIME = 600
+                  internet_results.append({
+                      "url": url,
+                      "status": status,
+                      "latency_ms": latency
+                  })
 
-          iteration = 0
+              except Exception as e:
 
-          print("\n========================================")
-          print("GPU WORKER STARTED")
-          print("Runtime:", MAX_RUNTIME, "seconds")
-          print("========================================")
+                  print(
+                      f"{url} -> ERROR: {e}"
+                  )
 
-          while True:
+                  internet_results.append({
+                      "url": url,
+                      "error": str(e)
+                  })
 
-              elapsed = time.time() - START
+          # ======================================
+          # PUBLIC IP
+          # ======================================
 
-              if elapsed >= MAX_RUNTIME:
-                  break
+          print("\n=== PUBLIC IP ===")
 
-              iteration += 1
+          public_ip = None
 
-              # GPU work
+          try:
 
               start = time.perf_counter()
 
-              vector_add[
-                  blocks,
-                  threads
-              ](
-                  d_a,
-                  d_b,
-                  d_c
-              )
+              with urllib.request.urlopen(
+                  "https://api.ipify.org",
+                  timeout=10
+              ) as response:
 
-              cuda.synchronize()
+                  public_ip = response.read().decode().strip()
 
-              gpu_time = (
-                  time.perf_counter() -
-                  start
+              latency = (
+                  time.perf_counter() - start
               ) * 1000
 
-              # Check GPU status
-
-              smi = subprocess.run(
-                  [
-                      "nvidia-smi",
-                      "--query-gpu=utilization.gpu,memory.used,temperature.gpu",
-                      "--format=csv,noheader"
-                  ],
-                  capture_output=True,
-                  text=True
+              print(
+                  "Public IP:",
+                  public_ip
               )
-
-              gpu_status = smi.stdout.strip()
 
               print(
-                  f"[Worker {iteration}] "
-                  f"elapsed={elapsed:.1f}s "
-                  f"GPU_compute={gpu_time:.3f}ms "
-                  f"status={gpu_status}"
+                  "IP request latency:",
+                  round(latency, 2),
+                  "ms"
               )
+
+          except Exception as e:
+
+              print(
+                  "Public IP ERROR:",
+                  e
+              )
+
+          # ======================================
+          # PERSISTENT OUTBOUND CONNECTION TEST
+          # ======================================
+
+          print("\n==========================================")
+          print("PERSISTENT CONNECTION TEST")
+          print("==========================================")
+
+          print(
+              "Worker will stay alive for 5 minutes."
+          )
+
+          print(
+              "Every 5 seconds an HTTPS request "
+              "will be made."
+          )
+
+          start_time = time.time()
+
+          max_runtime = 300
+
+          ping_count = 0
+
+          connection_results = []
+
+          while True:
+
+              elapsed = time.time() - start_time
+
+              if elapsed >= max_runtime:
+                  break
+
+              ping_count += 1
+
+              try:
+
+                  start = time.perf_counter()
+
+                  request = urllib.request.Request(
+                      "https://api.github.com",
+                      headers={
+                          "User-Agent":
+                          "Kaggle-GPU-Worker-Test"
+                      }
+                  )
+
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=10
+                  ) as response:
+
+                      status = response.status
+
+                  latency = (
+                      time.perf_counter() - start
+                  ) * 1000
+
+                  print(
+                      f"[PING {ping_count}] "
+                      f"HTTP {status} "
+                      f"latency={latency:.2f}ms "
+                      f"elapsed={elapsed:.1f}s"
+                  )
+
+                  connection_results.append({
+                      "ping": ping_count,
+                      "status": status,
+                      "latency_ms": latency,
+                      "elapsed_seconds": elapsed
+                  })
+
+              except Exception as e:
+
+                  print(
+                      f"[PING {ping_count}] "
+                      f"ERROR: {e}"
+                  )
+
+                  connection_results.append({
+                      "ping": ping_count,
+                      "error": str(e),
+                      "elapsed_seconds": elapsed
+                  })
 
               time.sleep(5)
 
-          # -----------------------------
-          # Finished
-          # -----------------------------
-
-          total_runtime = time.time() - START
+          # ======================================
+          # RESULT
+          # ======================================
 
           result = {
-              "worker": "kaggle_gpu_worker",
-              "hostname": socket.gethostname(),
-              "gpu": gpu_name,
-              "iterations": iteration,
-              "runtime_seconds": total_runtime,
-              "status": "WORKER_COMPLETED",
+
+              "worker":
+                  "kaggle_gpu_network_worker",
+
+              "hostname":
+                  hostname,
+
+              "gpu":
+                  gpu_name,
+
+              "public_ip":
+                  public_ip,
+
+              "internet_tests":
+                  internet_results,
+
+              "persistent_connection": {
+
+                  "runtime_seconds":
+                      time.time() - start_time,
+
+                  "ping_count":
+                      ping_count,
+
+                  "results":
+                      connection_results
+              },
+
               "finished_utc":
                   datetime.now(
                       timezone.utc
                   ).isoformat()
           }
 
-          print("\n========================================")
-          print("WORKER FINISHED")
-          print("========================================")
+          print("\n==========================================")
+          print("FINAL RESULT")
+          print("==========================================")
 
           print(
               json.dumps(
@@ -235,7 +365,7 @@ jobs:
           )
 
           with open(
-              "/kaggle/working/worker_result.json",
+              "/kaggle/working/network_result.json",
               "w"
           ) as f:
 
@@ -249,10 +379,14 @@ jobs:
 
           PY
 
-          cat > kaggle_worker/kernel-metadata.json <<EOF
+          # ======================================
+          # Kaggle metadata
+          # ======================================
+
+          cat > kaggle_network_worker/kernel-metadata.json <<EOF
           {
-            "id": "${KAGGLE_USERNAME}/gpu-worker-test",
-            "title": "GPU Worker Test",
+            "id": "${KAGGLE_USERNAME}/gpu-network-worker",
+            "title": "GPU Network Worker",
             "code_file": "worker.py",
             "language": "python",
             "kernel_type": "script",
@@ -267,16 +401,22 @@ jobs:
           }
           EOF
 
-      - name: Start GPU Worker on Kaggle
+      # ==========================================
+      # 5. Start Kaggle Worker
+      # ==========================================
+
+      - name: Start Kaggle GPU Worker
         run: |
           set -euo pipefail
 
-          echo "Starting Kaggle GPU Worker..."
-
           kaggle kernels push \
-            -p kaggle_worker \
+            -p kaggle_network_worker \
             --accelerator NvidiaTeslaP100 \
             --timeout 900
+
+      # ==========================================
+      # 6. Monitor Worker
+      # ==========================================
 
       - name: Monitor Worker
         env:
@@ -284,10 +424,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          KERNEL="${KAGGLE_USERNAME}/gpu-worker-test"
-
-          echo "Monitoring:"
-          echo "$KERNEL"
+          KERNEL="${KAGGLE_USERNAME}/gpu-network-worker"
 
           for i in $(seq 1 100); do
 
@@ -300,16 +437,14 @@ jobs:
 
             if echo "$STATUS" | grep -qi "COMPLETE"; then
 
-              echo ""
-              echo "WORKER COMPLETED."
+              echo "Worker completed."
               exit 0
 
             fi
 
             if echo "$STATUS" | grep -qi "ERROR"; then
 
-              echo ""
-              echo "WORKER FAILED."
+              echo "Worker failed."
               exit 1
 
             fi
@@ -321,28 +456,36 @@ jobs:
           echo "Monitor timeout."
           exit 1
 
-      - name: Download Worker Result
+      # ==========================================
+      # 7. Download result
+      # ==========================================
+
+      - name: Download network result
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
           set -euo pipefail
 
-          mkdir -p worker_output
+          mkdir -p network_output
 
           kaggle kernels output \
-            "${KAGGLE_USERNAME}/gpu-worker-test" \
-            -p worker_output \
+            "${KAGGLE_USERNAME}/gpu-network-worker" \
+            -p network_output \
             -o
 
           echo ""
-          echo "========================================"
-          echo "WORKER RESULT"
-          echo "========================================"
+          echo "=========================================="
+          echo "NETWORK RESULT"
+          echo "=========================================="
 
-          cat worker_output/worker_result.json
+          cat network_output/network_result.json
 
-      - name: Upload Worker Result
+      # ==========================================
+      # 8. Upload result
+      # ==========================================
+
+      - name: Upload network result
         uses: actions/upload-artifact@v4
         with:
-          name: kaggle-gpu-worker-result
-          path: worker_output/
+          name: kaggle-gpu-network-result
+          path: network_output/
