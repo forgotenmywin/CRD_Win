@@ -17,85 +17,104 @@ jobs:
           pip install --upgrade kaggle
           kaggle --version
 
-      - name: Configure Kaggle auth
+      - name: Create Kaggle benchmark files
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
           set -e
-          mkdir -p ~/.kaggle
-          cat > ~/.kaggle/kaggle.json <<EOF
-          {
-            "username": "${KAGGLE_USERNAME}",
-            "key": "${KAGGLE_API_TOKEN}"
-          }
-          EOF
-          chmod 600 ~/.kaggle/kaggle.json
-          echo "Kaggle auth configured."
 
-      - name: Create Kaggle benchmark notebook
-        run: |
-          set -e
           mkdir -p kaggle_test
 
           cat > kaggle_test/gpu_benchmark.py <<'PY'
           import json
-          import os
           import socket
           import subprocess
           import sys
           import time
           from datetime import datetime, timezone
 
-          OUT_FILE = "/kaggle/working/gpu_result.json"
+          OUTPUT = "/kaggle/working/gpu_result.json"
 
-          def sh(cmd):
-              return subprocess.run(cmd, capture_output=True, text=True)
-
-          def save(obj):
-              with open(OUT_FILE, "w") as f:
-                  json.dump(obj, f, indent=2)
-              print(json.dumps(obj, indent=2))
+          def run_cmd(cmd):
+              return subprocess.run(
+                  cmd,
+                  capture_output=True,
+                  text=True
+              )
 
           result = {
               "hostname": socket.gethostname(),
-              "utc_start": datetime.now(timezone.utc).isoformat(),
+              "start_time": datetime.now(timezone.utc).isoformat()
           }
 
-          print("=== NVIDIA-SMI ===")
-          smi = sh([
-              "bash", "-lc",
-              "nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw --format=csv,noheader"
+          print("================================")
+          print("KAGGLE GPU BENCHMARK")
+          print("================================")
+
+          # -------------------------
+          # NVIDIA GPU information
+          # -------------------------
+
+          print("\n=== NVIDIA-SMI ===")
+
+          smi = run_cmd([
+              "nvidia-smi",
+              "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw",
+              "--format=csv,noheader"
           ])
+
           print(smi.stdout)
-          print(smi.stderr)
+
+          if smi.stderr:
+              print(smi.stderr)
+
           result["nvidia_smi"] = smi.stdout.strip()
-          result["nvidia_smi_rc"] = smi.returncode
+          result["nvidia_smi_exit_code"] = smi.returncode
 
-          bench = {"backend": None}
+          # -------------------------
+          # CUDA benchmark with Numba
+          # -------------------------
 
-          # 1) Try Numba CUDA first (no heavy extra install needed if already present)
+          benchmark = {}
+
           try:
-              print("=== Numba CUDA benchmark ===")
+              print("\n=== CUDA / NUMBA TEST ===")
+
               from numba import cuda
               import numpy as np
 
-              bench["numba_present"] = True
-              bench["cuda_available"] = bool(cuda.is_available())
+              benchmark["numba_available"] = True
+              benchmark["cuda_available"] = bool(cuda.is_available())
 
               if not cuda.is_available():
-                  raise RuntimeError("numba.cuda.is_available() is False")
+                  raise RuntimeError(
+                      "Numba cannot access CUDA GPU"
+                  )
 
-              print("GPU name:", cuda.get_current_device().name.decode("utf-8"))
+              device = cuda.get_current_device()
+
+              gpu_name = device.name
+
+              if isinstance(gpu_name, bytes):
+                  gpu_name = gpu_name.decode()
+
+              print("GPU:", gpu_name)
 
               @cuda.jit
               def vector_add(a, b, c):
                   i = cuda.grid(1)
+
                   if i < c.size:
                       c[i] = a[i] + b[i]
 
-              n = 1 << 24  # 16,777,216 float32 elements
+              # 16 million float32 values
+              n = 1 << 24
+
+              # Number of repetitions
               repeats = 50
+
+              print("Elements:", n)
+              print("Repeats:", repeats)
 
               a = np.random.rand(n).astype(np.float32)
               b = np.random.rand(n).astype(np.float32)
@@ -108,94 +127,133 @@ jobs:
               blocks = (n + threads - 1) // threads
 
               # Warmup
-              vector_add[blocks, threads](d_a, d_b, d_c)
+              vector_add[blocks, threads](
+                  d_a,
+                  d_b,
+                  d_c
+              )
+
               cuda.synchronize()
 
-              start = cuda.event(timing=True)
-              end = cuda.event(timing=True)
+              start_event = cuda.event(timing=True)
+              end_event = cuda.event(timing=True)
 
-              t0 = time.perf_counter()
-              start.record()
+              wall_start = time.perf_counter()
+
+              start_event.record()
+
               for _ in range(repeats):
-                  vector_add[blocks, threads](d_a, d_b, d_c)
-              end.record()
-              end.synchronize()
-              total_wall_ms = (time.perf_counter() - t0) * 1000
+                  vector_add[blocks, threads](
+                      d_a,
+                      d_b,
+                      d_c
+                  )
 
-              kernel_ms = cuda.event_elapsed_time(start, end)
+              end_event.record()
 
-              # vector add reads 2 arrays and writes 1 array
-              bytes_moved = n * 4 * 3 * repeats
-              bandwidth_gbps = bytes_moved / (kernel_ms / 1000) / 1e9
+              end_event.synchronize()
 
-              bench.update({
-                  "backend": "numba",
-                  "gpu_name": cuda.get_current_device().name.decode("utf-8"),
-                  "elements": int(n),
-                  "repeats": int(repeats),
+              wall_end = time.perf_counter()
+
+              kernel_ms = cuda.event_elapsed_time(
+                  start_event,
+                  end_event
+              )
+
+              wall_ms = (
+                  wall_end - wall_start
+              ) * 1000
+
+              # 2 reads + 1 write
+              bytes_per_iteration = n * 4 * 3
+
+              total_bytes = (
+                  bytes_per_iteration * repeats
+              )
+
+              bandwidth_gbps = (
+                  total_bytes /
+                  (kernel_ms / 1000) /
+                  1e9
+              )
+
+              benchmark.update({
+                  "backend": "numba_cuda",
+                  "gpu_name": gpu_name,
+                  "elements": n,
+                  "repeats": repeats,
                   "kernel_ms": float(kernel_ms),
-                  "wall_ms": float(total_wall_ms),
-                  "effective_bandwidth_gbps": float(bandwidth_gbps),
+                  "wall_ms": float(wall_ms),
+                  "effective_bandwidth_gbps": float(
+                      bandwidth_gbps
+                  )
               })
 
-          except Exception as e_numba:
-              bench["numba_error"] = repr(e_numba)
+              print("\n=== BENCHMARK RESULT ===")
+              print(
+                  "GPU:",
+                  gpu_name
+              )
 
-              # 2) Fallback: CuPy matmul benchmark
-              try:
-                  print("=== CuPy benchmark ===")
-                  try:
-                      import cupy as cp
-                  except Exception:
-                      print("Installing cupy-cuda12x ...")
-                      subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", "cupy-cuda12x"])
-                      import cupy as cp
+              print(
+                  "Kernel time:",
+                  round(kernel_ms, 3),
+                  "ms"
+              )
 
-                  cp.cuda.Device(0).use()
-                  bench["cupy_present"] = True
+              print(
+                  "Wall time:",
+                  round(wall_ms, 3),
+                  "ms"
+              )
 
-                  n = 2048
-                  a = cp.random.random((n, n), dtype=cp.float32)
-                  b = cp.random.random((n, n), dtype=cp.float32)
+              print(
+                  "Effective bandwidth:",
+                  round(bandwidth_gbps, 2),
+                  "GB/s"
+              )
 
-                  # Warmup
-                  c = a @ b
-                  cp.cuda.Stream.null.synchronize()
+          except Exception as e:
+              print("\nCUDA benchmark failed:")
+              print(repr(e))
 
-                  start = cp.cuda.Event()
-                  end = cp.cuda.Event()
+              benchmark["backend"] = "failed"
+              benchmark["error"] = repr(e)
 
-                  t0 = time.perf_counter()
-                  start.record()
-                  c = a @ b
-                  end.record()
-                  end.synchronize()
-                  total_wall_ms = (time.perf_counter() - t0) * 1000
+          result["benchmark"] = benchmark
 
-                  kernel_ms = cp.cuda.get_elapsed_time(start, end)
-                  tflops = (2.0 * (n ** 3)) / (kernel_ms / 1000) / 1e12
+          result["end_time"] = (
+              datetime.now(timezone.utc).isoformat()
+          )
 
-                  bench.update({
-                      "backend": "cupy",
-                      "matmul_n": int(n),
-                      "kernel_ms": float(kernel_ms),
-                      "wall_ms": float(total_wall_ms),
-                      "effective_tflops": float(tflops),
-                  })
+          print("\n=== FINAL RESULT ===")
 
-              except Exception as e_cupy:
-                  bench["cupy_error"] = repr(e_cupy)
-                  bench["backend"] = "failed"
+          print(
+              json.dumps(
+                  result,
+                  indent=2
+              )
+          )
 
-          result["benchmark"] = bench
-          result["utc_end"] = datetime.now(timezone.utc).isoformat()
+          with open(
+              OUTPUT,
+              "w"
+          ) as f:
+              json.dump(
+                  result,
+                  f,
+                  indent=2
+              )
 
-          save(result)
+          print(
+              "\nSaved:",
+              OUTPUT
+          )
           PY
 
-          cat > kaggle_test/kernel-metadata.json <<'JSON'
+          cat > kaggle_test/kernel-metadata.json <<EOF
           {
-            "id": "darytredf/github-gpu-benchmark",
+            "id": "${KAGGLE_USERNAME}/github-gpu-benchmark",
             "title": "GitHub GPU Benchmark",
             "code_file": "gpu_benchmark.py",
             "language": "python",
@@ -209,65 +267,106 @@ jobs:
             "kernel_sources": [],
             "model_sources": []
           }
-          JSON
+          EOF
 
-          echo "Created Kaggle benchmark files."
+          echo "Kaggle files created."
 
-      - name: Push notebook to Kaggle
+      - name: Push benchmark to Kaggle
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
           set -e
+
+          echo "Testing Kaggle authentication..."
+
+          kaggle kernels list \
+            --search "github-gpu-benchmark" \
+            --page-size 1
+
+          echo "Authentication OK."
+
           START=$(date +%s%3N)
 
           kaggle kernels push \
-            -p kaggle_test \
-            --accelerator NvidiaTeslaP100 \
-            -t 3600
+            -p kaggle_test
 
           END=$(date +%s%3N)
-          echo "Push command time: $((END - START)) ms"
 
-      - name: Wait for Kaggle completion
+          echo "Push request time: $((END - START)) ms"
+
+      - name: Wait for Kaggle GPU
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
           set -e
 
-          KERNEL_REF="darytredf/github-gpu-benchmark"
-          echo "Waiting for $KERNEL_REF ..."
+          KERNEL="${KAGGLE_USERNAME}/github-gpu-benchmark"
+
+          echo "Waiting for:"
+          echo "$KERNEL"
 
           for i in $(seq 1 90); do
-            STATUS=$(kaggle kernels status "$KERNEL_REF" 2>&1 || true)
-            echo "Check $i/90: $STATUS"
+
+            STATUS=$(kaggle kernels status "$KERNEL" 2>&1 || true)
+
+            echo "Check $i/90"
+            echo "$STATUS"
 
             if echo "$STATUS" | grep -qi "COMPLETE"; then
-              echo "Kaggle job completed."
-              break
+              echo "Kaggle GPU job completed."
+              exit 0
             fi
 
             if echo "$STATUS" | grep -qi "ERROR"; then
-              echo "Kaggle job failed."
+              echo "Kaggle GPU job failed."
               exit 1
             fi
 
             sleep 10
+
           done
 
-      - name: Download output
+          echo "Timeout waiting for Kaggle."
+          exit 1
+
+      - name: Download GPU result
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
           set -e
+
           mkdir -p kaggle_output
 
-          kaggle kernels output darytredf/github-gpu-benchmark -p kaggle_output -o
+          KERNEL="${KAGGLE_USERNAME}/github-gpu-benchmark"
 
-          echo "=== Output files ==="
-          find kaggle_output -maxdepth 2 -type f -print
+          kaggle kernels output \
+            "$KERNEL" \
+            -p kaggle_output \
+            -o
+
+          echo "================================"
+          echo "KAGGLE OUTPUT"
+          echo "================================"
+
+          find kaggle_output \
+            -maxdepth 2 \
+            -type f \
+            -print
 
           echo
-          echo "=== gpu_result.json ==="
-          cat kaggle_output/gpu_result.json
+          echo "================================"
+          echo "GPU RESULT"
+          echo "================================"
 
-      - name: Upload artifacts
+          if [ -f kaggle_output/gpu_result.json ]; then
+            cat kaggle_output/gpu_result.json
+          else
+            echo "gpu_result.json not found!"
+            exit 1
+          fi
+
+      - name: Upload benchmark result
         uses: actions/upload-artifact@v4
         with:
-          name: kaggle-gpu-benchmark-output
+          name: kaggle-gpu-benchmark-result
           path: kaggle_output/
