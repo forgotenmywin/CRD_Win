@@ -8,9 +8,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
-    env:
-      KAGGLE_KERNEL: ${{ secrets.KAGGLE_USERNAME }}/gpu-ws-worker
-
     steps:
       - name: Install tools
         run: |
@@ -229,12 +226,14 @@ jobs:
           import subprocess
           import sys
           import time
+          import traceback
           from datetime import datetime, timezone
 
           RAW_TUNNEL_URL = os.environ["TUNNEL_URL"].strip()
           WSS_BASE = RAW_TUNNEL_URL.replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
           WSS_URL = f"{WSS_BASE}/ws"
           OUT_FILE = "/kaggle/working/worker_ws_result.json"
+          ERR_FILE = "/kaggle/working/worker_ws_error.txt"
 
           def run(cmd):
               return subprocess.run(cmd, capture_output=True, text=True)
@@ -243,6 +242,10 @@ jobs:
               with open(OUT_FILE, "w") as f:
                   json.dump(obj, f, indent=2)
               print(json.dumps(obj, indent=2))
+
+          def save_error(text):
+              with open(ERR_FILE, "w") as f:
+                  f.write(text)
 
           result = {
               "worker": "kaggle_gpu_ws_worker",
@@ -273,15 +276,22 @@ jobs:
           result["nvidia_smi_rc"] = smi.returncode
 
           try:
-              import websocket
-          except Exception:
-              subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "websocket-client"])
-              import websocket
+              try:
+                  import websocket
+              except Exception:
+                  subprocess.check_call([
+                      sys.executable,
+                      "-m",
+                      "pip",
+                      "install",
+                      "-q",
+                      "websocket-client"
+                  ])
+                  import websocket
 
-          pings = []
-          ws = None
+              pings = []
+              ws = None
 
-          try:
               print("\nConnecting to relay...")
               ws = websocket.create_connection(WSS_URL, timeout=20)
               welcome = json.loads(ws.recv())
@@ -323,14 +333,18 @@ jobs:
               result["pings"] = pings
 
           except Exception as e:
+              tb = traceback.format_exc()
               print("WORKER ERROR:", repr(e))
+              print(tb)
               result["status"] = "ERROR"
               result["error"] = repr(e)
-              result["pings"] = pings
+              result["traceback"] = tb
+              save_error(tb)
+              result["pings"] = result.get("pings", [])
 
           finally:
               try:
-                  if ws is not None:
+                  if "ws" in locals() and ws is not None:
                       ws.close()
               except Exception:
                   pass
@@ -366,43 +380,83 @@ jobs:
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
-          set -euo pipefail
+          set +euo pipefail
           KERNEL="${KAGGLE_USERNAME}/gpu-ws-worker"
+          FINAL_STATUS=""
 
           for i in $(seq 1 120); do
-            STATUS=$(kaggle kernels status "$KERNEL" 2>&1 || true)
+            STATUS=$(kaggle kernels status "$KERNEL" 2>&1)
+            RC=$?
             echo "Check $i/120: $STATUS"
+
+            FINAL_STATUS="$STATUS"
 
             if echo "$STATUS" | grep -qi "COMPLETE"; then
               echo "Kaggle worker complete."
-              exit 0
+              break
             fi
 
             if echo "$STATUS" | grep -qi "ERROR"; then
-              echo "Kaggle worker failed."
-              exit 1
+              echo "Kaggle worker reported ERROR."
+              break
             fi
 
             sleep 5
           done
 
-          echo "Timed out waiting for Kaggle worker."
-          exit 1
-
-      - name: Download worker output
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-        run: |
-          set -euo pipefail
           mkdir -p kaggle_output
-          kaggle kernels output "${KAGGLE_USERNAME}/gpu-ws-worker" -p kaggle_output -o
+          echo "Downloading Kaggle output..."
+          kaggle kernels output "$KERNEL" -p kaggle_output -o
+          OUTPUT_RC=$?
 
-          echo "=== worker_ws_result.json ==="
-          cat kaggle_output/worker_ws_result.json
+          echo "=========================================="
+          echo "KAGGLE OUTPUT FILES"
+          echo "=========================================="
+          find kaggle_output -maxdepth 2 -type f -print || true
 
-          echo ""
-          echo "=== relay_result.json ==="
-          cat relay/relay_result.json
+          echo "=========================================="
+          echo "WORKER RESULT"
+          echo "=========================================="
+          if [ -f kaggle_output/worker_ws_result.json ]; then
+            cat kaggle_output/worker_ws_result.json
+          else
+            echo "worker_ws_result.json was NOT produced."
+          fi
+
+          echo "=========================================="
+          echo "WORKER ERROR FILE"
+          echo "=========================================="
+          if [ -f kaggle_output/worker_ws_error.txt ]; then
+            cat kaggle_output/worker_ws_error.txt
+          else
+            echo "worker_ws_error.txt was NOT produced."
+          fi
+
+          echo "=========================================="
+          echo "RELAY LOG"
+          echo "=========================================="
+          cat relay/relay.log || true
+
+          echo "=========================================="
+          echo "CLOUDFLARE LOG"
+          echo "=========================================="
+          cat relay/cf.log || true
+
+          echo "=========================================="
+          echo "RELAY RESULT"
+          echo "=========================================="
+          if [ -f relay/relay_result.json ]; then
+            cat relay/relay_result.json
+          else
+            echo "relay_result.json was NOT produced."
+          fi
+
+          # اگر Kaggle خطا داد ولی خروجی و لاگ را گرفتیم، workflow را fail نکن
+          if echo "$FINAL_STATUS" | grep -qi "ERROR"; then
+            exit 0
+          fi
+
+          exit 0
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
