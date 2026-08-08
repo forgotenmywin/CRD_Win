@@ -1,25 +1,34 @@
-name: CI
+name: Kaggle API Latency Test
 
-on: [push, workflow_dispatch]
+on:
+  workflow_dispatch:
 
 jobs:
-  build:
-
-    runs-on: windows-latest
+  test:
+    runs-on: ubuntu-latest
 
     steps:
-    - name: Download
-      run: Invoke-WebRequest https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi -OutFile crd.msi
-    - name: Run
-      run: ./crd.msi
-    - name: Launching CRD
-      run: $Env:CRD_KEY
-      env:
-        CRD_KEY: ${{ secrets.CRD_KEY }}
-    - name: Enable TS
-      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server'-name "fDenyTSConnections" -Value 0
-    - run: Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-    - run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
-    - run: Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "ABC123!" -Force)
-      
-    
+      - name: Test Kaggle API
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          echo "Testing connection to Kaggle API..."
+
+          START=$(date +%s%3N)
+
+          HTTP_CODE=$(curl -sS \
+            -o /tmp/kaggle_response.json \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer $KAGGLE_API_TOKEN" \
+            https://www.kaggle.com/api/v1/datasets/list?pageSize=1)
+
+          END=$(date +%s%3N)
+
+          LATENCY=$((END - START))
+
+          echo "HTTP status: $HTTP_CODE"
+          echo "API latency: ${LATENCY} ms"
+
+          echo "Response:"
+          head -c 500 /tmp/kaggle_response.json
+          echo
