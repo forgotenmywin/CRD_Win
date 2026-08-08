@@ -1,34 +1,173 @@
-name: Kaggle API Latency Test
+name: GitHub to Kaggle GPU Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  kaggle-gpu-test:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test Kaggle API
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Kaggle CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade kaggle
+          kaggle --version
+
+      - name: Prepare Kaggle GPU test
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
-          echo "Testing connection to Kaggle API..."
+          set -e
+
+          mkdir -p kaggle_test
+
+          cat > kaggle_test/gpu_test.py <<'PY'
+          import subprocess
+          import time
+          import json
+          import os
+          import socket
+
+          start = time.perf_counter()
+
+          print("=== KAGGLE GPU TEST ===")
+          print("Hostname:", socket.gethostname())
+          print()
+
+          print("=== NVIDIA-SMI ===")
+
+          smi_start = time.perf_counter()
+
+          result = subprocess.run(
+              [
+                  "nvidia-smi",
+                  "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu",
+                  "--format=csv,noheader"
+              ],
+              capture_output=True,
+              text=True
+          )
+
+          smi_time = (time.perf_counter() - smi_start) * 1000
+
+          print(result.stdout)
+
+          print("nvidia-smi exit code:", result.returncode)
+          print("nvidia-smi execution time:", round(smi_time, 2), "ms")
+
+          gpu_name = result.stdout.strip()
+
+          output = {
+              "gpu": gpu_name,
+              "smi_time_ms": smi_time,
+              "total_time_ms": (time.perf_counter() - start) * 1000
+          }
+
+          with open("/kaggle/working/gpu_result.json", "w") as f:
+              json.dump(output, f, indent=2)
+
+          print()
+          print("=== RESULT ===")
+          print(json.dumps(output, indent=2))
+
+          PY
+
+          cat > kaggle_test/kernel-metadata.json <<EOF
+          {
+            "id": "${KAGGLE_USERNAME}/github-gpu-test",
+            "title": "GitHub GPU Test",
+            "code_file": "gpu_test.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": true,
+            "enable_gpu": true,
+            "enable_tpu": false,
+            "enable_internet": true,
+            "dataset_sources": [],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "model_sources": []
+          }
+          EOF
+
+          echo "=== METADATA ==="
+          cat kaggle_test/kernel-metadata.json
+
+      - name: Push GPU job to Kaggle
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        run: |
+          set -e
 
           START=$(date +%s%3N)
 
-          HTTP_CODE=$(curl -sS \
-            -o /tmp/kaggle_response.json \
-            -w "%{http_code}" \
-            -H "Authorization: Bearer $KAGGLE_API_TOKEN" \
-            https://www.kaggle.com/api/v1/datasets/list?pageSize=1)
+          kaggle kernels push \
+            -p kaggle_test \
+            --accelerator NvidiaTeslaP100
 
-          END=$(date +%s%3N)
+          PUSH_END=$(date +%s%3N)
 
-          LATENCY=$((END - START))
+          echo "Kaggle push request time: $((PUSH_END - START)) ms"
 
-          echo "HTTP status: $HTTP_CODE"
-          echo "API latency: ${LATENCY} ms"
+      - name: Wait for Kaggle GPU job
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        run: |
+          set -e
 
-          echo "Response:"
-          head -c 500 /tmp/kaggle_response.json
+          echo "Waiting for Kaggle..."
+
+          for i in $(seq 1 60); do
+
+            echo "Check $i/60"
+
+            STATUS=$(kaggle kernels status \
+              "${KAGGLE_USERNAME}/github-gpu-test" 2>&1 || true)
+
+            echo "$STATUS"
+
+            if echo "$STATUS" | grep -qi "complete"; then
+              echo "Kaggle job completed."
+              break
+            fi
+
+            if echo "$STATUS" | grep -qi "error"; then
+              echo "Kaggle job reported an error."
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+      - name: Download Kaggle GPU result
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        run: |
+          set -e
+
+          mkdir -p kaggle_output
+
+          kaggle kernels output \
+            "${KAGGLE_USERNAME}/github-gpu-test" \
+            -p kaggle_output \
+            --force
+
+          echo "=== KAGGLE OUTPUT FILES ==="
+          find kaggle_output -type f -maxdepth 2 -print
+
           echo
+          echo "=== GPU RESULT ==="
+
+          if [ -f kaggle_output/gpu_result.json ]; then
+            cat kaggle_output/gpu_result.json
+          else
+            echo "gpu_result.json was not found."
+          fi
