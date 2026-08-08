@@ -222,7 +222,7 @@ jobs:
           set -euo pipefail
           mkdir -p kaggle_ws_worker
 
-          cat > kaggle_ws_worker/worker.py <<PY
+          cat > kaggle_ws_worker/worker.py <<'PY'
           import json
           import os
           import socket
@@ -231,7 +231,9 @@ jobs:
           import time
           from datetime import datetime, timezone
 
-          WSS_URL = "${TUNNEL_URL}/ws"
+          RAW_TUNNEL_URL = os.environ["TUNNEL_URL"].strip()
+          WSS_BASE = RAW_TUNNEL_URL.replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
+          WSS_URL = f"{WSS_BASE}/ws"
           OUT_FILE = "/kaggle/working/worker_ws_result.json"
 
           def run(cmd):
@@ -245,6 +247,7 @@ jobs:
           result = {
               "worker": "kaggle_gpu_ws_worker",
               "hostname": socket.gethostname(),
+              "raw_tunnel_url": RAW_TUNNEL_URL,
               "wss_url": WSS_URL,
               "start_utc": datetime.now(timezone.utc).isoformat(),
           }
@@ -252,6 +255,7 @@ jobs:
           print("==========================================")
           print("      KAGGLE GPU WS WORKER")
           print("==========================================")
+          print("RAW TUNNEL URL:", RAW_TUNNEL_URL)
           print("WSS URL:", WSS_URL)
 
           smi = run([
