@@ -219,7 +219,7 @@ jobs:
           set -euo pipefail
           mkdir -p kaggle_ws_worker
 
-          cat > kaggle_ws_worker/worker.py <<'PY'
+          cat > kaggle_ws_worker/worker.py <<PY
           import json
           import os
           import socket
@@ -229,7 +229,7 @@ jobs:
           import traceback
           from datetime import datetime, timezone
 
-          RAW_TUNNEL_URL = os.environ["TUNNEL_URL"].strip()
+          RAW_TUNNEL_URL = "${TUNNEL_URL}".strip()
           WSS_BASE = RAW_TUNNEL_URL.replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
           WSS_URL = f"{WSS_BASE}/ws"
           OUT_FILE = "/kaggle/working/worker_ws_result.json"
@@ -382,14 +382,10 @@ jobs:
         run: |
           set +euo pipefail
           KERNEL="${KAGGLE_USERNAME}/gpu-ws-worker"
-          FINAL_STATUS=""
 
           for i in $(seq 1 120); do
             STATUS=$(kaggle kernels status "$KERNEL" 2>&1)
-            RC=$?
             echo "Check $i/120: $STATUS"
-
-            FINAL_STATUS="$STATUS"
 
             if echo "$STATUS" | grep -qi "COMPLETE"; then
               echo "Kaggle worker complete."
@@ -407,7 +403,6 @@ jobs:
           mkdir -p kaggle_output
           echo "Downloading Kaggle output..."
           kaggle kernels output "$KERNEL" -p kaggle_output -o
-          OUTPUT_RC=$?
 
           echo "=========================================="
           echo "KAGGLE OUTPUT FILES"
@@ -449,11 +444,6 @@ jobs:
             cat relay/relay_result.json
           else
             echo "relay_result.json was NOT produced."
-          fi
-
-          # اگر Kaggle خطا داد ولی خروجی و لاگ را گرفتیم، workflow را fail نکن
-          if echo "$FINAL_STATUS" | grep -qi "ERROR"; then
-            exit 0
           fi
 
           exit 0
