@@ -1,16 +1,10 @@
-name: Kaggle GPU Worker - Real-Time GPU Queue v7
+name: Kaggle GPU Worker - Real-Time GPU Queue v8
 
 on:
   workflow_dispatch:
-    inputs:
-      worker_count:
-        description: "Number of Kaggle GPU workers"
-        required: false
-        default: "2"
-      job_count:
-        description: "Number of GPU jobs"
-        required: false
-        default: "100"
+
+permissions:
+  contents: read
 
 jobs:
   relay:
@@ -20,12 +14,19 @@ jobs:
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      GPU_WORKER_TOKEN: ${{ secrets.GPU_WORKER_TOKEN }}
 
-      WORKER_COUNT: ${{ inputs.worker_count }}
-      JOB_COUNT: ${{ inputs.job_count }}
+      # تعداد Workerهای همزمان
+      WORKER_COUNT: "2"
 
-      RELAY_HOST: "127.0.0.1"
-      RELAY_PORT: "8765"
+      # تعداد Job
+      JOB_COUNT: "100"
+
+      # زمان انتظار اتصال Worker
+      WORKER_CONNECT_TIMEOUT: "180"
+
+      # زمان کل Queue
+      QUEUE_TIMEOUT: "600"
 
     steps:
 
@@ -58,30 +59,54 @@ jobs:
           python3 -m pip install --upgrade pip
 
           python3 -m pip install \
-            --upgrade \
             kaggle \
             websockets \
-            websocket-client
+            websocket-client \
+            aiohttp
 
 
       # ============================================================
-      # KAGGLE AUTH
+      # CHECK SECRETS
       # ============================================================
 
-      - name: Configure Kaggle authentication
+      - name: Check secrets
+        shell: bash
+        run: |
+          set -u
+
+          test -n "${KAGGLE_USERNAME:-}" || {
+            echo "ERROR: KAGGLE_USERNAME is missing"
+            exit 1
+          }
+
+          test -n "${KAGGLE_API_TOKEN:-}" || {
+            echo "ERROR: KAGGLE_API_TOKEN is missing"
+            exit 1
+          }
+
+          test -n "${GPU_WORKER_TOKEN:-}" || {
+            echo "ERROR: GPU_WORKER_TOKEN is missing"
+            exit 1
+          }
+
+          echo "Secrets are present."
+
+
+      # ============================================================
+      # KAGGLE CONFIG
+      # ============================================================
+
+      - name: Configure Kaggle
         shell: bash
         run: |
           set -euxo pipefail
-
-          test -n "$KAGGLE_USERNAME"
-          test -n "$KAGGLE_API_TOKEN"
 
           mkdir -p "$HOME/.kaggle"
 
           cat > "$HOME/.kaggle/kaggle.json" <<EOF
           {
-            "username": "$KAGGLE_USERNAME",
-            "key": "$KAGGLE_API_TOKEN"
+            "username": "${KAGGLE_USERNAME}",
+            "key": "${KAGGLE_API_TOKEN}"
           }
           EOF
 
@@ -89,15 +114,43 @@ jobs:
 
           kaggle --version
 
+          kaggle kernels list \
+            --user "$KAGGLE_USERNAME" \
+            --page-size 1 || true
+
+
+      # ============================================================
+      # CLOUDFLARED
+      # ============================================================
+
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          curl -fL \
+            --retry 5 \
+            --retry-delay 2 \
+            -o cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+
+          chmod +x cloudflared
+
+          sudo install \
+            -m 0755 \
+            cloudflared \
+            /usr/local/bin/cloudflared
+
+          cloudflared --version
+
 
       # ============================================================
       # CREATE RELAY
       # ============================================================
 
-      - name: Create Real-Time GPU Relay
+      - name: Create relay
         shell: bash
         run: |
-
           set -euxo pipefail
 
           cat > relay.py <<'PY'
@@ -106,20 +159,99 @@ jobs:
           import json
           import os
           import time
+          import traceback
           import uuid
           from datetime import datetime, timezone
 
           import websockets
 
 
-          HOST = os.getenv("RELAY_HOST", "127.0.0.1")
-          PORT = int(os.getenv("RELAY_PORT", "8765"))
+          HOST = "127.0.0.1"
+          PORT = 8765
 
-          JOB_COUNT = int(os.getenv("JOB_COUNT", "100"))
+          AUTH_TOKEN = os.environ["GPU_WORKER_TOKEN"]
 
-          HEARTBEAT_TIMEOUT = 45
-          JOB_TIMEOUT = 120
-          MAX_RETRIES = 3
+          JOB_COUNT = int(
+              os.environ.get("JOB_COUNT", "100")
+          )
+
+          WORKER_COUNT = int(
+              os.environ.get("WORKER_COUNT", "2")
+          )
+
+
+          # ==========================================================
+          # TIME
+          # ==========================================================
+
+          def now():
+
+              return datetime.now(
+                  timezone.utc
+              ).isoformat()
+
+
+          def mono():
+
+              return time.perf_counter()
+
+
+          # ==========================================================
+          # JOB CREATION
+          # ==========================================================
+
+          def create_jobs():
+
+              jobs = []
+
+              for i in range(1, JOB_COUNT + 1):
+
+                  # چند نوع Job برای تست واقعی‌تر
+                  mode = i % 4
+
+                  if mode == 0:
+
+                      job = {
+                          "job_id": i,
+                          "type": "gpu_job",
+                          "operation": "vector_add",
+                          "n": 4 * 1024 * 1024,
+                          "repeats": 20
+                      }
+
+                  elif mode == 1:
+
+                      job = {
+                          "job_id": i,
+                          "type": "gpu_job",
+                          "operation": "matrix_multiply",
+                          "matrix_size": 2048
+                      }
+
+                  elif mode == 2:
+
+                      job = {
+                          "job_id": i,
+                          "type": "gpu_job",
+                          "operation": "matrix_multiply",
+                          "matrix_size": 3072
+                      }
+
+                  else:
+
+                      job = {
+                          "job_id": i,
+                          "type": "gpu_job",
+                          "operation": "large_transfer",
+                          "elements": 16 * 1024 * 1024
+                      }
+
+                  jobs.append(job)
+
+              return jobs
+
+
+          JOBS = create_jobs()
 
 
           # ==========================================================
@@ -127,15 +259,16 @@ jobs:
           # ==========================================================
 
           state = {
-              "started_utc": datetime.now(timezone.utc).isoformat(),
+
+              "started_utc": now(),
 
               "connections_total": 0,
 
               "workers_alive": 0,
 
-              "jobs_total": JOB_COUNT,
+              "jobs_total": len(JOBS),
 
-              "jobs_queued": JOB_COUNT,
+              "jobs_queued": len(JOBS),
 
               "jobs_sent": 0,
 
@@ -154,41 +287,57 @@ jobs:
               "workers": {},
 
               "results": []
+
           }
 
 
+          lock = asyncio.Lock()
+
+          jobs_by_id = {
+              j["job_id"]: j
+              for j in JOBS
+          }
+
+          pending_jobs = asyncio.Queue()
+
+          running_jobs = {}
+
           workers = {}
-
-          jobs = {}
-
-          queue = asyncio.Queue()
 
           finished = asyncio.Event()
 
-          lock = asyncio.Lock()
-
 
           # ==========================================================
-          # TIME
+          # LOG
           # ==========================================================
 
-          def now():
-              return datetime.now(timezone.utc).isoformat()
+          def record(kind, **data):
 
+              state["events"].append({
 
-          def timestamp():
-              return time.time()
+                  "kind": kind,
 
+                  "at_utc": now(),
 
-          # ==========================================================
-          # SAVE
-          # ==========================================================
+                  **data
+
+              })
+
+              if len(state["events"]) > 1000:
+
+                  state["events"] = \
+                      state["events"][-1000:]
+
 
           def save():
 
-              tmp = "relay_result.json.tmp"
+              tmp = "relay_result.tmp"
 
-              with open(tmp, "w", encoding="utf-8") as f:
+              with open(
+                  tmp,
+                  "w",
+                  encoding="utf-8"
+              ) as f:
 
                   json.dump(
                       state,
@@ -204,327 +353,285 @@ jobs:
 
 
           # ==========================================================
-          # EVENTS
+          # JOB QUEUE
           # ==========================================================
 
-          def event(kind, **data):
+          async def initialize_queue():
 
-              state["events"].append({
-                  "kind": kind,
-                  "at_utc": now(),
-                  **data
-              })
+              for job in JOBS:
 
-              if len(state["events"]) > 1000:
-
-                  state["events"] = \
-                      state["events"][-1000:]
-
-              save()
-
-
-          # ==========================================================
-          # CREATE JOBS
-          # ==========================================================
-
-          def create_jobs():
-
-              for i in range(1, JOB_COUNT + 1):
-
-                  job = {
-                      "job_id": i,
-
-                      "type": "gpu_job",
-
-                      "benchmark": "matrix_multiply",
-
-                      "size": 2048,
-
-                      "repeats": 5,
-
-                      "created_utc": now(),
-
-                      "attempt": 0,
-
-                      "status": "queued"
-                  }
-
-                  jobs[i] = job
-
-                  queue.put_nowait(i)
+                  await pending_jobs.put(job)
 
 
           # ==========================================================
           # SEND JOB
           # ==========================================================
 
-          async def send_job(worker):
+          async def send_job(worker, job):
 
-              if worker["busy"]:
+              job_id = job["job_id"]
 
-                  return False
+              request_id = str(
+                  uuid.uuid4()
+              )
 
+              packet = dict(job)
 
-              try:
+              packet["request_id"] = request_id
 
-                  job_id = await asyncio.wait_for(
-                      queue.get(),
-                      timeout=1
-                  )
+              packet["sent_relay_mono"] = mono()
 
-              except asyncio.TimeoutError:
+              packet["sent_relay_utc"] = now()
 
-                  return False
+              await worker["ws"].send(
+                  json.dumps(packet)
+              )
 
+              running_jobs[job_id] = {
 
-              job = jobs.get(job_id)
+                  "job": job,
 
-              if not job:
+                  "worker_id":
+                      worker["worker_id"],
 
-                  return False
+                  "request_id":
+                      request_id,
 
+                  "sent_mono":
+                      mono(),
 
-              job["attempt"] += 1
+                  "attempt":
+                      job.get("_attempt", 1)
 
-              job["status"] = "running"
-
-              job["worker_id"] = worker["id"]
-
-              job["sent_utc"] = now()
-
-              job["sent_timestamp"] = timestamp()
-
-
-              message = dict(job)
-
-              message["type"] = "gpu_job"
-
-
-              try:
-
-                  await worker["ws"].send(
-                      json.dumps(message)
-                  )
-
-              except Exception as e:
-
-                  job["status"] = "queued"
-
-                  await queue.put(job_id)
-
-                  event(
-                      "send_failed",
-                      job_id=job_id,
-                      worker_id=worker["id"],
-                      error=repr(e)
-                  )
-
-                  return False
-
-
-              worker["busy"] = True
-
-              worker["job_id"] = job_id
-
-              worker["last_seen"] = timestamp()
-
+              }
 
               state["jobs_sent"] += 1
 
-              state["jobs_queued"] = queue.qsize()
+              state["jobs_queued"] = \
+                  pending_jobs.qsize()
 
-
-              event(
+              record(
                   "job_sent",
                   job_id=job_id,
-                  worker_id=worker["id"],
-                  attempt=job["attempt"]
+                  worker_id=worker["worker_id"],
+                  attempt=job.get("_attempt", 1)
               )
 
-              return True
+              save()
 
 
           # ==========================================================
-          # FILL WORKER
+          # WORKER AUTH
           # ==========================================================
 
-          async def fill_worker(worker):
-
-              while not worker["busy"]:
-
-                  if state["jobs_completed"] >= JOB_COUNT:
-
-                      return
-
-                  sent = await send_job(worker)
-
-                  if not sent:
-
-                      return
-
-
-          # ==========================================================
-          # HANDLE RESULT
-          # ==========================================================
-
-          async def handle_result(worker, msg):
-
-              job_id = msg.get("job_id")
-
-              if job_id is None:
-
-                  return
-
-
-              job = jobs.get(job_id)
-
-              if job is None:
-
-                  return
-
-
-              if job["status"] == "completed":
-
-                  return
-
-
-              job["status"] = "completed"
-
-              job["completed_utc"] = now()
-
-              job["result"] = msg
-
-              job["worker_id"] = worker["id"]
-
-
-              worker["busy"] = False
-
-              worker["job_id"] = None
-
-              worker["last_seen"] = timestamp()
-
-
-              state["jobs_completed"] += 1
-
-              state["jobs_queued"] = queue.qsize()
-
-              state["results"].append(msg)
-
-
-              event(
-                  "job_completed",
-                  job_id=job_id,
-                  worker_id=worker["id"],
-                  completed=state["jobs_completed"],
-                  total=JOB_COUNT
-              )
-
+          async def authenticate(ws):
 
               try:
 
-                  await worker["ws"].send(
+                  raw = await asyncio.wait_for(
+                      ws.recv(),
+                      timeout=30
+                  )
+
+                  state["messages"] += 1
+
+                  msg = json.loads(raw)
+
+                  if msg.get("type") != "auth":
+
+                      await ws.send(
+                          json.dumps({
+                              "type": "auth_failed"
+                          })
+                      )
+
+                      return None
+
+                  token = msg.get("token")
+
+                  if token != AUTH_TOKEN:
+
+                      await ws.send(
+                          json.dumps({
+                              "type": "auth_failed"
+                          })
+                      )
+
+                      return None
+
+                  worker_id = msg.get(
+                      "worker_id"
+                  )
+
+                  if not worker_id:
+
+                      worker_id = str(
+                          uuid.uuid4()
+                      )
+
+                  await ws.send(
                       json.dumps({
-                          "type": "ack",
-                          "job_id": job_id,
-                          "ok": True,
-                          "relay_utc": now()
+                          "type": "auth_ok",
+                          "worker_id":
+                              worker_id,
+                          "relay_utc":
+                              now()
                       })
                   )
 
+                  return worker_id
+
               except Exception:
 
-                  pass
+                  return None
 
 
-              if state["jobs_completed"] >= JOB_COUNT:
+          # ==========================================================
+          # DISPATCH LOOP
+          # ==========================================================
 
-                  state["done"] = True
+          async def dispatch_loop():
 
-                  event(
-                      "all_jobs_completed",
-                      total=JOB_COUNT
+              while not finished.is_set():
+
+                  await asyncio.sleep(0.05)
+
+                  if (
+                      state["jobs_completed"]
+                      >= state["jobs_total"]
+                  ):
+
+                      state["done"] = True
+
+                      record(
+                          "all_jobs_completed",
+                          total=state["jobs_total"]
+                      )
+
+                      save()
+
+                      finished.set()
+
+                      break
+
+                  for worker_id, worker in list(
+                      workers.items()
+                  ):
+
+                      if not worker["alive"]:
+
+                          continue
+
+                      if worker["busy"]:
+
+                          continue
+
+                      try:
+
+                          job = pending_jobs.get_nowait()
+
+                      except asyncio.QueueEmpty:
+
+                          continue
+
+                      worker["busy"] = True
+
+                      await send_job(
+                          worker,
+                          job
+                      )
+
+
+          # ==========================================================
+          # HEARTBEAT
+          # ==========================================================
+
+          async def heartbeat_loop():
+
+              while not finished.is_set():
+
+                  await asyncio.sleep(10)
+
+                  for worker_id, worker in list(
+                      workers.items()
+                  ):
+
+                      if not worker["alive"]:
+
+                          continue
+
+                      try:
+
+                          ping_id = str(
+                              uuid.uuid4()
+                          )
+
+                          worker[
+                              "last_ping"
+                          ] = mono()
+
+                          await worker["ws"].send(
+                              json.dumps({
+                                  "type": "ping",
+                                  "id": ping_id,
+                                  "relay_utc": now()
+                              })
+                          )
+
+                      except Exception:
+
+                          worker["alive"] = False
+
+
+                  state["workers_alive"] = sum(
+                      1
+                      for w in workers.values()
+                      if w["alive"]
                   )
 
-                  finished.set()
-
-                  return
-
-
-              await fill_worker(worker)
+                  save()
 
 
           # ==========================================================
-          # WORKER DISCONNECT
+          # RETRY JOB
           # ==========================================================
 
-          async def worker_disconnect(worker):
+          async def retry_job(job):
 
-              if not worker:
-
-                  return
-
-
-              worker_id = worker["id"]
-
-              if worker_id not in workers:
-
-                  return
-
-
-              job_id = worker.get("job_id")
-
-
-              if job_id is not None:
-
-                  job = jobs.get(job_id)
-
-                  if job and job["status"] == "running":
-
-                      attempt = job["attempt"]
-
-                      if attempt < MAX_RETRIES:
-
-                          job["status"] = "queued"
-
-                          job["worker_id"] = None
-
-                          state["jobs_retried"] += 1
-
-                          await queue.put(job_id)
-
-                          event(
-                              "job_requeued",
-                              job_id=job_id,
-                              worker_id=worker_id,
-                              attempt=attempt
-                          )
-
-                      else:
-
-                          job["status"] = "failed"
-
-                          state["jobs_failed"] += 1
-
-                          event(
-                              "job_failed",
-                              job_id=job_id,
-                              worker_id=worker_id,
-                              attempts=attempt
-                          )
-
-
-              workers.pop(worker_id, None)
-
-              state["workers_alive"] = len(workers)
-
-              state["jobs_queued"] = queue.qsize()
-
-
-              event(
-                  "worker_disconnected",
-                  worker_id=worker_id,
-                  job_id=job_id
+              attempt = int(
+                  job.get("_attempt", 1)
               )
+
+              if attempt >= 3:
+
+                  state["jobs_failed"] += 1
+
+                  record(
+                      "job_failed",
+                      job_id=job["job_id"],
+                      attempts=attempt
+                  )
+
+                  return
+
+              job = dict(job)
+
+              job["_attempt"] = attempt + 1
+
+              state["jobs_retried"] += 1
+
+              await pending_jobs.put(job)
+
+              record(
+                  "job_retry",
+                  job_id=job["job_id"],
+                  attempt=attempt + 1
+              )
+
+              state["jobs_queued"] = \
+                  pending_jobs.qsize()
+
+              save()
 
 
           # ==========================================================
@@ -537,93 +644,118 @@ jobs:
 
               state["connections_total"] += 1
 
-              event(
+              record(
                   "connection",
-                  remote=str(ws.remote_address)
+                  remote=str(
+                      ws.remote_address
+                  )
               )
 
+              save()
 
               try:
 
-                  raw = await asyncio.wait_for(
-                      ws.recv(),
-                      timeout=30
+                  worker_id = await authenticate(
+                      ws
                   )
 
-                  msg = json.loads(raw)
+                  if worker_id is None:
 
-                  state["messages"] += 1
-
-
-                  if msg.get("type") != "ready":
+                      record(
+                          "authentication_failed"
+                      )
 
                       await ws.close()
 
                       return
 
-
-                  worker_id = msg.get(
-                      "worker_id",
-                      str(uuid.uuid4())
+                  # اگر Worker قبلی با همان ID وجود دارد
+                  old = workers.get(
+                      worker_id
                   )
 
+                  if old:
 
-                  if worker_id in workers:
+                      old["alive"] = False
 
-                      worker_id = (
-                          worker_id
-                          + "-"
-                          + uuid.uuid4().hex[:6]
-                      )
-
+                      try:
+                          await old["ws"].close()
+                      except Exception:
+                          pass
 
                   worker = {
-                      "id": worker_id,
 
-                      "ws": ws,
+                      "worker_id":
+                          worker_id,
 
-                      "busy": False,
+                      "ws":
+                          ws,
 
-                      "job_id": None,
+                      "alive":
+                          True,
 
-                      "connected_utc": now(),
+                      "busy":
+                          False,
 
-                      "last_seen": timestamp()
+                      "connected_mono":
+                          mono(),
+
+                      "last_ping":
+                          mono(),
+
+                      "last_pong":
+                          mono(),
+
+                      "jobs":
+                          0
+
                   }
 
+                  workers[
+                      worker_id
+                  ] = worker
 
-                  workers[worker_id] = worker
+                  state[
+                      "workers"
+                  ][worker_id] = {
 
-                  state["workers_alive"] = len(workers)
+                      "connected_utc":
+                          now(),
 
-                  event(
+                      "alive":
+                          True,
+
+                      "jobs":
+                          0
+
+                  }
+
+                  state["workers_alive"] = sum(
+                      1
+                      for w in workers.values()
+                      if w["alive"]
+                  )
+
+                  record(
                       "worker_connected",
                       worker_id=worker_id
                   )
 
+                  save()
 
                   await ws.send(
                       json.dumps({
-                          "type": "worker_accepted",
-                          "worker_id": worker_id,
-                          "relay_utc": now()
+                          "type": "ready",
+                          "worker_id":
+                              worker_id,
+                          "jobs_total":
+                              state["jobs_total"]
                       })
                   )
-
-
-                  await fill_worker(worker)
-
-
-                  # ==================================================
-                  # MAIN LOOP
-                  # ==================================================
 
                   async for raw in ws:
 
                       state["messages"] += 1
-
-                      worker["last_seen"] = timestamp()
-
 
                       try:
 
@@ -633,128 +765,212 @@ jobs:
 
                           continue
 
+                      msg_type = msg.get(
+                          "type"
+                      )
 
-                      msg_type = msg.get("type")
+                      # --------------------------------------------
+                      # PONG
+                      # --------------------------------------------
 
+                      if msg_type == "pong":
+
+                          worker[
+                              "last_pong"
+                          ] = mono()
+
+                          continue
+
+                      # --------------------------------------------
+                      # GPU RESULT
+                      # --------------------------------------------
 
                       if msg_type == "gpu_result":
 
-                          await handle_result(
-                              worker,
-                              msg
+                          job_id = msg.get(
+                              "job_id"
                           )
 
+                          if job_id not in running_jobs:
 
-                      elif msg_type == "heartbeat":
+                              record(
+                                  "unknown_job_result",
+                                  job_id=job_id
+                              )
+
+                              continue
+
+                          running = running_jobs.pop(
+                              job_id
+                          )
+
+                          worker[
+                              "busy"
+                          ] = False
+
+                          worker[
+                              "jobs"
+                          ] += 1
+
+                          state[
+                              "workers"
+                          ][worker_id][
+                              "jobs"
+                          ] = worker["jobs"]
+
+                          latency_ms = (
+                              mono()
+                              -
+                              running[
+                                  "sent_mono"
+                              ]
+                          ) * 1000
+
+                          msg[
+                              "relay_latency_ms"
+                          ] = latency_ms
+
+                          state[
+                              "jobs_completed"
+                          ] += 1
+
+                          state[
+                              "results"
+                          ].append(msg)
+
+                          record(
+                              "job_completed",
+                              job_id=job_id,
+                              worker_id=worker_id,
+                              latency_ms=latency_ms
+                          )
 
                           await ws.send(
                               json.dumps({
-                                  "type": "heartbeat_ack",
-                                  "relay_utc": now()
+                                  "type": "ack",
+                                  "job_id":
+                                      job_id
                               })
                           )
 
+                          save()
 
-                      elif msg_type == "ping":
+                          continue
 
-                          await ws.send(
-                              json.dumps({
-                                  "type": "pong",
-                                  "id": msg.get("id"),
-                                  "relay_utc": now()
-                              })
+                      # --------------------------------------------
+                      # ERROR
+                      # --------------------------------------------
+
+                      if msg_type == "job_error":
+
+                          job_id = msg.get(
+                              "job_id"
                           )
 
+                          running = running_jobs.pop(
+                              job_id,
+                              None
+                          )
+
+                          worker[
+                              "busy"
+                          ] = False
+
+                          if running:
+
+                              await retry_job(
+                                  running["job"]
+                              )
+
+                          record(
+                              "worker_job_error",
+                              worker_id=worker_id,
+                              job_id=job_id,
+                              error=msg.get(
+                                  "error"
+                              )
+                          )
+
+                          save()
 
               except Exception as e:
 
-                  event(
+                  record(
                       "worker_handler_error",
                       worker_id=worker_id,
-                      error=repr(e)
+                      error=repr(e),
+                      traceback=
+                          traceback.format_exc()
                   )
-
 
               finally:
 
-                  if worker_id:
+                  if worker_id in workers:
 
-                      await worker_disconnect(
-                          workers.get(worker_id)
-                      )
+                      workers[
+                          worker_id
+                      ]["alive"] = False
 
+                      state[
+                          "workers"
+                      ][worker_id][
+                          "alive"
+                      ] = False
 
-          # ==========================================================
-          # MONITOR WORKERS
-          # ==========================================================
-
-          async def monitor():
-
-              while not finished.is_set():
-
-                  await asyncio.sleep(5)
-
-                  current = list(
-                      workers.values()
+                  state[
+                      "workers_alive"
+                  ] = sum(
+                      1
+                      for w in workers.values()
+                      if w["alive"]
                   )
 
-                  for worker in current:
+                  # ------------------------------------------------
+                  # REQUEUE JOB THAT WAS RUNNING
+                  # ------------------------------------------------
 
-                      age = (
-                          timestamp()
-                          - worker["last_seen"]
-                      )
+                  if worker_id:
 
-                      if age > HEARTBEAT_TIMEOUT:
+                      dead_jobs = []
 
-                          event(
-                              "worker_timeout",
-                              worker_id=worker["id"],
-                              age_seconds=age
+                      for job_id, running in list(
+                          running_jobs.items()
+                      ):
+
+                          if (
+                              running[
+                                  "worker_id"
+                              ]
+                              ==
+                              worker_id
+                          ):
+
+                              dead_jobs.append(
+                                  (
+                                      job_id,
+                                      running[
+                                          "job"
+                                      ]
+                                  )
+                              )
+
+                      for job_id, job in dead_jobs:
+
+                          running_jobs.pop(
+                              job_id,
+                              None
                           )
 
-                          try:
+                          await retry_job(
+                              job
+                          )
 
-                              await worker["ws"].close()
-
-                          except Exception:
-
-                              pass
-
-
-                  state["workers_alive"] = len(workers)
-
-                  state["jobs_queued"] = queue.qsize()
+                  record(
+                      "worker_disconnected",
+                      worker_id=worker_id
+                  )
 
                   save()
-
-
-          # ==========================================================
-          # HEARTBEAT
-          # ==========================================================
-
-          async def heartbeat():
-
-              while not finished.is_set():
-
-                  await asyncio.sleep(15)
-
-                  for worker in list(
-                      workers.values()
-                  ):
-
-                      try:
-
-                          await worker["ws"].send(
-                              json.dumps({
-                                  "type": "heartbeat",
-                                  "relay_utc": now()
-                              })
-                          )
-
-                      except Exception:
-
-                          pass
 
 
           # ==========================================================
@@ -763,83 +979,98 @@ jobs:
 
           async def main():
 
-              create_jobs()
+              await initialize_queue()
 
-              save()
-
-              event(
+              record(
                   "relay_start",
                   host=HOST,
                   port=PORT,
-                  jobs=JOB_COUNT
+                  jobs=len(JOBS),
+                  worker_count=WORKER_COUNT
               )
 
+              save()
 
               async with websockets.serve(
+
                   handler,
+
                   HOST,
+
                   PORT,
 
                   ping_interval=20,
 
-                  ping_timeout=30,
+                  ping_timeout=60,
 
-                  max_size=64 * 1024 * 1024,
+                  max_size=100 * 1024 * 1024,
 
                   max_queue=256
+
               ):
 
                   print(
-                      f"Relay listening on {HOST}:{PORT}"
+                      f"Relay listening on "
+                      f"ws://{HOST}:{PORT}"
                   )
 
                   print(
-                      f"Jobs: {JOB_COUNT}"
+                      f"Jobs: {len(JOBS)}"
                   )
 
                   print(
-                      "Waiting for Kaggle workers..."
+                      f"Workers expected: "
+                      f"{WORKER_COUNT}"
                   )
 
+                  save()
 
-                  monitor_task = asyncio.create_task(
-                      monitor()
-                  )
+                  tasks = [
 
-                  heartbeat_task = asyncio.create_task(
-                      heartbeat()
-                  )
+                      asyncio.create_task(
+                          dispatch_loop()
+                      ),
 
+                      asyncio.create_task(
+                          heartbeat_loop()
+                      )
+
+                  ]
 
                   try:
 
                       await asyncio.wait_for(
                           finished.wait(),
-                          timeout=1500
+                          timeout=600
                       )
 
                   except asyncio.TimeoutError:
 
-                      event(
-                          "relay_timeout",
-                          completed=state["jobs_completed"],
-                          total=JOB_COUNT
+                      record(
+                          "queue_timeout",
+                          completed=
+                              state[
+                                  "jobs_completed"
+                              ],
+                          total=
+                              state[
+                                  "jobs_total"
+                              ]
                       )
 
+                  for task in tasks:
 
-                  monitor_task.cancel()
+                      task.cancel()
 
-                  heartbeat_task.cancel()
-
-
-                  state["workers_alive"] = len(
-                      workers
+                  state[
+                      "workers_alive"
+                  ] = sum(
+                      1
+                      for w in workers.values()
+                      if w["alive"]
                   )
 
-                  state["jobs_queued"] = queue.qsize()
-
                   save()
-
 
                   print(
                       json.dumps(
@@ -852,7 +1083,9 @@ jobs:
 
           if __name__ == "__main__":
 
-              asyncio.run(main())
+              asyncio.run(
+                  main()
+              )
 
           PY
 
@@ -861,118 +1094,79 @@ jobs:
       # START RELAY
       # ============================================================
 
-      - name: Start Relay
+      - name: Start relay
         shell: bash
         run: |
           set -euxo pipefail
 
-          rm -f relay.log relay_result.json
-
           nohup python3 relay.py \
-            > relay.log 2>&1 &
+            > relay.log 2>&1 < /dev/null &
 
-          RELAY_PID=$!
+          echo $! > relay.pid
 
-          echo "$RELAY_PID" > relay.pid
-
-          sleep 3
-
-          if ! kill -0 "$RELAY_PID" 2>/dev/null; then
-
-            echo "Relay died."
-
-            cat relay.log || true
-
-            exit 1
-
-          fi
-
-          echo "Relay PID=$RELAY_PID"
+          sleep 2
 
           cat relay.log || true
 
+          test -f relay_result.json
+
 
       # ============================================================
-      # INSTALL CLOUDFLARED
+      # TEST LOCAL RELAY
       # ============================================================
 
-      - name: Install cloudflared
+      - name: Test local relay
         shell: bash
         run: |
           set -euxo pipefail
 
-          RELEASE_JSON="$(
-            curl -fsSL \
-              --retry 5 \
-              --retry-delay 2 \
-              -H "User-Agent: GitHub-Actions" \
-              https://api.github.com/repos/cloudflare/cloudflared/releases/latest
-          )"
+          echo "Testing local port..."
 
-          TAG="$(
-            printf '%s' "$RELEASE_JSON" |
-            jq -r '.tag_name'
-          )"
+          nc -zv \
+            127.0.0.1 \
+            8765
 
-          test -n "$TAG"
-          test "$TAG" != "null"
-
-          curl -fL \
-            --retry 5 \
-            --retry-delay 2 \
-            -o cloudflared \
-            "https://github.com/cloudflare/cloudflared/releases/download/${TAG}/cloudflared-linux-amd64"
-
-          chmod +x cloudflared
-
-          sudo install \
-            -m 0755 \
-            cloudflared \
-            /usr/local/bin/cloudflared
-
-          cloudflared --version
+          echo "Relay local port is OPEN."
 
 
       # ============================================================
       # START CLOUDFLARE
       # ============================================================
 
-      - name: Start Cloudflare Tunnel
+      - name: Start Cloudflare tunnel
         shell: bash
         run: |
-          set -euxo pipefail
+          set -u
 
           rm -f cloudflared.log
           rm -f tunnel_url.txt
-          rm -f wss_url.txt
 
-          echo "Starting Cloudflare tunnel..."
+          echo "Starting Cloudflare..."
 
           nohup cloudflared tunnel \
             --url http://127.0.0.1:8765 \
             --protocol http2 \
             --no-autoupdate \
-            > cloudflared.log 2>&1 &
+            > cloudflared.log 2>&1 < /dev/null &
 
-          PID=$!
+          CLOUDFLARED_PID=$!
 
-          echo "$PID" > cloudflared.pid
+          echo "$CLOUDFLARED_PID" \
+            > cloudflared.pid
 
-          echo "Cloudflare PID: $PID"
-
-          sleep 5
+          echo "Cloudflare PID: $CLOUDFLARED_PID"
 
           URL=""
 
-          for i in $(seq 1 120); do
+          for i in $(seq 1 90); do
 
-            if ! kill -0 "$PID" 2>/dev/null; then
+            echo "Waiting for Cloudflare... $i/90"
 
-              echo "cloudflared exited early."
+            if ! kill -0 \
+              "$CLOUDFLARED_PID" \
+              2>/dev/null; then
 
-              echo "=============================="
-              echo "CLOUDFLARED LOG"
-              echo "=============================="
+              echo "Cloudflared died."
 
               cat cloudflared.log || true
 
@@ -980,34 +1174,25 @@ jobs:
 
             fi
 
-
             URL="$(
               grep -oE \
-                'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
+                'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
                 cloudflared.log |
               head -n 1 ||
               true
             )"
 
-
             if [ -n "$URL" ]; then
-
               break
-
             fi
-
-
-            echo \
-              "Waiting for Cloudflare... $i/120"
 
             sleep 2
 
           done
 
-
           if [ -z "$URL" ]; then
 
-            echo "Tunnel URL was not found."
+            echo "ERROR: Cloudflare URL not found."
 
             cat cloudflared.log || true
 
@@ -1015,78 +1200,63 @@ jobs:
 
           fi
 
-
-          WSS_URL="$(
-            printf '%s' "$URL" |
-            sed 's#^https:#wss:#'
-          )/ws"
-
-
           printf '%s\n' "$URL" \
             > tunnel_url.txt
 
-          printf '%s\n' "$WSS_URL" \
-            > wss_url.txt
-
-
-          echo "TUNNEL_URL=$URL" \
-            >> "$GITHUB_ENV"
+          WSS_URL="$(
+            printf '%s' "$URL" |
+            sed 's#^https://#wss://#'
+          )/"
 
           echo "WSS_URL=$WSS_URL" \
             >> "$GITHUB_ENV"
 
-
           echo
-          echo "======================================"
-          echo "CLOUDFLARE TUNNEL READY"
-          echo "======================================"
+          echo "============================================"
+          echo "CLOUDFLARE READY"
+          echo "============================================"
           echo "HTTP : $URL"
           echo "WSS  : $WSS_URL"
-          echo "======================================"
+          echo "============================================"
 
 
       # ============================================================
-      # TEST RELAY BEFORE KAGGLE
+      # TEST CLOUDFLARE
       # ============================================================
 
-      - name: Test Relay
+      - name: Test Cloudflare endpoint
         shell: bash
         run: |
-          set -euxo pipefail
+          set -u
 
-          echo "Testing local relay..."
+          URL="$(cat tunnel_url.txt)"
 
-          nc -zv \
-            127.0.0.1 \
-            8765
-
-          echo "Local relay is reachable."
-
-
-          echo
-          echo "Testing Cloudflare endpoint..."
+          echo "Testing:"
+          echo "$URL"
 
           curl \
             -I \
             --max-time 20 \
-            "$TUNNEL_URL" \
+            "$URL" \
             || true
+
+          echo
+          echo "Cloudflare log:"
+          tail -n 50 cloudflared.log || true
 
 
       # ============================================================
       # CREATE KAGGLE WORKERS
       # ============================================================
 
-      - name: Create Kaggle GPU workers
+      - name: Create Kaggle workers
         shell: bash
         run: |
-
           set -euxo pipefail
 
           rm -rf kaggle_workers
 
           mkdir -p kaggle_workers
-
 
           for WORKER_INDEX in $(seq 1 "$WORKER_COUNT"); do
 
@@ -1094,165 +1264,419 @@ jobs:
 
             mkdir -p "$DIR"
 
-
-            cat > "$DIR/worker.py" <<PY
+            cat > "$DIR/worker.py" <<PYWORKER
 
           import asyncio
           import json
           import os
+          import socket
+          import subprocess
           import time
           import traceback
           import uuid
+          from datetime import datetime, timezone
 
+          import numpy as np
           import websockets
 
 
-          WSS_URL = os.environ["WSS_URL"]
+          WSS_URL = "${WSS_URL}"
+
+          AUTH_TOKEN = "${GPU_WORKER_TOKEN}"
 
           WORKER_ID = (
-              "kaggle-worker-"
-              + str(${WORKER_INDEX})
-              + "-"
-              + uuid.uuid4().hex[:8]
+              "gpu-worker-${WORKER_INDEX}-"
+              + str(uuid.uuid4())[:8]
           )
 
 
-          async def benchmark(size, repeats):
+          RESULT_FILE = (
+              "/kaggle/working/"
+              "worker_result.json"
+          )
 
-              import numpy as np
+
+          def now():
+
+              return datetime.now(
+                  timezone.utc
+              ).isoformat()
+
+
+          def nvidia_smi():
+
+              try:
+
+                  p = subprocess.run(
+
+                      [
+                          "nvidia-smi",
+
+                          "--query-gpu="
+                          "name,"
+                          "memory.total,"
+                          "memory.used,"
+                          "utilization.gpu,"
+                          "temperature.gpu",
+
+                          "--format=csv,noheader"
+                      ],
+
+                      capture_output=True,
+
+                      text=True,
+
+                      timeout=20
+                  )
+
+                  return p.stdout.strip()
+
+              except Exception as e:
+
+                  return repr(e)
+
+
+          def vector_add(n, repeats):
 
               from numba import cuda
-
 
               if not cuda.is_available():
 
                   raise RuntimeError(
-                      "CUDA is not available"
+                      "CUDA unavailable"
                   )
-
 
               @cuda.jit
-              def matmul_kernel(A, B, C):
+              def kernel(a, b, c):
 
-                  row, col = cuda.grid(2)
+                  i = cuda.grid(1)
 
-                  if (
-                      row < C.shape[0]
-                      and col < C.shape[1]
-                  ):
+                  if i < c.size:
 
-                      total = 0.0
-
-                      for k in range(
-                          A.shape[1]
-                      ):
-
-                          total += (
-                              A[row, k]
-                              * B[k, col]
-                          )
-
-                      C[row, col] = total
+                      c[i] = a[i] + b[i]
 
 
-              A = cuda.to_device(
+              a = cuda.to_device(
                   np.ones(
-                      (size, size),
+                      n,
                       dtype=np.float32
                   )
               )
 
-
-              B = cuda.to_device(
+              b = cuda.to_device(
                   np.ones(
-                      (size, size),
+                      n,
                       dtype=np.float32
                   )
               )
 
+              c = cuda.device_array_like(a)
 
-              C = cuda.device_array(
-                  (size, size),
-                  dtype=np.float32
-              )
-
-
-              threads = (
-                  16,
-                  16
-              )
-
+              threads = 256
 
               blocks = (
-                  (size + 15) // 16,
-                  (size + 15) // 16
-              )
+                  n + threads - 1
+              ) // threads
 
-
-              # JIT warmup
-
-              matmul_kernel[
+              kernel[
                   blocks,
                   threads
               ](
-                  A,
-                  B,
-                  C
+                  a,
+                  b,
+                  c
               )
 
               cuda.synchronize()
 
-
               start = time.perf_counter()
-
 
               for _ in range(repeats):
 
-                  matmul_kernel[
+                  kernel[
                       blocks,
                       threads
                   ](
-                      A,
-                      B,
-                      C
+                      a,
+                      b,
+                      c
                   )
 
-
               cuda.synchronize()
-
 
               elapsed = (
                   time.perf_counter()
                   - start
               )
 
-
               return {
-                  "gpu": str(
-                      cuda.get_current_device().name
-                  ),
 
-                  "size": size,
+                  "operation":
+                      "vector_add",
 
-                  "repeats": repeats,
+                  "n":
+                      n,
 
-                  "compute_ms":
-                      elapsed * 1000,
+                  "repeats":
+                      repeats,
 
-                  "backend":
-                      "numba_cuda"
+                  "wall_ms":
+                      elapsed * 1000
+
               }
 
 
-          async def run():
+          def matrix_multiply(size):
+
+              import cupy as cp
+
+              a = cp.random.random(
+                  (size, size),
+                  dtype=cp.float32
+              )
+
+              b = cp.random.random(
+                  (size, size),
+                  dtype=cp.float32
+              )
+
+              cp.cuda.Stream.null.synchronize()
+
+              start = time.perf_counter()
+
+              c = a @ b
+
+              cp.cuda.Stream.null.synchronize()
+
+              elapsed = (
+                  time.perf_counter()
+                  - start
+              )
+
+              checksum = float(
+                  cp.sum(c).get()
+              )
+
+              return {
+
+                  "operation":
+                      "matrix_multiply",
+
+                  "size":
+                      size,
+
+                  "wall_ms":
+                      elapsed * 1000,
+
+                  "checksum":
+                      checksum
+
+              }
+
+
+          def large_transfer(elements):
+
+              import cupy as cp
+
+              host = np.random.random(
+                  elements
+              ).astype(
+                  np.float32
+              )
+
+              start = time.perf_counter()
+
+              device = cp.asarray(
+                  host
+              )
+
+              cp.cuda.Stream.null.synchronize()
+
+              output = cp.asnumpy(
+                  device * 2
+              )
+
+              elapsed = (
+                  time.perf_counter()
+                  - start
+              )
+
+              return {
+
+                  "operation":
+                      "large_transfer",
+
+                  "elements":
+                      elements,
+
+                  "bytes":
+                      int(
+                          elements * 4
+                      ),
+
+                  "wall_ms":
+                      elapsed * 1000,
+
+                  "output_checksum":
+                      float(
+                          np.sum(
+                              output[:100000]
+                          )
+                      )
+
+              }
+
+
+          async def execute(job):
+
+              operation = job.get(
+                  "operation"
+              )
+
+              if operation == "vector_add":
+
+                  return vector_add(
+
+                      int(
+                          job["n"]
+                      ),
+
+                      int(
+                          job["repeats"]
+                      )
+
+                  )
+
+              if operation == "matrix_multiply":
+
+                  return matrix_multiply(
+
+                      int(
+                          job["matrix_size"]
+                      )
+
+                  )
+
+              if operation == "large_transfer":
+
+                  return large_transfer(
+
+                      int(
+                          job["elements"]
+                      )
+
+                  )
+
+              raise ValueError(
+                  "Unknown operation: "
+                  + str(operation)
+              )
+
+
+          async def connect():
+
+              last_error = None
+
+              for attempt in range(1, 31):
+
+                  try:
+
+                      print(
+                          f"Connecting "
+                          f"{attempt}/30"
+                      )
+
+                      print(
+                          "WSS:",
+                          WSS_URL
+                      )
+
+                      ws = await websockets.connect(
+
+                          WSS_URL,
+
+                          open_timeout=30,
+
+                          close_timeout=10,
+
+                          ping_interval=20,
+
+                          ping_timeout=60,
+
+                          max_size=
+                              100 * 1024 * 1024
+
+                      )
+
+                      print(
+                          "CONNECTED"
+                      )
+
+                      return ws
+
+                  except Exception as e:
+
+                      last_error = repr(e)
+
+                      print(
+                          "CONNECT ERROR:",
+                          last_error
+                      )
+
+                      await asyncio.sleep(
+                          min(
+                              attempt * 2,
+                              15
+                          )
+                      )
+
+              raise RuntimeError(
+                  "Could not connect: "
+                  + str(last_error)
+              )
+
+
+          async def main():
+
+              result = {
+
+                  "worker_id":
+                      WORKER_ID,
+
+                  "start_utc":
+                      now(),
+
+                  "status":
+                      "STARTING",
+
+                  "gpu":
+                      nvidia_smi(),
+
+                  "jobs":
+                      []
+
+              }
 
               print(
-                  "================================"
+                  "=" * 70
               )
 
               print(
-                  "GPU WORKER:",
+                  "KAGGLE REAL-TIME GPU WORKER"
+              )
+
+              print(
+                  "=" * 70
+              )
+
+              print(
+                  "WORKER:",
                   WORKER_ID
+              )
+
+              print(
+                  "HOST:",
+                  socket.gethostname()
               )
 
               print(
@@ -1261,211 +1685,306 @@ jobs:
               )
 
               print(
-                  "================================"
+                  "GPU:"
               )
 
+              print(
+                  nvidia_smi()
+              )
 
-              while True:
+              ws = None
 
-                  try:
+              try:
 
-                      async with websockets.connect(
-                          WSS_URL,
+                  ws = await connect()
 
-                          ping_interval=20,
+                  result[
+                      "status"
+                  ] = "CONNECTED"
 
-                          ping_timeout=60,
+                  await ws.send(
+                      json.dumps({
 
-                          max_size=64 * 1024 * 1024
-                      ) as ws:
+                          "type":
+                              "auth",
+
+                          "token":
+                              AUTH_TOKEN,
+
+                          "worker_id":
+                              WORKER_ID,
+
+                          "worker_utc":
+                              now()
+
+                      })
+                  )
+
+                  raw = await ws.recv()
+
+                  auth_result = json.loads(
+                      raw
+                  )
+
+                  print(
+                      "AUTH:",
+                      auth_result
+                  )
+
+                  if auth_result.get(
+                      "type"
+                  ) != "auth_ok":
+
+                      raise RuntimeError(
+                          "Authentication failed"
+                      )
+
+                  while True:
+
+                      raw = await ws.recv()
+
+                      if raw is None:
+
+                          break
+
+                      msg = json.loads(
+                          raw
+                      )
+
+                      msg_type = msg.get(
+                          "type"
+                      )
+
+                      if msg_type == "ready":
 
                           print(
-                              "CONNECTED"
+                              "WORKER READY"
                           )
 
+                          continue
+
+                      if msg_type == "ping":
 
                           await ws.send(
                               json.dumps({
-                                  "type":
-                                      "ready",
 
-                                  "worker_id":
-                                      WORKER_ID,
+                                  "type":
+                                      "pong",
+
+                                  "id":
+                                      msg.get(
+                                          "id"
+                                      ),
 
                                   "worker_utc":
-                                      time.time()
+                                      now()
+
                               })
                           )
 
+                          continue
 
-                          async for raw in ws:
+                      if msg_type == "ack":
 
-                              msg = json.loads(
-                                  raw
-                              )
+                          continue
 
+                      if msg_type != "gpu_job":
 
-                              msg_type = msg.get(
-                                  "type"
-                              )
+                          continue
 
+                      job_id = msg.get(
+                          "job_id"
+                      )
 
-                              if msg_type == "worker_accepted":
+                      request_id = msg.get(
+                          "request_id"
+                      )
 
-                                  print(
-                                      "WORKER ACCEPTED"
-                                  )
+                      received = time.perf_counter()
 
-                                  continue
-
-
-                              if msg_type == "heartbeat":
-
-                                  await ws.send(
-                                      json.dumps({
-                                          "type":
-                                              "heartbeat_ack"
-                                      })
-                                  )
-
-                                  continue
-
-
-                              if msg_type != "gpu_job":
-
-                                  continue
-
-
-                              job_id = msg[
-                                  "job_id"
-                              ]
-
-
-                              size = int(
-                                  msg.get(
-                                      "size",
-                                      1024
-                                  )
-                              )
-
-
-                              repeats = int(
-                                  msg.get(
-                                      "repeats",
-                                      1
-                                  )
-                              )
-
-
-                              started = (
-                                  time.perf_counter()
-                              )
-
-
-                              try:
-
-                                  result = (
-                                      await benchmark(
-                                          size,
-                                          repeats
-                                      )
-                                  )
-
-
-                                  response = {
-
-                                      "type":
-                                          "gpu_result",
-
-                                      "job_id":
-                                          job_id,
-
-                                      "worker_id":
-                                          WORKER_ID,
-
-                                      "ok":
-                                          True,
-
-                                      "compute_wall_ms":
-                                          (
-                                              time.perf_counter()
-                                              - started
-                                          ) * 1000,
-
-                                      "benchmark":
-                                          result
-                                  }
-
-
-                              except Exception as e:
-
-                                  response = {
-
-                                      "type":
-                                          "gpu_result",
-
-                                      "job_id":
-                                          job_id,
-
-                                      "worker_id":
-                                          WORKER_ID,
-
-                                      "ok":
-                                          False,
-
-                                      "error":
-                                          repr(e),
-
-                                      "traceback":
-                                          traceback.format_exc()
-                                  }
-
-
-                              await ws.send(
-                                  json.dumps(
-                                      response
-                                  )
-                              )
-
-
-                              print(
-                                  "RESULT:",
-                                  json.dumps(
-                                      response
-                                  )
-                              )
-
-
-                  except Exception as e:
+                      print()
+                      print(
+                          "=" * 70
+                      )
 
                       print(
-                          "CONNECTION ERROR:",
-                          repr(e)
+                          "JOB:",
+                          job_id
                       )
-
 
                       print(
-                          "RECONNECTING..."
+                          "OP:",
+                          msg.get(
+                              "operation"
+                          )
                       )
 
-
-                      await asyncio.sleep(
-                          5
+                      print(
+                          "=" * 70
                       )
+
+                      try:
+
+                          compute_start = \
+                              time.perf_counter()
+
+                          output = await execute(
+                              msg
+                          )
+
+                          compute_ms = (
+                              time.perf_counter()
+                              -
+                              compute_start
+                          ) * 1000
+
+                          response = {
+
+                              "type":
+                                  "gpu_result",
+
+                              "job_id":
+                                  job_id,
+
+                              "request_id":
+                                  request_id,
+
+                              "worker_id":
+                                  WORKER_ID,
+
+                              "worker_utc":
+                                  now(),
+
+                              "receive_to_compute_ms":
+                                  (
+                                      time.perf_counter()
+                                      -
+                                      received
+                                  ) * 1000,
+
+                              "compute_ms":
+                                  compute_ms,
+
+                              "output":
+                                  output
+
+                          }
+
+                      except Exception as e:
+
+                          response = {
+
+                              "type":
+                                  "job_error",
+
+                              "job_id":
+                                  job_id,
+
+                              "request_id":
+                                  request_id,
+
+                              "worker_id":
+                                  WORKER_ID,
+
+                              "error":
+                                  repr(e),
+
+                              "traceback":
+                                  traceback.format_exc()
+
+                          }
+
+                      result[
+                          "jobs"
+                      ].append(
+                          response
+                      )
+
+                      await ws.send(
+                          json.dumps(
+                              response
+                          )
+                      )
+
+                      print(
+                          "RESULT SENT:"
+                      )
+
+                      print(
+                          json.dumps(
+                              response,
+                              indent=2
+                          )
+                      )
+
+              except Exception as e:
+
+                  result[
+                      "status"
+                  ] = "ERROR"
+
+                  result[
+                      "error"
+                  ] = repr(e)
+
+                  result[
+                      "traceback"
+                  ] = traceback.format_exc()
+
+                  print(
+                      "WORKER ERROR:",
+                      repr(e)
+                  )
+
+              finally:
+
+                  result[
+                      "end_utc"
+                  ] = now()
+
+                  try:
+
+                      with open(
+                          RESULT_FILE,
+                          "w",
+                          encoding="utf-8"
+                      ) as f:
+
+                          json.dump(
+                              result,
+                              f,
+                              indent=2,
+                              ensure_ascii=False
+                          )
+
+                  except Exception:
+
+                      pass
+
+                  if ws:
+
+                      try:
+
+                          await ws.close()
+
+                      except Exception:
+
+                          pass
 
 
           if __name__ == "__main__":
 
-              asyncio.run(run())
+              asyncio.run(
+                  main()
+              )
 
-          PY
+          PYWORKER
 
 
             cat > "$DIR/kernel-metadata.json" <<EOF
-
           {
-            "id": "${KAGGLE_USERNAME}/gpu-gpu-worker-${WORKER_INDEX}",
-            "title": "gpu-gpu-worker-${WORKER_INDEX}",
+            "id": "${KAGGLE_USERNAME}/gpu-worker-${WORKER_INDEX}",
+            "title": "gpu-worker-${WORKER_INDEX}",
             "code_file": "worker.py",
             "language": "python",
             "kernel_type": "script",
@@ -1478,7 +1997,6 @@ jobs:
             "kernel_sources": [],
             "model_sources": []
           }
-
           EOF
 
           done
@@ -1488,95 +2006,105 @@ jobs:
       # PUSH WORKERS
       # ============================================================
 
-      - name: Push Kaggle GPU workers
+      - name: Push Kaggle workers
         shell: bash
         run: |
-
           set -euxo pipefail
-
-          echo "====================================="
-          echo "PUSHING $WORKER_COUNT KAGGLE WORKERS"
-          echo "====================================="
-
 
           for WORKER_INDEX in $(seq 1 "$WORKER_COUNT"); do
 
             DIR="kaggle_workers/gpu-worker-${WORKER_INDEX}"
 
             echo
-            echo "Pushing worker $WORKER_INDEX"
-            echo "Directory: $DIR"
+            echo "=========================================="
+            echo "PUSHING WORKER $WORKER_INDEX"
+            echo "=========================================="
 
+            cat "$DIR/kernel-metadata.json"
 
-            # IMPORTANT:
-            # metadata ID and title are identical slugs.
-            #
             kaggle kernels push \
               -p "$DIR"
 
           done
 
 
-          echo
-          echo "All Kaggle workers submitted."
-
-
       # ============================================================
       # WAIT FOR WORKERS
       # ============================================================
 
-      - name: Wait for GPU workers
+      - name: Wait for workers
         shell: bash
         run: |
+          set -u
 
-          set -euxo pipefail
+          echo
+          echo "Waiting for Kaggle Workers..."
+          echo
 
-          echo "====================================="
-          echo "WAITING FOR GPU WORKERS"
-          echo "====================================="
+          CONNECTED=0
 
-
-          FOUND=0
-
-
-          for i in $(seq 1 90); do
+          for i in $(seq 1 60); do
 
             if [ -f relay_result.json ]; then
 
-              FOUND="$(
-                jq -r '.workers_alive' \
+              CONNECTED="$(
+                jq -r \
+                  '.workers_alive' \
                   relay_result.json \
                   2>/dev/null ||
                   echo 0
               )"
 
-            fi
-
-
-            echo \
-              "Attempt=$i workers_alive=$FOUND/$WORKER_COUNT"
-
-
-            if [ "$FOUND" -ge 1 ]; then
+              CONNECTIONS="$(
+                jq -r \
+                  '.connections_total' \
+                  relay_result.json \
+                  2>/dev/null ||
+                  echo 0
+              )"
 
               echo
-              echo "At least one GPU worker connected."
+              echo "Attempt: $i/60"
+              echo "Connections: $CONNECTIONS"
+              echo "Workers alive: $CONNECTED"
+
+            fi
+
+            if [ "$CONNECTED" -ge 1 ]; then
+
+              echo
+              echo "=========================================="
+              echo "AT LEAST ONE GPU WORKER CONNECTED"
+              echo "=========================================="
 
               break
 
             fi
 
+            # وضعیت Kaggle Workerها
+
+            for WORKER_INDEX in $(seq 1 "$WORKER_COUNT"); do
+
+              echo
+              echo "Kaggle worker $WORKER_INDEX status:"
+
+              kaggle kernels status \
+                "${KAGGLE_USERNAME}/gpu-worker-${WORKER_INDEX}" \
+                2>/dev/null ||
+                true
+
+            done
 
             sleep 5
 
           done
 
-
-          if [ "$FOUND" -lt 1 ]; then
+          if [ "$CONNECTED" -lt 1 ]; then
 
             echo
-            echo "ERROR:"
-            echo "No Kaggle GPU worker connected."
+            echo "=========================================="
+            echo "NO GPU WORKER CONNECTED"
+            echo "=========================================="
 
             echo
             echo "===== RELAY ====="
@@ -1584,14 +2112,38 @@ jobs:
             cat relay.log || true
 
             echo
-            echo "===== CLOUDFLARED ====="
+            echo "===== CLOUDFLARE ====="
 
             cat cloudflared.log || true
 
             echo
-            echo "===== STATE ====="
+            echo "===== RELAY STATE ====="
 
             cat relay_result.json || true
+
+            echo
+            echo "===== KAGGLE OUTPUT ====="
+
+            mkdir -p debug_output
+
+            for WORKER_INDEX in $(seq 1 "$WORKER_COUNT"); do
+
+              echo
+              echo "Downloading worker $WORKER_INDEX..."
+
+              kaggle kernels output \
+                "${KAGGLE_USERNAME}/gpu-worker-${WORKER_INDEX}" \
+                -p "debug_output/worker-${WORKER_INDEX}" \
+                --force ||
+                true
+
+            done
+
+            find debug_output \
+              -type f \
+              -maxdepth 4 \
+              -print \
+              || true
 
             exit 1
 
@@ -1599,114 +2151,132 @@ jobs:
 
 
       # ============================================================
-      # WAIT FOR ALL JOBS
+      # WAIT FOR QUEUE
       # ============================================================
 
-      - name: Wait for all GPU jobs
+      - name: Wait for GPU queue
         shell: bash
         run: |
+          set -u
 
-          set -euxo pipefail
+          echo
+          echo "=========================================="
+          echo "WAITING FOR GPU QUEUE"
+          echo "=========================================="
 
-          echo "======================================"
-          echo "REAL-TIME GPU QUEUE"
-          echo "======================================"
+          for i in $(seq 1 120); do
 
-          echo "Workers: $WORKER_COUNT"
-          echo "Jobs:    $JOB_COUNT"
-
-
-          COMPLETED=0
-
-
-          for i in $(seq 1 240); do
+            COMPLETED=0
+            SENT=0
+            WORKERS=0
+            RETRIES=0
+            FAILED=0
 
             if [ -f relay_result.json ]; then
 
               COMPLETED="$(
-                jq -r '.jobs_completed' \
+                jq -r \
+                  '.jobs_completed' \
                   relay_result.json \
                   2>/dev/null ||
                   echo 0
               )"
-
 
               SENT="$(
-                jq -r '.jobs_sent' \
+                jq -r \
+                  '.jobs_sent' \
                   relay_result.json \
                   2>/dev/null ||
                   echo 0
               )"
-
 
               WORKERS="$(
-                jq -r '.workers_alive' \
+                jq -r \
+                  '.workers_alive' \
                   relay_result.json \
                   2>/dev/null ||
                   echo 0
               )"
-
 
               RETRIES="$(
-                jq -r '.jobs_retried' \
+                jq -r \
+                  '.jobs_retried' \
                   relay_result.json \
                   2>/dev/null ||
                   echo 0
               )"
-
 
               FAILED="$(
-                jq -r '.jobs_failed' \
+                jq -r \
+                  '.jobs_failed' \
                   relay_result.json \
                   2>/dev/null ||
                   echo 0
               )"
-
-
-              echo \
-                "[$i] workers=$WORKERS sent=$SENT completed=$COMPLETED/$JOB_COUNT retries=$RETRIES failed=$FAILED"
-
-
-              if [ "$COMPLETED" -ge "$JOB_COUNT" ]; then
-
-                echo
-                echo "======================================"
-                echo "ALL GPU JOBS COMPLETED"
-                echo "======================================"
-
-                break
-
-              fi
 
             fi
 
+            echo
+            echo "[$i/120]"
+            echo "workers=$WORKERS"
+            echo "sent=$SENT"
+            echo "completed=$COMPLETED/$JOB_COUNT"
+            echo "retries=$RETRIES"
+            echo "failed=$FAILED"
+
+            if [ "$COMPLETED" -ge "$JOB_COUNT" ]; then
+
+              echo
+              echo "=========================================="
+              echo "ALL GPU JOBS COMPLETED"
+              echo "=========================================="
+
+              break
+
+            fi
 
             sleep 5
 
           done
 
 
-          FINAL="$(
-            jq -r '.jobs_completed' \
-              relay_result.json \
-              2>/dev/null ||
-              echo 0
-          )
+      # ============================================================
+      # DOWNLOAD OUTPUTS
+      # ============================================================
 
+      - name: Download Kaggle worker outputs
+        if: always()
+        shell: bash
+        run: |
+          set +e
 
-          if [ "$FINAL" -lt "$JOB_COUNT" ]; then
+          mkdir -p kaggle_output
+
+          for WORKER_INDEX in $(seq 1 "$WORKER_COUNT"); do
 
             echo
-            echo "GPU QUEUE DID NOT FINISH."
+            echo "=========================================="
+            echo "WORKER $WORKER_INDEX OUTPUT"
+            echo "=========================================="
 
-            echo
-            echo "===== RELAY RESULT ====="
+            mkdir -p \
+              "kaggle_output/worker-${WORKER_INDEX}"
 
-            cat relay_result.json || true
+            kaggle kernels output \
+              "${KAGGLE_USERNAME}/gpu-worker-${WORKER_INDEX}" \
+              -p \
+              "kaggle_output/worker-${WORKER_INDEX}" \
+              --force
 
-            exit 1
+          done
 
-          fi
+          echo
+          echo "Files:"
+
+          find kaggle_output \
+            -type f \
+            -print \
+            || true
 
 
       # ============================================================
@@ -1717,56 +2287,45 @@ jobs:
         if: always()
         shell: bash
         run: |
-
           set +e
 
           echo
-          echo "======================================"
-          echo "FINAL GPU API REPORT"
-          echo "======================================"
-
-
-          if [ -f relay_result.json ]; then
-
-            jq '{
-              jobs_total,
-              jobs_sent,
-              jobs_completed,
-              jobs_failed,
-              jobs_retried,
-              workers_alive,
-              connections_total,
-              messages,
-              done
-            }' relay_result.json
-
-          fi
-
+          echo "================================================"
+          echo "FINAL GPU REAL-TIME REPORT"
+          echo "================================================"
 
           echo
-          echo "======================================"
-          echo "RELAY LOG"
-          echo "======================================"
-
-          cat relay.log || true
-
-
-          echo
-          echo "======================================"
-          echo "CLOUDFLARED LOG"
-          echo "======================================"
-
-          cat cloudflared.log || true
-
-
-          echo
-          echo "======================================"
-          echo "TUNNEL"
-          echo "======================================"
-
+          echo "Tunnel:"
           cat tunnel_url.txt || true
 
-          cat wss_url.txt || true
+          echo
+          echo "Relay state:"
+          cat relay_result.json || true
+
+          echo
+          echo "Relay log:"
+          cat relay.log || true
+
+          echo
+          echo "Cloudflare log:"
+          cat cloudflared.log || true
+
+          echo
+          echo "Kaggle workers:"
+
+          for WORKER_INDEX in $(seq 1 "$WORKER_COUNT"); do
+
+            echo
+            echo "--------------------------------------------"
+            echo "WORKER $WORKER_INDEX"
+            echo "--------------------------------------------"
+
+            kaggle kernels status \
+              "${KAGGLE_USERNAME}/gpu-worker-${WORKER_INDEX}" \
+              2>/dev/null ||
+              true
+
+          done
 
 
       # ============================================================
@@ -1777,14 +2336,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kaggle-gpu-realtime-v7
+          name: gpu-realtime-v8-results
           path: |
             relay_result.json
             relay.log
             cloudflared.log
             tunnel_url.txt
-            wss_url.txt
-            relay.pid
-            cloudflared.pid
+            kaggle_output/**
           if-no-files-found: warn
           retention-days: 7
