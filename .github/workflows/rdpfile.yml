@@ -14,6 +14,7 @@ jobs:
       KAGGLE_KERNEL: ${{ secrets.KAGGLE_USERNAME }}/gpu-ws-worker
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -21,10 +22,17 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           sudo apt-get update
           sudo apt-get install -y curl jq python3 python3-pip
+
           python3 -m pip install --upgrade pip
-          python3 -m pip install --upgrade kaggle websocket-client numpy numba websockets
+          python3 -m pip install --upgrade \
+            kaggle \
+            websocket-client \
+            websockets
+
+          echo "Dependencies installed."
 
       - name: Configure Kaggle authentication
         shell: bash
@@ -33,50 +41,67 @@ jobs:
 
           mkdir -p "$HOME/.kaggle"
 
-          printf '%s' "$KAGGLE_API_TOKEN" > "$HOME/.kaggle/access_token"
+          printf '%s' "$KAGGLE_API_TOKEN" \
+            > "$HOME/.kaggle/access_token"
+
           chmod 600 "$HOME/.kaggle/access_token"
 
-          cat > "$HOME/.kaggle/kaggle.json" <<EOF
-          {
-            "username": "${KAGGLE_USERNAME}",
-            "key": "${KAGGLE_API_TOKEN}"
-          }
-          EOF
+          printf '%s\n' \
+            "{" \
+            "  \"username\": \"$KAGGLE_USERNAME\"," \
+            "  \"key\": \"$KAGGLE_API_TOKEN\"" \
+            "}" \
+            > "$HOME/.kaggle/kaggle.json"
+
           chmod 600 "$HOME/.kaggle/kaggle.json"
 
-          echo "Kaggle auth configured."
+          echo "Kaggle authentication configured."
 
-      - name: Verify Kaggle auth
+      - name: Verify Kaggle
         shell: bash
         run: |
           set -euxo pipefail
-          kaggle kernels list --user "$KAGGLE_USERNAME" --page-size 1
+
+          kaggle --version
+
+          kaggle kernels list \
+            --user "$KAGGLE_USERNAME" \
+            --page-size 1
 
       - name: Install cloudflared
         shell: bash
         run: |
           set -euxo pipefail
 
-          CLOUDFLARED_TAG="$(
-            python3 - <<'PY'
-          import json
-          import urllib.request
+          echo "Getting latest cloudflared version..."
 
-          url = "https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
-          with urllib.request.urlopen(url) as r:
-              data = json.load(r)
-          print(data["tag_name"])
-          PY
-          )"
+          RELEASE_JSON="$(curl -fsSL \
+            --retry 5 \
+            --retry-delay 2 \
+            -H "User-Agent: GitHub-Actions" \
+            "https://api.github.com/repos/cloudflare/cloudflared/releases/latest")"
 
-          echo "Latest cloudflared tag: $CLOUDFLARED_TAG"
+          CLOUDFLARED_TAG="$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name')"
 
-          curl -fL --retry 5 --retry-delay 2 \
+          if [ -z "$CLOUDFLARED_TAG" ] || [ "$CLOUDFLARED_TAG" = "null" ]; then
+            echo "Could not determine cloudflared version."
+            exit 1
+          fi
+
+          echo "Latest version: $CLOUDFLARED_TAG"
+
+          curl -fL \
+            --retry 5 \
+            --retry-delay 2 \
             -o cloudflared \
             "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_TAG}/cloudflared-linux-amd64"
 
           chmod +x cloudflared
-          sudo install -m 0755 cloudflared /usr/local/bin/cloudflared
+
+          sudo install -m 0755 \
+            cloudflared \
+            /usr/local/bin/cloudflared
+
           cloudflared --version
 
       - name: Create relay server
@@ -84,7 +109,7 @@ jobs:
         run: |
           set -euxo pipefail
 
-          cat > relay.py <<'PY'
+          cat > relay.py <<'PYFILE'
           import asyncio
           import json
           from datetime import datetime, timezone
@@ -115,7 +140,12 @@ jobs:
 
           def save():
               with open(STATE_FILE, "w", encoding="utf-8") as f:
-                  json.dump(state, f, indent=2, ensure_ascii=False)
+                  json.dump(
+                      state,
+                      f,
+                      indent=2,
+                      ensure_ascii=False
+                  )
 
 
           def record(kind, **data):
@@ -124,27 +154,43 @@ jobs:
                   "at_utc": now(),
                   **data
               })
+
               if len(state["events"]) > 300:
                   state["events"] = state["events"][-300:]
+
               save()
 
 
           async def handler(ws):
+
               state["connections"] += 1
-              record("connect", remote=str(ws.remote_address), url="/ws")
+
+              record(
+                  "connect",
+                  remote=str(ws.remote_address)
+              )
 
               try:
+
                   async for raw in ws:
+
                       state["messages"] += 1
 
                       try:
                           msg = json.loads(raw)
                       except Exception:
-                          msg = {"type": "raw", "raw": raw}
+                          msg = {
+                              "type": "raw",
+                              "raw": raw
+                          }
 
-                      record("message", message=msg)
+                      record(
+                          "message",
+                          message=msg
+                      )
 
                       if msg.get("type") == "ready":
+
                           job = {
                               "type": "gpu_job",
                               "job_id": 1,
@@ -153,113 +199,189 @@ jobs:
                               "repeats": 50
                           }
 
-                          await ws.send(json.dumps(job))
+                          await ws.send(
+                              json.dumps(job)
+                          )
+
                           state["job_sent"] += 1
-                          record("job_sent", job=job)
+
+                          record(
+                              "job_sent",
+                              job=job
+                          )
 
                       elif msg.get("type") == "gpu_result":
-                          state["job_results"] += 1
-                          state["job_results_data"].append(msg)
-                          record("job_result", result=msg)
 
-                          await ws.send(json.dumps({
-                              "type": "ack",
-                              "ok": True,
-                              "job_id": msg.get("job_id"),
-                              "relay_utc": now()
-                          }))
+                          state["job_results"] += 1
+
+                          state[
+                              "job_results_data"
+                          ].append(msg)
+
+                          record(
+                              "job_result",
+                              result=msg
+                          )
+
+                          await ws.send(
+                              json.dumps({
+                                  "type": "ack",
+                                  "ok": True,
+                                  "job_id": msg.get("job_id"),
+                                  "relay_utc": now()
+                              })
+                          )
 
                           finished.set()
 
                       elif msg.get("type") == "ping":
-                          await ws.send(json.dumps({
-                              "type": "pong",
-                              "id": msg.get("id"),
-                              "relay_utc": now()
-                          }))
+
+                          await ws.send(
+                              json.dumps({
+                                  "type": "pong",
+                                  "id": msg.get("id"),
+                                  "relay_utc": now()
+                              })
+                          )
 
               except Exception as e:
-                  record("handler_error", error=repr(e))
+
+                  record(
+                      "handler_error",
+                      error=repr(e)
+                  )
 
               finally:
+
                   record("close")
 
 
           async def main():
+
               async with websockets.serve(
                   handler,
                   HOST,
                   PORT,
                   ping_interval=20,
                   ping_timeout=60,
-                  max_size=10 * 1024 * 1024,
+                  max_size=10 * 1024 * 1024
               ):
-                  print(f"Relay listening on ws://{HOST}:{PORT}/ws")
+
+                  print(
+                      f"Relay listening on ws://{HOST}:{PORT}/ws"
+                  )
+
                   save()
 
                   try:
-                      await asyncio.wait_for(finished.wait(), timeout=900)
+
+                      await asyncio.wait_for(
+                          finished.wait(),
+                          timeout=900
+                      )
+
                   except asyncio.TimeoutError:
+
                       record("timeout")
 
                   save()
-                  print(json.dumps(state, indent=2, ensure_ascii=False))
+
+                  print(
+                      json.dumps(
+                          state,
+                          indent=2,
+                          ensure_ascii=False
+                      )
+                  )
 
 
           if __name__ == "__main__":
               asyncio.run(main())
-          PY
+          PYFILE
 
       - name: Start relay
         shell: bash
         run: |
           set -euxo pipefail
-          nohup python3 relay.py > relay.log 2>&1 &
+
+          nohup python3 relay.py \
+            > relay.log 2>&1 &
+
           echo $! > relay.pid
+
           sleep 2
+
           cat relay.log || true
 
       - name: Start Cloudflare tunnel
         shell: bash
         run: |
           set -euxo pipefail
+
           nohup cloudflared tunnel \
             --url http://127.0.0.1:8765 \
             --no-autoupdate \
             > cloudflared.log 2>&1 &
+
           echo $! > cloudflared.pid
 
-          echo "Waiting for tunnel URL..."
+          echo "Waiting for Cloudflare tunnel..."
+
+          rm -f tunnel_url.txt
+
           for i in $(seq 1 60); do
-            if grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' cloudflared.log | head -n 1 > tunnel_url.txt; then
+
+            URL="$(grep -oE \
+              'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
+              cloudflared.log \
+              | head -n 1 || true)"
+
+            if [ -n "$URL" ]; then
+              printf '%s\n' "$URL" > tunnel_url.txt
               break
             fi
+
             sleep 2
+
           done
 
           if [ ! -s tunnel_url.txt ]; then
-            echo "Tunnel URL not found."
+
+            echo "Cloudflare tunnel URL was not found."
+
+            echo "===== CLOUDFLARED LOG ====="
             cat cloudflared.log || true
+
             exit 1
           fi
 
           TUNNEL_URL="$(cat tunnel_url.txt)"
+
           WSS_URL="${TUNNEL_URL/https:/wss:}/ws"
 
           echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
           echo "WSS_URL=$WSS_URL" >> "$GITHUB_ENV"
 
-          echo "Tunnel URL: $TUNNEL_URL"
-          echo "WSS URL: $WSS_URL"
+          echo
+          echo "=============================="
+          echo "PUBLIC HTTP:"
+          echo "$TUNNEL_URL"
+          echo
+          echo "PUBLIC WEBSOCKET:"
+          echo "$WSS_URL"
+          echo "=============================="
+          echo
 
-      - name: Create Kaggle worker
+      - name: Create Kaggle GPU worker
         shell: bash
         run: |
           set -euxo pipefail
+
           rm -rf kaggle_worker
+
           mkdir -p kaggle_worker
 
-          cat > kaggle_worker/worker.py <<PY
+          cat > kaggle_worker/worker.py <<PYWORKER
           import json
           import subprocess
           import time
@@ -268,22 +390,40 @@ jobs:
 
           import websocket
 
+
           WSS_URL = "${WSS_URL}"
+
           RESULT_FILE = "/kaggle/working/worker_result.json"
 
 
           def now():
-              return datetime.now(timezone.utc).isoformat()
+              return datetime.now(
+                  timezone.utc
+              ).isoformat()
 
 
           def save(result):
+
               result["end_utc"] = now()
-              with open(RESULT_FILE, "w", encoding="utf-8") as f:
-                  json.dump(result, f, indent=2, ensure_ascii=False)
+
+              with open(
+                  RESULT_FILE,
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+
+                  json.dump(
+                      result,
+                      f,
+                      indent=2,
+                      ensure_ascii=False
+                  )
 
 
           def nvidia_smi():
+
               try:
+
                   p = subprocess.run(
                       [
                           "nvidia-smi",
@@ -294,160 +434,460 @@ jobs:
                       text=True,
                       timeout=20
                   )
+
                   return {
-                      "rc": p.returncode,
+                      "return_code": p.returncode,
                       "output": p.stdout.strip(),
                       "stderr": p.stderr.strip()
                   }
+
               except Exception as e:
+
                   return {
                       "error": repr(e)
                   }
 
 
           def run_benchmark(n, repeats):
+
               import numpy as np
               from numba import cuda
 
+
               if not cuda.is_available():
-                  raise RuntimeError("CUDA is not available")
+
+                  raise RuntimeError(
+                      "CUDA is not available"
+                  )
+
 
               @cuda.jit
               def add_kernel(a, b, c):
+
                   i = cuda.grid(1)
+
                   if i < c.size:
+
                       c[i] = a[i] + b[i]
 
-              a = cuda.to_device(np.ones(n, dtype=np.float32))
-              b = cuda.to_device(np.ones(n, dtype=np.float32))
-              c = cuda.to_device(np.zeros(n, dtype=np.float32))
+
+              a = cuda.to_device(
+                  np.ones(
+                      n,
+                      dtype=np.float32
+                  )
+              )
+
+              b = cuda.to_device(
+                  np.ones(
+                      n,
+                      dtype=np.float32
+                  )
+              )
+
+              c = cuda.to_device(
+                  np.zeros(
+                      n,
+                      dtype=np.float32
+                  )
+              )
+
 
               threads = 256
-              blocks = (n + threads - 1) // threads
 
-              add_kernel[blocks, threads](a, b, c)
+              blocks = (
+                  n + threads - 1
+              ) // threads
+
+
+              add_kernel[
+                  blocks,
+                  threads
+              ](
+                  a,
+                  b,
+                  c
+              )
+
               cuda.synchronize()
+
 
               start = time.perf_counter()
-              for _ in range(repeats):
-                  add_kernel[blocks, threads](a, b, c)
-              cuda.synchronize()
-              elapsed = time.perf_counter() - start
 
-              start_evt = cuda.event(timing=True)
-              end_evt = cuda.event(timing=True)
-              start_evt.record()
               for _ in range(repeats):
-                  add_kernel[blocks, threads](a, b, c)
+
+                  add_kernel[
+                      blocks,
+                      threads
+                  ](
+                      a,
+                      b,
+                      c
+                  )
+
+              cuda.synchronize()
+
+              elapsed = (
+                  time.perf_counter()
+                  - start
+              )
+
+
+              start_evt = cuda.event(
+                  timing=True
+              )
+
+              end_evt = cuda.event(
+                  timing=True
+              )
+
+
+              start_evt.record()
+
+              for _ in range(repeats):
+
+                  add_kernel[
+                      blocks,
+                      threads
+                  ](
+                      a,
+                      b,
+                      c
+                  )
+
               end_evt.record()
+
               end_evt.synchronize()
 
-              kernel_ms_total = cuda.event_elapsed_time(start_evt, end_evt)
-              kernel_ms_per_launch = kernel_ms_total / repeats
 
-              bytes_total = n * 12 * repeats
-              bandwidth_gbps = bytes_total / elapsed / 1e9
+              kernel_ms_total = (
+                  cuda.event_elapsed_time(
+                      start_evt,
+                      end_evt
+                  )
+              )
 
-              gpu_name = cuda.get_current_device().name
-              if isinstance(gpu_name, bytes):
-                  gpu_name = gpu_name.decode(errors="replace")
+
+              kernel_ms_per_launch = (
+                  kernel_ms_total / repeats
+              )
+
+
+              bytes_total = (
+                  n * 12 * repeats
+              )
+
+
+              bandwidth_gbps = (
+                  bytes_total
+                  / elapsed
+                  / 1e9
+              )
+
+
+              gpu_name = (
+                  cuda.get_current_device().name
+              )
+
+
+              if isinstance(
+                  gpu_name,
+                  bytes
+              ):
+
+                  gpu_name = gpu_name.decode(
+                      errors="replace"
+                  )
+
 
               return {
+
                   "backend": "numba_cuda",
+
                   "gpu_name": gpu_name,
+
                   "elements": n,
+
                   "repeats": repeats,
-                  "kernel_ms_per_launch": float(kernel_ms_per_launch),
-                  "wall_ms": float(elapsed * 1000),
-                  "effective_bandwidth_gbps": float(bandwidth_gbps)
+
+                  "kernel_ms_per_launch":
+                      float(
+                          kernel_ms_per_launch
+                      ),
+
+                  "wall_ms":
+                      float(
+                          elapsed * 1000
+                      ),
+
+                  "effective_bandwidth_gbps":
+                      float(
+                          bandwidth_gbps
+                      )
               }
 
 
           result = {
-              "worker": "kaggle_gpu_ws_worker",
-              "wss_url": WSS_URL,
-              "start_utc": now(),
-              "status": "STARTING",
-              "jobs": []
+
+              "worker":
+                  "kaggle_gpu_ws_worker",
+
+              "wss_url":
+                  WSS_URL,
+
+              "start_utc":
+                  now(),
+
+              "status":
+                  "STARTING",
+
+              "jobs":
+                  []
           }
 
-          print("=" * 50)
-          print("KAGGLE GPU WS WORKER")
-          print("=" * 50)
-          print("WSS URL:", WSS_URL)
-          print("=== NVIDIA-SMI ===")
-          print(json.dumps(nvidia_smi(), indent=2, ensure_ascii=False))
+
+          print(
+              "=" * 60
+          )
+
+          print(
+              "KAGGLE GPU WEBSOCKET WORKER"
+          )
+
+          print(
+              "=" * 60
+          )
+
+          print(
+              "WSS URL:",
+              WSS_URL
+          )
+
+          print(
+              "NVIDIA-SMI:"
+          )
+
+          print(
+              json.dumps(
+                  nvidia_smi(),
+                  indent=2,
+                  ensure_ascii=False
+              )
+          )
+
 
           ws = None
 
-          try:
-              ws = websocket.create_connection(WSS_URL, timeout=30)
-              result["status"] = "CONNECTED"
 
-              ws.send(json.dumps({
-                  "type": "ready",
-                  "worker_utc": now()
-              }))
+          try:
+
+              ws = websocket.create_connection(
+                  WSS_URL,
+                  timeout=60
+              )
+
+
+              result["status"] = (
+                  "CONNECTED"
+              )
+
+
+              ws.send(
+                  json.dumps({
+                      "type": "ready",
+                      "worker_utc": now()
+                  })
+              )
+
+
+              print(
+                  "READY sent."
+              )
+
 
               while True:
+
                   raw = ws.recv()
+
                   if raw is None:
+
                       break
 
-                  msg = json.loads(raw)
-                  print("RECV:", msg)
 
-                  if msg.get("type") != "gpu_job":
+                  msg = json.loads(raw)
+
+                  print(
+                      "RECEIVED:",
+                      json.dumps(
+                          msg,
+                          ensure_ascii=False
+                      )
+                  )
+
+
+                  if (
+                      msg.get("type")
+                      != "gpu_job"
+                  ):
+
                       continue
 
-                  job_id = msg.get("job_id")
-                  n = int(msg.get("n", 16777216))
-                  repeats = int(msg.get("repeats", 50))
 
-                  started = time.perf_counter()
+                  job_id = msg.get(
+                      "job_id"
+                  )
+
+
+                  n = int(
+                      msg.get(
+                          "n",
+                          16777216
+                      )
+                  )
+
+
+                  repeats = int(
+                      msg.get(
+                          "repeats",
+                          50
+                      )
+                  )
+
+
+                  started = (
+                      time.perf_counter()
+                  )
+
 
                   try:
-                      benchmark = run_benchmark(n, repeats)
+
+                      benchmark = (
+                          run_benchmark(
+                              n,
+                              repeats
+                          )
+                      )
+
+
                       response = {
-                          "type": "gpu_result",
-                          "job_id": job_id,
-                          "worker_utc": now(),
-                          "compute_wall_ms": float((time.perf_counter() - started) * 1000),
-                          "benchmark": benchmark
-                      }
-                  except Exception as e:
-                      response = {
-                          "type": "gpu_result",
-                          "job_id": job_id,
-                          "worker_utc": now(),
-                          "error": repr(e),
-                          "traceback": traceback.format_exc()
+
+                          "type":
+                              "gpu_result",
+
+                          "job_id":
+                              job_id,
+
+                          "worker_utc":
+                              now(),
+
+                          "compute_wall_ms":
+                              float(
+                                  (
+                                      time.perf_counter()
+                                      - started
+                                  ) * 1000
+                              ),
+
+                          "benchmark":
+                              benchmark
                       }
 
-                  result["jobs"].append(response)
-                  ws.send(json.dumps(response))
-                  print("SENT:", json.dumps(response, indent=2, ensure_ascii=False))
+
+                  except Exception as e:
+
+                      response = {
+
+                          "type":
+                              "gpu_result",
+
+                          "job_id":
+                              job_id,
+
+                          "worker_utc":
+                              now(),
+
+                          "error":
+                              repr(e),
+
+                          "traceback":
+                              traceback.format_exc()
+                      }
+
+
+                  result[
+                      "jobs"
+                  ].append(
+                      response
+                  )
+
+
+                  ws.send(
+                      json.dumps(
+                          response
+                      )
+                  )
+
+
+                  print(
+                      "RESULT SENT:"
+                  )
+
+                  print(
+                      json.dumps(
+                          response,
+                          indent=2,
+                          ensure_ascii=False
+                      )
+                  )
+
+
                   break
+
 
               result["status"] = "DONE"
 
+
           except Exception as e:
+
               result["status"] = "ERROR"
+
               result["error"] = repr(e)
-              result["traceback"] = traceback.format_exc()
-              print("WORKER ERROR:", repr(e))
-              print(result["traceback"])
+
+              result["traceback"] = (
+                  traceback.format_exc()
+              )
+
+              print(
+                  "WORKER ERROR:",
+                  repr(e)
+              )
+
+              print(
+                  result["traceback"]
+              )
+
 
           finally:
+
               if ws is not None:
+
                   try:
                       ws.close()
                   except Exception:
                       pass
 
+
               save(result)
-              print(json.dumps(result, indent=2, ensure_ascii=False))
-          PY
+
+
+              print(
+                  json.dumps(
+                      result,
+                      indent=2,
+                      ensure_ascii=False
+                  )
+              )
+          PYWORKER
 
           cat > kaggle_worker/kernel-metadata.json <<EOF
           {
@@ -467,29 +907,68 @@ jobs:
           }
           EOF
 
+          echo "Kaggle worker created."
+
       - name: Push Kaggle kernel
         shell: bash
         run: |
           set -euxo pipefail
-          kaggle kernels push -p kaggle_worker
 
-      - name: Wait for worker result
+          kaggle kernels push \
+            -p kaggle_worker
+
+      - name: Wait for GPU worker
         shell: bash
         run: |
           set -euxo pipefail
 
+          echo "Waiting for GPU result..."
+
           for i in $(seq 1 120); do
-            if [ -f relay_result.json ] && grep -q '"job_results": 1' relay_result.json; then
-              echo "GPU result received."
-              break
+
+            if [ -f relay_result.json ]; then
+
+              RESULTS="$(
+                jq -r '.job_results' \
+                relay_result.json \
+                2>/dev/null || echo 0
+              )"
+
+              CONNECTIONS="$(
+                jq -r '.connections' \
+                relay_result.json \
+                2>/dev/null || echo 0
+              )"
+
+              echo \
+                "Attempt=$i connections=$CONNECTIONS results=$RESULTS"
+
+              if [ "$RESULTS" = "1" ]; then
+
+                echo \
+                  "GPU result received."
+
+                break
+
+              fi
+
             fi
 
+
             STATUS="$(
-              kaggle kernels status "$KAGGLE_KERNEL" 2>/dev/null | tail -n 1 || true
+              kaggle kernels status \
+                "$KAGGLE_KERNEL" \
+                2>/dev/null \
+                | tail -n 1 \
+                || true
             )"
-            echo "Kaggle status: $STATUS"
+
+            echo \
+              "Kaggle status: $STATUS"
+
 
             sleep 5
+
           done
 
       - name: Download Kaggle output
@@ -497,26 +976,46 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           mkdir -p kaggle_output
-          kaggle kernels output "$KAGGLE_KERNEL" -p kaggle_output --force || true
-          find kaggle_output -maxdepth 3 -type f -print || true
+
+          kaggle kernels output \
+            "$KAGGLE_KERNEL" \
+            -p kaggle_output \
+            --force || true
+
+          find kaggle_output \
+            -maxdepth 3 \
+            -type f \
+            -print || true
 
       - name: Collect logs
         if: always()
         shell: bash
         run: |
           set +e
-          echo "=== RELAY LOG ==="
+
+          echo
+          echo "================ RELAY LOG ================"
           cat relay.log || true
+
           echo
-          echo "=== CLOUDFLARED LOG ==="
+          echo "============= CLOUDFLARED LOG ============="
           cat cloudflared.log || true
+
           echo
-          echo "=== RELAY RESULT ==="
+          echo "============== RELAY RESULT ==============="
           cat relay_result.json || true
+
           echo
-          echo "=== KAGGLE OUTPUT FILES ==="
-          find kaggle_output -type f -maxdepth 3 -print -exec sh -c 'echo "--- $1"; cat "$1"; echo' _ {} \; || true
+          echo "============ KAGGLE OUTPUT ================"
+          find kaggle_output \
+            -type f \
+            -maxdepth 3 \
+            -print \
+            -exec sh -c \
+            'echo "--- $1"; cat "$1"; echo' \
+            _ {} \; || true
 
       - name: Upload artifacts
         if: always()
