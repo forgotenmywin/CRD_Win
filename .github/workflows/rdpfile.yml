@@ -6,7 +6,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Install tools
@@ -276,11 +276,13 @@ jobs:
           import sys
           import time
           import traceback
+          import urllib.request
           from datetime import datetime, timezone
 
           RAW_TUNNEL_URL = "${TUNNEL_URL}".strip()
           WSS_BASE = RAW_TUNNEL_URL.replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
           WSS_URL = f"{WSS_BASE}/ws"
+          HEALTH_URL = f"{RAW_TUNNEL_URL.rstrip('/')}/health"
           OUT_FILE = "/kaggle/working/worker_ws_result.json"
           ERR_FILE = "/kaggle/working/worker_ws_error.txt"
 
@@ -296,33 +298,35 @@ jobs:
               with open(ERR_FILE, "w") as f:
                   f.write(text)
 
-          result = {
-              "worker": "kaggle_gpu_ws_worker",
-              "hostname": socket.gethostname(),
-              "raw_tunnel_url": RAW_TUNNEL_URL,
-              "wss_url": WSS_URL,
-              "start_utc": datetime.now(timezone.utc).isoformat(),
-          }
+          def http_get(url, timeout=10):
+              req = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "Kaggle-GPU-WS-Worker"}
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  return resp.status, resp.read().decode("utf-8", errors="replace")
 
-          print("==========================================")
-          print("      KAGGLE GPU GPU JOB WORKER")
-          print("==========================================")
-          print("RAW TUNNEL URL:", RAW_TUNNEL_URL)
-          print("WSS URL:", WSS_URL)
-
-          smi = run([
-              "nvidia-smi",
-              "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw",
-              "--format=csv,noheader"
-          ])
-
-          print("\n=== NVIDIA-SMI ===")
-          print(smi.stdout)
-          if smi.stderr:
-              print(smi.stderr)
-
-          result["nvidia_smi"] = smi.stdout.strip()
-          result["nvidia_smi_rc"] = smi.returncode
+          def wait_for_dns_and_http(url, retries=10, sleep_s=5):
+              last_err = None
+              for attempt in range(1, retries + 1):
+                  try:
+                      host = url.split("://", 1)[1].split("/", 1)[0]
+                      socket.getaddrinfo(host, 443)
+                      status, body = http_get(url, timeout=10)
+                      return {
+                          "ok": True,
+                          "attempt": attempt,
+                          "status": status,
+                          "body_preview": body[:200]
+                      }
+                  except Exception as e:
+                      last_err = repr(e)
+                      print(f"[preflight {attempt}/{retries}] {last_err}")
+                      time.sleep(sleep_s)
+              return {
+                  "ok": False,
+                  "error": last_err
+              }
 
           def run_numba_job(job):
               from numba import cuda
@@ -383,7 +387,44 @@ jobs:
                   "effective_bandwidth_gbps": float(bandwidth_gbps)
               }
 
+          result = {
+              "worker": "kaggle_gpu_ws_worker",
+              "hostname": socket.gethostname(),
+              "raw_tunnel_url": RAW_TUNNEL_URL,
+              "wss_url": WSS_URL,
+              "health_url": HEALTH_URL,
+              "start_utc": datetime.now(timezone.utc).isoformat(),
+          }
+
+          print("==========================================")
+          print("      KAGGLE GPU WS WORKER")
+          print("==========================================")
+          print("RAW TUNNEL URL:", RAW_TUNNEL_URL)
+          print("WSS URL:", WSS_URL)
+          print("HEALTH URL:", HEALTH_URL)
+
+          smi = run([
+              "nvidia-smi",
+              "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw",
+              "--format=csv,noheader"
+          ])
+
+          print("\n=== NVIDIA-SMI ===")
+          print(smi.stdout)
+          if smi.stderr:
+              print(smi.stderr)
+
+          result["nvidia_smi"] = smi.stdout.strip()
+          result["nvidia_smi_rc"] = smi.returncode
+
           try:
+              preflight = wait_for_dns_and_http(HEALTH_URL, retries=10, sleep_s=5)
+              result["preflight"] = preflight
+              print("PREFLIGHT:", preflight)
+
+              if not preflight.get("ok"):
+                  raise RuntimeError("Health preflight failed: " + str(preflight))
+
               try:
                   import websocket
               except Exception:
@@ -397,7 +438,30 @@ jobs:
                   ])
                   import websocket
 
-              ws = websocket.create_connection(WSS_URL, timeout=20)
+              pings = []
+              ws = None
+
+              ws_url_candidates = [WSS_URL]
+              if WSS_URL.startswith("wss://"):
+                  ws_url_candidates.append("ws://" + WSS_URL[len("wss://"):])
+
+              last_ws_error = None
+
+              for candidate in ws_url_candidates:
+                  try:
+                      print("\nConnecting to relay:", candidate)
+                      ws = websocket.create_connection(candidate, timeout=20)
+                      WSS_USED = candidate
+                      break
+                  except Exception as e:
+                      last_ws_error = repr(e)
+                      print("WS connect failed:", last_ws_error)
+                      ws = None
+
+              if ws is None:
+                  raise RuntimeError("Unable to connect WebSocket: " + str(last_ws_error))
+
+              result["wss_used"] = WSS_USED
 
               welcome = json.loads(ws.recv())
               print("WELCOME:", welcome)
@@ -411,7 +475,6 @@ jobs:
               job = None
               gpu_result = None
               ack = None
-              pings = []
 
               while True:
                   raw = ws.recv()
