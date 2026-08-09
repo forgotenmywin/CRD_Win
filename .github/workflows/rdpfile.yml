@@ -1,4 +1,4 @@
-name: Kaggle GPU Worker - Real-Time GPU Queue Fixed
+name: Kaggle GPU Worker - Real-Time GPU Queue Fixed v3
 
 "on":
   workflow_dispatch:
@@ -11,6 +11,7 @@ jobs:
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+
       WORKER_COUNT: "2"
       STRESS_JOBS: "24"
       MAX_QUEUE: "500"
@@ -94,7 +95,6 @@ jobs:
 
           cat > relay.py <<'PY'
           import asyncio
-          import base64
           import json
           import os
           import secrets
@@ -341,39 +341,40 @@ jobs:
 
               await dispatch_jobs()
 
+          async def retryable_worker_cleanup(worker_id, reason):
+              worker = workers.get(worker_id)
+              if not worker:
+                  return
+              worker["alive"] = False
+              worker["busy"] = False
+              job_id = worker.get("current_job")
+              worker["current_job"] = None
+              record("worker_dead", worker_id=worker_id, reason=reason)
+              if job_id:
+                  await retry_job(job_id, reason)
+
           async def worker_watchdog():
               while True:
                   await asyncio.sleep(5)
                   current = mono()
-
                   for worker_id, worker in list(workers.items()):
                       if not worker["alive"]:
                           continue
                       age = current - worker["last_seen"]
                       if age > WORKER_DEAD_SECONDS:
-                          worker["alive"] = False
-                          record("worker_dead", worker_id=worker_id, age_seconds=age)
-                          job_id = worker.get("current_job")
-                          worker["busy"] = False
-                          worker["current_job"] = None
-                          if job_id:
-                              await retry_job(job_id, "worker_dead")
-
+                          await retryable_worker_cleanup(worker_id, "worker_dead")
                   await dispatch_jobs()
 
           async def job_watchdog():
               while True:
                   await asyncio.sleep(2)
                   current = mono()
-
                   for job_id, job in list(jobs.items()):
                       if job["status"] != "running":
                           continue
-
                       started = job.get("assigned_mono")
                       if not started:
                           continue
-
                       if current - started > JOB_TIMEOUT_SECONDS:
                           worker_id = job.get("worker_id")
                           worker = workers.get(worker_id)
@@ -381,7 +382,6 @@ jobs:
                               worker["busy"] = False
                               worker["current_job"] = None
                           await retry_job(job_id, "job_timeout")
-
                   await dispatch_jobs()
 
           async def worker_handler(ws, worker_id):
@@ -430,14 +430,7 @@ jobs:
               except Exception as e:
                   record("worker_exception", worker_id=worker_id, error=repr(e))
               finally:
-                  info = workers.get(worker_id)
-                  if info:
-                      info["alive"] = False
-                      job_id = info.get("current_job")
-                      info["busy"] = False
-                      info["current_job"] = None
-                      if job_id:
-                          await retry_job(job_id, "worker_connection_lost")
+                  await retryable_worker_cleanup(worker_id, "worker_connection_lost")
                   record("worker_disconnected", worker_id=worker_id)
                   await dispatch_jobs()
 
@@ -631,11 +624,9 @@ jobs:
             cat > "${DIR}/worker.py" <<PY
           import base64
           import json
-          import os
           import subprocess
           import time
           import traceback
-
           from datetime import datetime, timezone
 
           import numpy as np
@@ -921,7 +912,7 @@ jobs:
             cat > "${DIR}/kernel-metadata.json" <<EOF
           {
             "id": "${KAGGLE_USERNAME}/gpu-worker-${WORKER_INDEX}",
-            "title": "GPU WS Worker ${WORKER_INDEX}",
+            "title": "gpu-worker-${WORKER_INDEX}",
             "code_file": "worker.py",
             "language": "python",
             "kernel_type": "script",
@@ -998,10 +989,9 @@ jobs:
               print("JOBS:", COUNT)
               print("=" * 60)
 
-              pending = {}
-              latencies = []
               completed = 0
               accepted = 0
+              latencies = []
 
               async with websockets.connect(
                   WSS_URL,
@@ -1010,7 +1000,6 @@ jobs:
                   ping_interval=20,
                   ping_timeout=30
               ) as ws:
-
                   await ws.send(json.dumps({
                       "type": "auth",
                       "role": "client",
@@ -1024,22 +1013,18 @@ jobs:
                   status = json.loads(await ws.recv())
                   print("STATUS:", status)
 
-                  # Wait until at least one worker is alive.
                   for _ in range(60):
-                      workers_alive = status.get("workers_alive", 0)
-                      if workers_alive > 0:
+                      if status.get("workers_alive", 0) > 0:
                           break
                       await asyncio.sleep(2)
                       await ws.send(json.dumps({"type": "status"}))
                       status = json.loads(await ws.recv())
                       print("STATUS:", status)
 
-                  # Submit jobs.
                   for i in range(COUNT):
                       client_job_id = str(uuid.uuid4())
 
                       if i % 6 == 0:
-                          # Large input/output job.
                           request = {
                               "type": "submit",
                               "client_job_id": client_job_id,
@@ -1051,7 +1036,6 @@ jobs:
                               "max_retries": 3
                           }
                       elif i % 7 == 0:
-                          # Different GPU job.
                           request = {
                               "type": "submit",
                               "client_job_id": client_job_id,
@@ -1069,10 +1053,8 @@ jobs:
                               "max_retries": 3
                           }
 
-                      pending[client_job_id] = time.monotonic()
                       await ws.send(json.dumps(request))
 
-                  # Receive results.
                   deadline = time.monotonic() + 900
 
                   while completed < COUNT and time.monotonic() < deadline:
@@ -1092,16 +1074,15 @@ jobs:
 
                       if msg.get("type") == "job_result":
                           completed += 1
-                          job_id = msg.get("job_id")
                           latency = msg.get("latency", {})
                           total = latency.get("total_relay_ms")
                           if total is not None:
                               latencies.append(float(total))
-
                           if completed % 5 == 0:
-                              print(f"Completed {completed}/{COUNT} job_id={job_id}")
+                              print(f"Completed {completed}/{COUNT}")
+                          continue
 
-                      elif msg.get("type") == "job_failed":
+                      if msg.get("type") == "job_failed":
                           completed += 1
                           print("FAILED:", msg)
 
