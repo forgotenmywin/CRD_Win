@@ -1,4 +1,4 @@
-name: Kaggle GPU Real-Time Test v2
+name: Kaggle GPU Real-Time Test v3
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
@@ -57,12 +57,12 @@ jobs:
           chmod +x cloudflared
           sudo install -m 0755 cloudflared /usr/local/bin/cloudflared
 
-      # ========== RELAY با لاگ بیشتر ==========
+      # ========== RELAY ==========
       - name: Create relay
         shell: bash
         run: |
           cat > relay.py <<'PY'
-          import asyncio, json, os, time, uuid
+          import asyncio, json, os, sys, time, uuid
           from datetime import datetime, timezone
           import websockets
 
@@ -80,79 +80,68 @@ jobs:
           }
 
           def log(msg):
-              print(f"[RELAY {datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}")
+              ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
+              line = f"[RELAY {ts}] {msg}"
+              print(line, flush=True)
               with open("relay_debug.log", "a") as f:
-                  f.write(f"{msg}\n")
+                  f.write(line + "\n")
 
           async def handler(ws, path):
               remote = str(ws.remote_address)
               log(f"🔌 NEW CONNECTION from {remote}")
               state["connections"].append({"time": time.time(), "remote": remote})
               
-              # Auth
               try:
                   raw = await asyncio.wait_for(ws.recv(), timeout=30)
                   msg = json.loads(raw)
-                  log(f"📨 Auth message: {msg.get('type')} from {msg.get('worker_id', 'unknown')}")
+                  log(f"📨 Auth: type={msg.get('type')} worker={msg.get('worker_id', 'unknown')}")
                   
-                  if msg.get("type") != "auth":
-                      log("❌ Auth failed: wrong type")
-                      await ws.send(json.dumps({"type": "auth_failed"}))
-                      return
-                  if msg.get("token") != AUTH_TOKEN:
-                      log("❌ Auth failed: wrong token")
+                  if msg.get("type") != "auth" or msg.get("token") != AUTH_TOKEN:
+                      log("❌ Auth failed")
                       await ws.send(json.dumps({"type": "auth_failed"}))
                       return
                       
                   worker_id = msg.get("worker_id", str(uuid.uuid4()))
                   await ws.send(json.dumps({"type": "auth_ok", "worker_id": worker_id}))
-                  log(f"✅ Worker authenticated: {worker_id}")
+                  log(f"✅ Auth OK: {worker_id}")
                   state["worker_connected"] = True
               except Exception as e:
-                  log(f"❌ Auth exception: {e}")
-                  state["error"] = f"Auth failed: {e}"
+                  log(f"❌ Auth error: {e}")
                   return
 
-              # Send test job
-              job = {
-                  "job_id": 1,
-                  "type": "gpu_job", 
-                  "operation": "gpu_info"
-              }
+              # Send job
+              job = {"job_id": 1, "type": "gpu_job", "operation": "gpu_info"}
               state["job_sent_at"] = time.perf_counter()
               await ws.send(json.dumps(job))
-              log(f"📤 Job sent at {state['job_sent_at']}")
+              log(f"📤 Job sent")
 
-              # Wait for result
+              # Wait result
               try:
-                  raw = await asyncio.wait_for(ws.recv(), timeout=120)
+                  raw = await asyncio.wait_for(ws.recv(), timeout=180)
                   state["result_received_at"] = time.perf_counter()
                   msg = json.loads(raw)
-                  log(f"📥 Result received: {msg.get('type')}")
+                  log(f"📥 Result: {msg.get('type')}")
                   
                   if msg.get("type") == "gpu_result":
                       state["total_seconds"] = state["result_received_at"] - state["job_sent_at"]
-                      state["gpu_info"] = msg.get("output", {})
-                      log(f"✅ SUCCESS in {state['total_seconds']:.2f}s")
+                      state["gpu_info"] = msg
+                      log(f"✅ SUCCESS: {state['total_seconds']:.2f}s")
                   else:
                       state["error"] = f"Unexpected: {msg}"
-                      log(f"❌ Unexpected response: {msg}")
-                      
+                      log(f"❌ Unexpected: {msg}")
               except asyncio.TimeoutError:
                   state["error"] = "Timeout"
-                  log("❌ TIMEOUT waiting for result")
+                  log("❌ TIMEOUT")
 
-              # Save result
               with open("test_result.json", "w") as f:
                   json.dump(state, f, indent=2)
-              
-              log("🔒 Closing connection")
+              log("💾 Result saved")
               await ws.close()
 
           async def main():
               log("🚀 Starting relay on ws://127.0.0.1:8765")
               async with websockets.serve(handler, "127.0.0.1", 8765, ping_interval=20, ping_timeout=60):
-                  await asyncio.sleep(300)
+                  await asyncio.sleep(600)  # 10 min
 
           asyncio.run(main())
           PY
@@ -162,7 +151,7 @@ jobs:
         run: |
           nohup python3 relay.py > relay.log 2>&1 &
           sleep 2
-          echo "=== Relay started ==="
+          echo "=== Relay PID: $(cat relay.pid 2>/dev/null || echo unknown) ==="
           cat relay.log || true
 
       - name: Start Cloudflare tunnel
@@ -182,7 +171,7 @@ jobs:
           done
           test -n "$WSS_URL" || { echo "Tunnel failed"; cat cloudflared.log; exit 1; }
 
-      # ========== WORKER با لاگ بیشتر ==========
+      # ========== WORKER ساده‌تر ==========
       - name: Create Kaggle worker
         shell: bash
         run: |
@@ -193,7 +182,7 @@ jobs:
           import asyncio, json, os, subprocess, sys, time, traceback, uuid
           from datetime import datetime, timezone
 
-          # Install websockets if missing
+          # Install websockets
           try:
               import websockets
           except ImportError:
@@ -201,109 +190,73 @@ jobs:
               subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "websockets"])
               import websockets
 
-          try:
-              import torch
-              TORCH_OK = True
-          except ImportError:
-              TORCH_OK = False
-              print("[WORKER] WARNING: PyTorch not available")
-
           WSS_URL = "${WSS_URL}"
           AUTH_TOKEN = "${GPU_WORKER_TOKEN}"
-          WORKER_ID = "test-worker-" + str(uuid.uuid4())[:8]
+          WORKER_ID = "test-" + str(uuid.uuid4())[:8]
 
-          def now():
-              return datetime.now(timezone.utc).isoformat()
+          def log(msg):
+              ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
+              line = f"[WORKER {ts}] {msg}"
+              print(line, flush=True)
+              with open("/kaggle/working/debug.log", "a") as f:
+                  f.write(line + "\n")
 
-          def get_gpu_info():
+          def gpu_info():
               try:
-                  p = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,temperature.gpu", "--format=csv,noheader"],
-                                    capture_output=True, text=True, timeout=10)
+                  p = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
                   return p.stdout.strip()
               except Exception as e:
                   return str(e)
 
           async def main():
-              log_file = "/kaggle/working/worker_debug.log"
-              def log(msg):
-                  line = f"[{now()}] {msg}"
-                  print(line)
-                  with open(log_file, "a") as f:
-                      f.write(line + "\n")
-
-              log(f"🚀 {WORKER_ID} starting...")
-              log(f"WSS_URL: {WSS_URL}")
-              log(f"GPU: {get_gpu_info()}")
-              log(f"PyTorch: {TORCH_OK}")
-              
-              if TORCH_OK:
-                  log(f"CUDA available: {torch.cuda.is_available()}")
+              log(f"🚀 START {WORKER_ID}")
+              log(f"WSS_URL={WSS_URL}")
+              log(f"GPU={gpu_info()}")
               
               ws = None
               try:
-                  # Connect with retry
                   for attempt in range(1, 31):
                       try:
-                          log(f"🔌 Connecting attempt {attempt}/30...")
-                          ws = await websockets.connect(
-                              WSS_URL, 
-                              open_timeout=30, 
-                              close_timeout=10,
-                              ping_interval=20,
-                              ping_timeout=60
-                          )
-                          log("✅ Connected!")
+                          log(f"🔌 Connect attempt {attempt}/30...")
+                          ws = await websockets.connect(WSS_URL, open_timeout=30, close_timeout=10)
+                          log("✅ CONNECTED")
                           break
                       except Exception as e:
-                          log(f"❌ Connect error: {e}")
+                          log(f"❌ Connect error: {str(e)[:100]}")
                           await asyncio.sleep(min(attempt * 2, 15))
                   
                   if not ws:
-                      raise RuntimeError("Could not connect after 30 attempts")
+                      raise RuntimeError("Failed to connect")
 
-                  # Auth
                   await ws.send(json.dumps({
                       "type": "auth",
                       "token": AUTH_TOKEN,
                       "worker_id": WORKER_ID
                   }))
                   log("📨 Auth sent")
-                  
-                  # Wait for job
+
                   raw = await ws.recv()
                   msg = json.loads(raw)
-                  log(f"📥 Received: {msg}")
+                  log(f"📥 Got: {msg}")
 
                   if msg.get("type") == "gpu_job":
-                      # Do GPU work
-                      if TORCH_OK and torch.cuda.is_available():
-                          device = torch.device("cuda")
-                          a = torch.randn(1000, 1000, device=device)
-                          b = torch.randn(1000, 1000, device=device)
-                          c = torch.matmul(a, b)
-                          torch.cuda.synchronize()
-                          gpu_name = torch.cuda.get_device_name(0)
-                      else:
-                          gpu_name = "CPU_FALLBACK"
-                      
                       result = {
                           "type": "gpu_result",
                           "job_id": msg["job_id"],
                           "worker_id": WORKER_ID,
-                          "gpu_name": gpu_name,
-                          "nvidia_smi": get_gpu_info(),
-                          "torch_ok": TORCH_OK
+                          "gpu": gpu_info(),
+                          "timestamp": datetime.now(timezone.utc).isoformat()
                       }
                       await ws.send(json.dumps(result))
                       log("✅ Result sent")
                   else:
-                      log(f"Unexpected message type: {msg.get('type')}")
-                  
+                      log(f"Unexpected: {msg}")
+
               except Exception as e:
                   log(f"❌ ERROR: {e}")
                   traceback.print_exc()
               finally:
-                  log("🏁 Worker finished")
+                  log("🏁 END")
                   if ws:
                       await ws.close()
 
@@ -332,113 +285,92 @@ jobs:
         run: |
           set -euxo pipefail
           kaggle kernels push -p kaggle_test/worker
-          echo "✅ Worker pushed"
+          echo "✅ Pushed. Waiting for Kaggle to start..."
 
-      # ========== CHECK KAGGLE STATUS ==========
-      - name: Check Kaggle worker status
+      # ========== MONITOR KAGGLE STATUS ==========
+      - name: Monitor Kaggle status
         shell: bash
         run: |
-          echo "Checking Kaggle worker status..."
-          for i in $(seq 1 20); do
-            echo "--- Attempt $i ---"
-            kaggle kernels status "${KAGGLE_USERNAME}/gpu-test-worker" 2>/dev/null || true
-            sleep 3
+          echo "Monitoring Kaggle worker status..."
+          for i in $(seq 1 30); do
+            echo "--- Check $i ---"
+            kaggle kernels status "${KAGGLE_USERNAME}/gpu-test-worker" 2>/dev/null || echo "Status check failed"
+            echo ""
+            sleep 5
           done
 
       # ========== WAIT FOR RESULT ==========
-      - name: Wait for test result
+      - name: Wait for result
         shell: bash
         run: |
           set -u
-          echo "Waiting for worker to connect..."
-          
           for i in $(seq 1 60); do
             echo ""
             echo "=== Attempt $i/60 ==="
             
-            # Check relay connections
-            if [ -f relay_debug.log ]; then
-              echo "--- Relay connections ---"
-              cat relay_debug.log | tail -20
-            fi
-            
-            # Check result
             if [ -f test_result.json ]; then
-              echo ""
-              echo "=========================================="
-              echo "✅ TEST COMPLETED"
-              echo "=========================================="
+              echo "✅ RESULT FOUND!"
               cat test_result.json
-              
               TOTAL=$(jq -r '.total_seconds // "null"' test_result.json)
               if [ "$TOTAL" != "null" ] && [ "$TOTAL" != "0" ]; then
                 echo ""
                 if (( $(echo "$TOTAL < 5" | bc -l) )); then
-                  echo "🚀 REAL-TIME: YES (< 5 seconds)"
+                  echo "🚀 REAL-TIME: YES"
                 elif (( $(echo "$TOTAL < 30" | bc -l) )); then
-                  echo "⚠️  REAL-TIME: MAYBE (5-30 seconds)"
+                  echo "⚠️ MAYBE"
                 else
-                  echo "❌ REAL-TIME: NO (> 30 seconds)"
+                  echo "❌ NO"
                 fi
               fi
               exit 0
             fi
             
-            # Check if any connection happened
             if [ -f relay_debug.log ]; then
-              CONNS=$(grep -c "NEW CONNECTION" relay_debug.log 2>/dev/null || echo 0)
-              if [ "$CONNS" -gt 0 ]; then
-                echo "Connections so far: $CONNS"
-              fi
+              echo "--- Relay log ---"
+              tail -10 relay_debug.log
             fi
             
             sleep 5
           done
           
-          echo ""
           echo "❌ TIMEOUT"
           exit 1
 
-      - name: Download worker output
+      # ========== DOWNLOAD & REPORT ==========
+      - name: Download and report
         if: always()
         shell: bash
         run: |
           set +e
           mkdir -p test_output
+          
           echo "Downloading worker output..."
           kaggle kernels output "${KAGGLE_USERNAME}/gpu-test-worker" -p test_output --force || true
-          echo "--- Files ---"
-          find test_output -type f -print || true
-          echo "--- Logs ---"
-          cat test_output/*.log 2>/dev/null || true
-          echo "--- JSON ---"
-          cat test_output/*.json 2>/dev/null || true
-
-      - name: Final report
-        if: always()
-        shell: bash
-        run: |
-          echo "=========================================="
-          echo "FINAL REPORT"
-          echo "=========================================="
+          
           echo ""
-          echo "Tunnel:"
-          grep trycloudflare cloudflared.log | head -1 || true
+          echo "=========================================="
+          echo "WORKER FILES:"
+          find test_output -type f 2>/dev/null | while read f; do
+            echo "--- $f ---"
+            cat "$f"
+            echo ""
+          done
+          
           echo ""
-          echo "Relay debug:"
+          echo "=========================================="
+          echo "RELAY DEBUG:"
           cat relay_debug.log 2>/dev/null || echo "No relay debug"
+          
           echo ""
-          echo "Test result:"
+          echo "=========================================="
+          echo "TEST RESULT:"
           cat test_result.json 2>/dev/null || echo "No result"
-          echo ""
-          echo "Relay log:"
-          cat relay.log || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gpu-realtime-test-v2
+          name: gpu-test-v3
           path: |
             test_result.json
             relay.log
