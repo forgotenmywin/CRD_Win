@@ -1,4 +1,4 @@
-name: Kaggle GPU Real-Time Test v3
+name: Kaggle GPU Real-Time Test v5
 
 on:
   workflow_dispatch:
@@ -17,9 +17,6 @@ jobs:
       GPU_WORKER_TOKEN: ${{ secrets.GPU_WORKER_TOKEN }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Install dependencies
         shell: bash
         run: |
@@ -36,7 +33,7 @@ jobs:
           test -n "${KAGGLE_USERNAME:-}" || { echo "ERROR: KAGGLE_USERNAME is missing"; exit 1; }
           test -n "${KAGGLE_API_TOKEN:-}" || { echo "ERROR: KAGGLE_API_TOKEN is missing"; exit 1; }
           test -n "${GPU_WORKER_TOKEN:-}" || { echo "ERROR: GPU_WORKER_TOKEN is missing"; exit 1; }
-          echo "Secrets OK."
+          echo "Secrets OK. Username: ${KAGGLE_USERNAME}"
 
       - name: Configure Kaggle
         shell: bash
@@ -47,6 +44,14 @@ jobs:
           {"username": "${KAGGLE_USERNAME}", "key": "${KAGGLE_API_TOKEN}"}
           EOF
           chmod 600 "$HOME/.kaggle/kaggle.json"
+          echo "Kaggle config created"
+
+      - name: Test Kaggle API
+        shell: bash
+        run: |
+          echo "Testing Kaggle API..."
+          kaggle kernels list --user "$KAGGLE_USERNAME" --page-size 1 || true
+          echo "API test done"
 
       - name: Install cloudflared
         shell: bash
@@ -62,7 +67,7 @@ jobs:
         shell: bash
         run: |
           cat > relay.py <<'PY'
-          import asyncio, json, os, sys, time, uuid
+          import asyncio, json, os, time, uuid
           from datetime import datetime, timezone
           import websockets
 
@@ -117,7 +122,7 @@ jobs:
 
               # Wait result
               try:
-                  raw = await asyncio.wait_for(ws.recv(), timeout=180)
+                  raw = await asyncio.wait_for(ws.recv(), timeout=300)
                   state["result_received_at"] = time.perf_counter()
                   msg = json.loads(raw)
                   log(f"📥 Result: {msg.get('type')}")
@@ -141,7 +146,7 @@ jobs:
           async def main():
               log("🚀 Starting relay on ws://127.0.0.1:8765")
               async with websockets.serve(handler, "127.0.0.1", 8765, ping_interval=20, ping_timeout=60):
-                  await asyncio.sleep(600)  # 10 min
+                  await asyncio.sleep(600)
 
           asyncio.run(main())
           PY
@@ -151,7 +156,6 @@ jobs:
         run: |
           nohup python3 relay.py > relay.log 2>&1 &
           sleep 2
-          echo "=== Relay PID: $(cat relay.pid 2>/dev/null || echo unknown) ==="
           cat relay.log || true
 
       - name: Start Cloudflare tunnel
@@ -171,28 +175,36 @@ jobs:
           done
           test -n "$WSS_URL" || { echo "Tunnel failed"; cat cloudflared.log; exit 1; }
 
-      # ========== WORKER ساده‌تر ==========
+      # ========== CREATE WORKER ==========
       - name: Create Kaggle worker
         shell: bash
         run: |
           set -euxo pipefail
           rm -rf kaggle_test && mkdir -p kaggle_test/worker
           
+          # IMPORTANT: Use simple slug without special chars
+          KERNEL_SLUG="gpuw-test-$(date +%s)"
+          echo "KERNEL_SLUG=$KERNEL_SLUG" >> "$GITHUB_ENV"
+          
           cat > kaggle_test/worker/worker.py <<PYWORKER
-          import asyncio, json, os, subprocess, sys, time, traceback, uuid
+          import asyncio
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+          import traceback
+          import uuid
           from datetime import datetime, timezone
 
-          # Install websockets
-          try:
-              import websockets
-          except ImportError:
-              print("[WORKER] Installing websockets...")
-              subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "websockets"])
-              import websockets
+          # Install websockets first thing
+          print("[WORKER] Installing websockets...")
+          subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "websockets"])
+          import websockets
 
           WSS_URL = "${WSS_URL}"
           AUTH_TOKEN = "${GPU_WORKER_TOKEN}"
-          WORKER_ID = "test-" + str(uuid.uuid4())[:8]
+          WORKER_ID = "kgpu-" + str(uuid.uuid4())[:8]
 
           def log(msg):
               ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
@@ -206,7 +218,7 @@ jobs:
                   p = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
                   return p.stdout.strip()
               except Exception as e:
-                  return str(e)
+                  return f"Error: {e}"
 
           async def main():
               log(f"🚀 START {WORKER_ID}")
@@ -222,11 +234,11 @@ jobs:
                           log("✅ CONNECTED")
                           break
                       except Exception as e:
-                          log(f"❌ Connect error: {str(e)[:100]}")
+                          log(f"❌ Connect error: {str(e)[:200]}")
                           await asyncio.sleep(min(attempt * 2, 15))
                   
                   if not ws:
-                      raise RuntimeError("Failed to connect")
+                      raise RuntimeError("Failed to connect after 30 attempts")
 
                   await ws.send(json.dumps({
                       "type": "auth",
@@ -250,7 +262,7 @@ jobs:
                       await ws.send(json.dumps(result))
                       log("✅ Result sent")
                   else:
-                      log(f"Unexpected: {msg}")
+                      log(f"Unexpected type: {msg.get('type')}")
 
               except Exception as e:
                   log(f"❌ ERROR: {e}")
@@ -265,8 +277,8 @@ jobs:
 
           cat > kaggle_test/worker/kernel-metadata.json <<EOF
           {
-            "id": "${KAGGLE_USERNAME}/gpu-test-worker",
-            "title": "gpu-test-worker",
+            "id": "${KAGGLE_USERNAME}/${KERNEL_SLUG}",
+            "title": "${KERNEL_SLUG}",
             "code_file": "worker.py",
             "language": "python",
             "kernel_type": "script",
@@ -280,23 +292,55 @@ jobs:
           }
           EOF
 
+          echo "=== kernel-metadata.json ==="
+          cat kaggle_test/worker/kernel-metadata.json
+
+      # ========== PUSH & RUN ==========
       - name: Push Kaggle worker
         shell: bash
         run: |
           set -euxo pipefail
+          echo "Pushing kernel: ${KERNEL_SLUG}"
           kaggle kernels push -p kaggle_test/worker
-          echo "✅ Pushed. Waiting for Kaggle to start..."
+          echo "✅ Push done"
+          
+          # Wait a bit for Kaggle to process
+          sleep 5
 
-      # ========== MONITOR KAGGLE STATUS ==========
-      - name: Monitor Kaggle status
+      # ========== CHECK STATUS WITH RETRY ==========
+      - name: Check Kaggle status
         shell: bash
         run: |
-          echo "Monitoring Kaggle worker status..."
-          for i in $(seq 1 30); do
-            echo "--- Check $i ---"
-            kaggle kernels status "${KAGGLE_USERNAME}/gpu-test-worker" 2>/dev/null || echo "Status check failed"
+          set +e
+          echo "Checking Kaggle kernel status..."
+          
+          for i in $(seq 1 40); do
             echo ""
-            sleep 5
+            echo "=== Check $i/40 ==="
+            
+            # Try to get status - note the correct format
+            STATUS_OUTPUT=$(kaggle kernels status "${KAGGLE_USERNAME}/${KERNEL_SLUG}" 2>&1)
+            echo "Raw output: $STATUS_OUTPUT"
+            
+            # Check if it's running
+            if echo "$STATUS_OUTPUT" | grep -q "running"; then
+              echo "🟢 Kernel is RUNNING!"
+              break
+            fi
+            
+            # Check if complete
+            if echo "$STATUS_OUTPUT" | grep -q "complete"; then
+              echo "🟡 Kernel is COMPLETE (might have finished fast)"
+              break
+            fi
+            
+            # Check if error
+            if echo "$STATUS_OUTPUT" | grep -q "error"; then
+              echo "🔴 Kernel has ERROR"
+              break
+            fi
+            
+            sleep 10
           done
 
       # ========== WAIT FOR RESULT ==========
@@ -315,25 +359,25 @@ jobs:
               if [ "$TOTAL" != "null" ] && [ "$TOTAL" != "0" ]; then
                 echo ""
                 if (( $(echo "$TOTAL < 5" | bc -l) )); then
-                  echo "🚀 REAL-TIME: YES"
+                  echo "🚀 REAL-TIME: YES (< 5s)"
                 elif (( $(echo "$TOTAL < 30" | bc -l) )); then
-                  echo "⚠️ MAYBE"
+                  echo "⚠️ REAL-TIME: MAYBE (5-30s)"
                 else
-                  echo "❌ NO"
+                  echo "❌ REAL-TIME: NO (> 30s)"
                 fi
               fi
               exit 0
             fi
             
             if [ -f relay_debug.log ]; then
-              echo "--- Relay log ---"
-              tail -10 relay_debug.log
+              echo "--- Relay connections ---"
+              tail -5 relay_debug.log
             fi
             
             sleep 5
           done
           
-          echo "❌ TIMEOUT"
+          echo "❌ TIMEOUT - No result from worker"
           exit 1
 
       # ========== DOWNLOAD & REPORT ==========
@@ -345,15 +389,15 @@ jobs:
           mkdir -p test_output
           
           echo "Downloading worker output..."
-          kaggle kernels output "${KAGGLE_USERNAME}/gpu-test-worker" -p test_output --force || true
+          kaggle kernels output "${KAGGLE_USERNAME}/${KERNEL_SLUG}" -p test_output --force || true
           
           echo ""
           echo "=========================================="
           echo "WORKER FILES:"
           find test_output -type f 2>/dev/null | while read f; do
-            echo "--- $f ---"
-            cat "$f"
             echo ""
+            echo "=== $f ==="
+            cat "$f" 2>/dev/null
           done
           
           echo ""
@@ -365,12 +409,17 @@ jobs:
           echo "=========================================="
           echo "TEST RESULT:"
           cat test_result.json 2>/dev/null || echo "No result"
+          
+          echo ""
+          echo "=========================================="
+          echo "CLOUDFLARE LOG:"
+          tail -20 cloudflared.log 2>/dev/null || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gpu-test-v3
+          name: gpu-test-v5
           path: |
             test_result.json
             relay.log
