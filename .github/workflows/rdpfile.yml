@@ -1,4 +1,4 @@
-name: Kaggle Worker WebSocket Relay Test
+name: Kaggle Worker GPU Job Relay Test
 
 on:
   workflow_dispatch:
@@ -57,11 +57,13 @@ jobs:
             started_utc: new Date().toISOString(),
             connections: 0,
             messages: 0,
+            job_sent: 0,
+            job_results: 0,
             events: []
           };
 
           function trimEvents() {
-            if (state.events.length > 400) state.events = state.events.slice(-400);
+            if (state.events.length > 500) state.events = state.events.slice(-500);
           }
 
           function save() {
@@ -104,6 +106,12 @@ jobs:
 
           wss.on('connection', (socket, req) => {
             state.connections += 1;
+
+            const conn = {
+              jobSent: false,
+              jobDone: false
+            };
+
             logEvent('connect', {
               remote: req.socket.remoteAddress,
               url: req.url
@@ -116,8 +124,10 @@ jobs:
 
             socket.on('message', (buf) => {
               state.messages += 1;
+
               const raw = buf.toString();
               let msg = null;
+
               try {
                 msg = JSON.parse(raw);
               } catch (e) {
@@ -126,19 +136,59 @@ jobs:
 
               logEvent('message', { message: msg });
 
-              if (msg && msg.type === 'ping') {
+              if (msg && msg.type === 'ready' && !conn.jobSent) {
+                conn.jobSent = true;
+
+                const job = {
+                  type: 'gpu_job',
+                  job_id: 1,
+                  benchmark: 'numba_vector_add',
+                  n: 16777216,
+                  repeats: 50
+                };
+
+                state.job_sent += 1;
+                logEvent('job_sent', { job });
+
+                socket.send(JSON.stringify(job));
+                return;
+              }
+
+              if (msg && msg.type === 'gpu_result') {
+                conn.jobDone = true;
+                state.job_results += 1;
+
+                logEvent('job_result', { result: msg });
+
                 socket.send(JSON.stringify({
-                  type: 'pong',
-                  id: msg.id,
+                  type: 'ack',
+                  job_id: msg.job_id,
+                  ok: true,
                   server_time_ms: Date.now()
                 }));
-              } else {
-                socket.send(JSON.stringify({
-                  type: 'echo',
-                  server_time_ms: Date.now(),
-                  received: msg
-                }));
+
+                setTimeout(() => {
+                  try {
+                    socket.close();
+                  } catch (e) {}
+                }, 300);
+
+                return;
               }
+
+              if (msg && msg.type === 'heartbeat') {
+                socket.send(JSON.stringify({
+                  type: 'heartbeat_ack',
+                  server_time_ms: Date.now()
+                }));
+                return;
+              }
+
+              socket.send(JSON.stringify({
+                type: 'echo',
+                server_time_ms: Date.now(),
+                received: msg
+              }));
             });
 
             socket.on('close', () => logEvent('close', {}));
@@ -213,15 +263,14 @@ jobs:
 
       - name: Create Kaggle worker
         env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           TUNNEL_URL: ${{ env.TUNNEL_URL }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
           set -euo pipefail
           mkdir -p kaggle_ws_worker
 
           cat > kaggle_ws_worker/worker.py <<PY
           import json
-          import os
           import socket
           import subprocess
           import sys
@@ -256,7 +305,7 @@ jobs:
           }
 
           print("==========================================")
-          print("      KAGGLE GPU WS WORKER")
+          print("      KAGGLE GPU GPU JOB WORKER")
           print("==========================================")
           print("RAW TUNNEL URL:", RAW_TUNNEL_URL)
           print("WSS URL:", WSS_URL)
@@ -275,6 +324,65 @@ jobs:
           result["nvidia_smi"] = smi.stdout.strip()
           result["nvidia_smi_rc"] = smi.returncode
 
+          def run_numba_job(job):
+              from numba import cuda
+              import numpy as np
+
+              n = int(job.get("n", 1 << 24))
+              repeats = int(job.get("repeats", 50))
+
+              @cuda.jit
+              def vector_add(a, b, c):
+                  i = cuda.grid(1)
+                  if i < c.size:
+                      c[i] = a[i] + b[i]
+
+              device = cuda.get_current_device()
+              gpu_name = device.name
+              if isinstance(gpu_name, bytes):
+                  gpu_name = gpu_name.decode()
+
+              a = np.random.rand(n).astype(np.float32)
+              b = np.random.rand(n).astype(np.float32)
+
+              d_a = cuda.to_device(a)
+              d_b = cuda.to_device(b)
+              d_c = cuda.device_array_like(a)
+
+              threads = 256
+              blocks = (n + threads - 1) // threads
+
+              vector_add[blocks, threads](d_a, d_b, d_c)
+              cuda.synchronize()
+
+              start_event = cuda.event(timing=True)
+              end_event = cuda.event(timing=True)
+
+              wall_start = time.perf_counter()
+              start_event.record()
+
+              for _ in range(repeats):
+                  vector_add[blocks, threads](d_a, d_b, d_c)
+
+              end_event.record()
+              end_event.synchronize()
+              wall_end = time.perf_counter()
+
+              kernel_ms = cuda.event_elapsed_time(start_event, end_event)
+              wall_ms = (wall_end - wall_start) * 1000
+              bytes_moved = n * 4 * 3 * repeats
+              bandwidth_gbps = bytes_moved / (kernel_ms / 1000) / 1e9
+
+              return {
+                  "backend": "numba_cuda",
+                  "gpu_name": gpu_name,
+                  "elements": n,
+                  "repeats": repeats,
+                  "kernel_ms": float(kernel_ms),
+                  "wall_ms": float(wall_ms),
+                  "effective_bandwidth_gbps": float(bandwidth_gbps)
+              }
+
           try:
               try:
                   import websocket
@@ -289,45 +397,60 @@ jobs:
                   ])
                   import websocket
 
-              pings = []
-              ws = None
-
-              print("\nConnecting to relay...")
               ws = websocket.create_connection(WSS_URL, timeout=20)
+
               welcome = json.loads(ws.recv())
               print("WELCOME:", welcome)
               result["welcome"] = welcome
 
-              max_pings = 60
-              sleep_s = 5
+              ws.send(json.dumps({
+                  "type": "ready",
+                  "worker_utc": datetime.now(timezone.utc).isoformat()
+              }))
 
-              for i in range(1, max_pings + 1):
-                  payload = {
-                      "type": "ping",
-                      "id": i,
-                      "client_utc": datetime.now(timezone.utc).isoformat()
-                  }
+              job = None
+              gpu_result = None
+              ack = None
+              pings = []
 
-                  t0 = time.perf_counter()
-                  ws.send(json.dumps(payload))
-                  reply_raw = ws.recv()
-                  rtt_ms = (time.perf_counter() - t0) * 1000
+              while True:
+                  raw = ws.recv()
+                  msg = json.loads(raw)
+                  print("RECV:", msg)
 
-                  try:
-                      reply = json.loads(reply_raw)
-                  except Exception:
-                      reply = {"type": "bad_json", "raw": reply_raw}
+                  if msg.get("type") == "gpu_job":
+                      job = msg
 
-                  print(f"[PING {i}] rtt={rtt_ms:.2f}ms reply={reply}")
+                      t0 = time.perf_counter()
+                      compute_start_utc = datetime.now(timezone.utc).isoformat()
+                      gpu_result = run_numba_job(job)
+                      compute_ms = (time.perf_counter() - t0) * 1000
 
-                  pings.append({
-                      "id": i,
-                      "rtt_ms": rtt_ms,
-                      "reply": reply,
-                      "client_utc": payload["client_utc"]
-                  })
+                      payload = {
+                          "type": "gpu_result",
+                          "job_id": job.get("job_id"),
+                          "worker_utc": datetime.now(timezone.utc).isoformat(),
+                          "compute_wall_ms": float(compute_ms),
+                          "benchmark": gpu_result
+                      }
 
-                  time.sleep(sleep_s)
+                      ws.send(json.dumps(payload))
+                      print("SENT GPU RESULT:", payload)
+                      result["job"] = job
+                      result["compute_start_utc"] = compute_start_utc
+                      result["gpu_result"] = gpu_result
+                      result["compute_wall_ms"] = float(compute_ms)
+                      continue
+
+                  if msg.get("type") == "ack":
+                      ack = msg
+                      print("ACK:", ack)
+                      result["ack"] = ack
+                      break
+
+                  if msg.get("type") == "heartbeat_ack":
+                      pings.append(msg)
+                      continue
 
               result["status"] = "DONE"
               result["pings"] = pings
