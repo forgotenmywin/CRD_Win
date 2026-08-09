@@ -48,10 +48,9 @@ jobs:
               t = datetime.now(timezone.utc).strftime("%H:%M:%S")
               print(f"[{t}] {m}", flush=True)
 
-          # WebSocket handler for Kaggle GPU Worker
           async def ws_handler(ws, path):
               state["connected"] = True
-              log("🔌 GPU Worker connected!")
+              log("GPU Worker connected!")
               try:
                   while True:
                       j = await jobs.get()
@@ -61,12 +60,11 @@ jobs:
                       r["_relay_ms"] = (time.perf_counter() - j["_sent"]) * 1000
                       results[j["id"]] = r
                       state["jobs_done"] += 1
-                      log(f"✅ Job {j['id']} done in {r['_relay_ms']:.1f}ms")
+                      log(f"Job {j['id']} done in {r['_relay_ms']:.1f}ms")
               except Exception as e:
                   log(f"Worker error: {e}")
                   state["connected"] = False
 
-          # HTTP API for VPS Client
           async def add_job(request):
               try:
                   d = await request.json()
@@ -74,7 +72,7 @@ jobs:
                   d = {}
               i = str(uuid.uuid4())[:8]
               await jobs.put({"id": i, **d})
-              log(f"📥 Queued job {i}")
+              log(f"Queued job {i}")
               return web.json_response({"job_id": i, "status": "queued"})
 
           async def get_result(request):
@@ -87,96 +85,83 @@ jobs:
               return web.json_response(state)
 
           async def main():
-              # WS for Kaggle
               asyncio.create_task(
                   websockets.serve(ws_handler, "127.0.0.1", 8765, ping_interval=20, ping_timeout=60)
               )
-              # HTTP for VPS
               app = web.Application()
               app.router.add_post("/job", add_job)
               app.router.add_get("/result/{id}", get_result)
               app.router.add_get("/status", status)
               await web.AppRunner(app).setup()
               await web.TCPSite(app, "127.0.0.1", 8080).start()
-              log("🚀 Relay ready! WS:8765 API:8080")
+              log("Relay ready! WS:8765 API:8080")
               await asyncio.Future()
 
           asyncio.run(main())
           PY
 
           nohup python3 relay.py > relay.log 2>&1 &
-          RELAY_PID=$!
+          echo "Relay PID: $!"
           sleep 3
-          log "Relay PID: $RELAY_PID"
 
           # 2. Cloudflare tunnel for WebSocket (Kaggle Worker)
           nohup cloudflared tunnel --url http://127.0.0.1:8765 --no-autoupdate > ws.log 2>&1 &
-          WS_PID=$!
-          log "WS tunnel PID: $WS_PID"
-
+          echo "WS tunnel PID: $!"
+          
           # 3. Cloudflare tunnel for HTTP API (VPS Client)
           nohup cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > api.log 2>&1 &
-          API_PID=$!
-          log "API tunnel PID: $API_PID"
+          echo "API tunnel PID: $!"
 
           # 4. Wait for tunnels
-          log "Waiting for Cloudflare tunnels..."
+          echo "Waiting for Cloudflare tunnels..."
           sleep 20
 
-          # Extract URLs - fixed regex
-          extract_url() {
-            grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$1" | head -1
-          }
+          # Extract URLs
+          WS_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' ws.log | head -1)
+          API_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' api.log | head -1)
 
-          WS_URL=$(extract_url ws.log)
-          API_URL=$(extract_url api.log)
-
-          # Debug
-          log ""
-          log "=== DEBUG LOGS ==="
-          log "--- WS tunnel log ---"
+          echo ""
+          echo "=== DEBUG ==="
+          echo "--- WS log ---"
           head -10 ws.log || true
-          log "--- API tunnel log ---"
+          echo "--- API log ---"
           head -10 api.log || true
-          log ""
+          echo ""
 
-          # Validate
           if [ -z "$WS_URL" ]; then
-            log "ERROR: WS tunnel URL not found!"
+            echo "ERROR: WS tunnel URL not found!"
             cat ws.log
             exit 1
           fi
 
           if [ -z "$API_URL" ]; then
-            log "ERROR: API tunnel URL not found!"
+            echo "ERROR: API tunnel URL not found!"
             cat api.log
             exit 1
           fi
 
-          # Convert WS URL to wss://
           WSS_URL=$(echo "$WS_URL" | sed 's/^https:/wss:/')/
 
-          log ""
-          log "================================"
-          log "WORKER WSS: $WSS_URL"
-          log "CLIENT API: $API_URL"
-          log "================================"
-          log ""
-          log "Copy WSS_URL to Kaggle notebook"
-          log "Copy API_URL to VPS Windows"
-          log ""
+          echo ""
+          echo "================================"
+          echo "WORKER WSS: $WSS_URL"
+          echo "CLIENT API: $API_URL"
+          echo "================================"
+          echo ""
+          echo "Copy WSS_URL to Kaggle notebook"
+          echo "Copy API_URL to VPS Windows"
+          echo ""
 
-          # Save to files for artifact
           echo "$WSS_URL" > wss_url.txt
           echo "$API_URL" > api_url.txt
 
           # Keep alive
-          log "Running for 6 hours..."
+          echo "Running for 6 hours..."
           for i in $(seq 1 4320); do
             sleep 5
             if [ $((i % 120)) -eq 0 ]; then
               MINS=$((i / 12))
-              log "... ${MINS}min | jobs: ${state[jobs_done]}"
+              echo "... ${MINS}min elapsed"
             fi
           done
 
