@@ -6,7 +6,7 @@ on:
 jobs:
   relay:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
@@ -294,9 +294,15 @@ def nvidia_smi():
             text=True,
             timeout=20
         )
-        return {"rc": p.returncode, "output": p.stdout.strip(), "stderr": p.stderr.strip()}
+        return {
+            "rc": p.returncode,
+            "output": p.stdout.strip(),
+            "stderr": p.stderr.strip()
+        }
     except Exception as e:
-        return {"error": repr(e)}
+        return {
+            "error": repr(e)
+        }
 
 
 def run_benchmark(n, repeats):
