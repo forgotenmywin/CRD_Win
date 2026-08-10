@@ -15,22 +15,17 @@ jobs:
       - name: Install
         run: |
           pip install websockets aiohttp
-          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o c
-          chmod +x c && sudo mv c /usr/local/bin/
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
 
-      - name: Relay
+      - name: Start Relay
         shell: bash
         run: |
-          set -e
-
+          # 1. Relay
           cat > relay.py <<'PY'
-          import asyncio
-          import json
-          import os
-          import time
-          import uuid
+          import asyncio, json, os, time, uuid
           from datetime import datetime, timezone
-
           import websockets
           from aiohttp import web
 
@@ -43,15 +38,15 @@ jobs:
               t = datetime.now(timezone.utc).strftime("%H:%M:%S")
               print(f"[{t}] {m}", flush=True)
 
-          async def ws_handler(ws):
+          async def ws_handler(websocket):
               state["connected"] = True
               log("GPU Worker connected!")
               try:
                   while True:
                       j = await jobs.get()
                       j["_sent"] = time.perf_counter()
-                      await ws.send(json.dumps(j))
-                      r = json.loads(await asyncio.wait_for(ws.recv(), timeout=300))
+                      await websocket.send(json.dumps(j))
+                      r = json.loads(await asyncio.wait_for(websocket.recv(), timeout=300))
                       r["_relay_ms"] = (time.perf_counter() - j["_sent"]) * 1000
                       results[j["id"]] = r
                       state["jobs_done"] += 1
@@ -76,62 +71,47 @@ jobs:
                   return web.json_response({"status": "done", "result": results[i]})
               return web.json_response({"status": "pending"})
 
-          async def status(request):
-              return web.json_response(state)
-
           async def main():
-              # Start WS server properly
-              ws_server = await websockets.serve(
-                  ws_handler, 
-                  "127.0.0.1", 
-                  8765,
-                  ping_interval=20,
-                  ping_timeout=60
-              )
-              log("WS Server started on :8765")
+              await websockets.serve(ws_handler, "127.0.0.1", 8765, ping_interval=20, ping_timeout=60)
+              log("WS on :8765")
               
-              # Start HTTP API
               app = web.Application()
               app.router.add_post("/job", add_job)
               app.router.add_get("/result/{id}", get_result)
-              app.router.add_get("/status", status)
               runner = web.AppRunner(app)
               await runner.setup()
               await web.TCPSite(runner, "127.0.0.1", 8080).start()
-              log("HTTP API started on :8080")
+              log("HTTP on :8080")
               
-              # Keep alive forever
               await asyncio.Future()
 
           asyncio.run(main())
           PY
 
-          nohup python3 relay.py > relay.log 2>&1 &
-          echo "Relay PID: $!"
+          python3 relay.py > relay.log 2>&1 &
           sleep 3
+          echo "Relay PID: $!"
 
-          # Tunnels
+          # 2. Tunnels
           nohup cloudflared tunnel --url http://127.0.0.1:8765 --no-autoupdate > ws.log 2>&1 &
-          echo "WS tunnel PID: $!"
-          
           nohup cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > api.log 2>&1 &
-          echo "API tunnel PID: $!"
+          
+          echo "Waiting 30s for tunnels..."
+          sleep 30
 
-          sleep 25  # بیشتر صبر کن
-
-          WS_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' ws.log | head -1)
-          API_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' api.log | head -1)
+          # 3. Extract URLs (NO set -e, so grep failure won't crash)
+          WS_URL=$(cat ws.log | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -1 || true)
+          API_URL=$(cat api.log | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -1 || true)
 
           echo ""
-          echo "=== DEBUG ==="
-          echo "--- WS ---"
-          cat ws.log | grep -E "(Tunnel|trycloudflare)" | head -5
-          echo "--- API ---"
-          cat api.log | grep -E "(Tunnel|trycloudflare)" | head -5
+          echo "=== WS LOG ==="
+          cat ws.log | grep -E "Tunnel|trycloudflare" | head -3
+          echo "=== API LOG ==="
+          cat api.log | grep -E "Tunnel|trycloudflare" | head -3
           echo ""
 
           if [ -z "$WS_URL" ] || [ -z "$API_URL" ]; then
-            echo "ERROR: Tunnel failed"
+            echo "ERROR: URL not found. Full logs:"
             cat ws.log
             cat api.log
             exit 1
@@ -139,12 +119,10 @@ jobs:
 
           WSS_URL=$(echo "$WS_URL" | sed 's/^https:/wss:/')/
 
-          echo ""
           echo "================================"
-          echo "WORKER WSS: $WSS_URL"
-          echo "CLIENT API: $API_URL"
+          echo "WSS: $WSS_URL"
+          echo "API: $API_URL"
           echo "================================"
-          echo ""
 
           echo "$WSS_URL" > wss_url.txt
           echo "$API_URL" > api_url.txt
@@ -152,7 +130,7 @@ jobs:
           # Keep alive
           for i in $(seq 1 4320); do
             sleep 5
-            [ $((i % 120)) -eq 0 ] && echo "... $((i/12))min"
+            [ $((i % 60)) -eq 0 ] && echo "... $((i/12))min"
           done
 
       - name: Upload
