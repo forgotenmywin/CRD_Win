@@ -12,22 +12,17 @@ jobs:
       TOKEN: ${{ secrets.GPU_WORKER_TOKEN }}
 
     steps:
-      - name: Install Python deps
+      - name: Install
         run: |
           pip install websockets aiohttp
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o c
+          chmod +x c && sudo mv c /usr/local/bin/
 
-      - name: Install cloudflared
-        run: |
-          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/
-
-      - name: Start Relay + Tunnels
+      - name: Relay
         shell: bash
         run: |
           set -e
 
-          # 1. Relay server
           cat > relay.py <<'PY'
           import asyncio
           import json
@@ -48,7 +43,7 @@ jobs:
               t = datetime.now(timezone.utc).strftime("%H:%M:%S")
               print(f"[{t}] {m}", flush=True)
 
-          async def ws_handler(ws, path):
+          async def ws_handler(ws):
               state["connected"] = True
               log("GPU Worker connected!")
               try:
@@ -85,16 +80,27 @@ jobs:
               return web.json_response(state)
 
           async def main():
-              asyncio.create_task(
-                  websockets.serve(ws_handler, "127.0.0.1", 8765, ping_interval=20, ping_timeout=60)
+              # Start WS server properly
+              ws_server = await websockets.serve(
+                  ws_handler, 
+                  "127.0.0.1", 
+                  8765,
+                  ping_interval=20,
+                  ping_timeout=60
               )
+              log("WS Server started on :8765")
+              
+              # Start HTTP API
               app = web.Application()
               app.router.add_post("/job", add_job)
               app.router.add_get("/result/{id}", get_result)
               app.router.add_get("/status", status)
-              await web.AppRunner(app).setup()
-              await web.TCPSite(app, "127.0.0.1", 8080).start()
-              log("Relay ready! WS:8765 API:8080")
+              runner = web.AppRunner(app)
+              await runner.setup()
+              await web.TCPSite(runner, "127.0.0.1", 8080).start()
+              log("HTTP API started on :8080")
+              
+              # Keep alive forever
               await asyncio.Future()
 
           asyncio.run(main())
@@ -104,38 +110,29 @@ jobs:
           echo "Relay PID: $!"
           sleep 3
 
-          # 2. Cloudflare tunnel for WebSocket (Kaggle Worker)
+          # Tunnels
           nohup cloudflared tunnel --url http://127.0.0.1:8765 --no-autoupdate > ws.log 2>&1 &
           echo "WS tunnel PID: $!"
           
-          # 3. Cloudflare tunnel for HTTP API (VPS Client)
           nohup cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > api.log 2>&1 &
           echo "API tunnel PID: $!"
 
-          # 4. Wait for tunnels
-          echo "Waiting for Cloudflare tunnels..."
-          sleep 20
+          sleep 25  # بیشتر صبر کن
 
-          # Extract URLs
           WS_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' ws.log | head -1)
           API_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' api.log | head -1)
 
           echo ""
           echo "=== DEBUG ==="
-          echo "--- WS log ---"
-          head -10 ws.log || true
-          echo "--- API log ---"
-          head -10 api.log || true
+          echo "--- WS ---"
+          cat ws.log | grep -E "(Tunnel|trycloudflare)" | head -5
+          echo "--- API ---"
+          cat api.log | grep -E "(Tunnel|trycloudflare)" | head -5
           echo ""
 
-          if [ -z "$WS_URL" ]; then
-            echo "ERROR: WS tunnel URL not found!"
+          if [ -z "$WS_URL" ] || [ -z "$API_URL" ]; then
+            echo "ERROR: Tunnel failed"
             cat ws.log
-            exit 1
-          fi
-
-          if [ -z "$API_URL" ]; then
-            echo "ERROR: API tunnel URL not found!"
             cat api.log
             exit 1
           fi
@@ -148,24 +145,17 @@ jobs:
           echo "CLIENT API: $API_URL"
           echo "================================"
           echo ""
-          echo "Copy WSS_URL to Kaggle notebook"
-          echo "Copy API_URL to VPS Windows"
-          echo ""
 
           echo "$WSS_URL" > wss_url.txt
           echo "$API_URL" > api_url.txt
 
           # Keep alive
-          echo "Running for 6 hours..."
           for i in $(seq 1 4320); do
             sleep 5
-            if [ $((i % 120)) -eq 0 ]; then
-              MINS=$((i / 12))
-              echo "... ${MINS}min elapsed"
-            fi
+            [ $((i % 120)) -eq 0 ] && echo "... $((i/12))min"
           done
 
-      - name: Upload artifacts
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
