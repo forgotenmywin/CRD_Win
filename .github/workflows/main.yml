@@ -52,10 +52,18 @@ jobs:
         run: |
           SLUG="${{ secrets.KAGGLE_USERNAME }}/repo-gpu-run"
           for i in $(seq 1 120); do
-            STATUS=$(kaggle kernels status "$SLUG" 2>/dev/null | tail -1 | awk '{print $NF}')
+            # فیکس: کوتیشن ها رو حذف کن
+            STATUS=$(kaggle kernels status "$SLUG" 2>/dev/null | tail -1 | awk -F'"' '{print $2}' | tr '[:upper:]' '[:lower:]')
             echo "[$i/120] Status: ${STATUS:-waiting}"
-            [ "$STATUS" = "complete" ] && echo "Done!" && break
-            [ "$STATUS" = "error" ] && echo "Error! Downloading logs anyway..." && break
+            
+            if [ "$STATUS" = "kernelworkerstatus.complete" ]; then
+              echo "Done!"
+              break
+            elif [ "$STATUS" = "kernelworkerstatus.error" ]; then
+              echo "Error!"
+              break
+            fi
+            
             sleep 10
           done
 
@@ -73,7 +81,7 @@ jobs:
           cat output/debug_log.txt 2>/dev/null || echo "No debug_log.txt"
           echo ""
           echo "========== ALL FILES =========="
-          find output -type f -exec echo "--- {}" \; -exec cat {} \;
+          find output -type f
 
       - name: Upload Artifact
         if: always()
