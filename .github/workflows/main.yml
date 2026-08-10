@@ -1,38 +1,30 @@
-name: Run Repo File on Kaggle GPU
+name: Run Kaggle GPU (Cloudflare)
 
 on:
   workflow_dispatch:
 
 jobs:
-  gpu:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     steps:
       - uses: actions/checkout@v4
-
-      - run: pip install kaggle
-
-      - run: |
+      
+      - name: Setup Kaggle
+        run: |
+          pip install kaggle
           mkdir -p ~/.kaggle
-          echo "${{ secrets.KAGGLE_API_TOKEN }}" > ~/.kaggle/access_token
-          chmod 600 ~/.kaggle/access_token
-
+          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+      
       - name: Push to Kaggle
         env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          TAILSCALE_AUT: ${{ secrets.TAILSCALE_AUT }}   # ← TAILSCALE_AUT
         run: |
-          ID="test-$(date +%s)"
-          echo "ID=$ID" >> $GITHUB_ENV
-          
-          mkdir -p push
-          cp kaggle_gpu.py push/script.py
-          
-          cat > push/kernel-metadata.json <<EOF
+          cat > kernel-metadata.json << 'EOF'
           {
-            "id": "${{ secrets.KAGGLE_USERNAME }}/gpu-${ID}",
-            "title": "gpu-${ID}",
-            "code_file": "script.py",
+            "id": "${{ secrets.KAGGLE_USERNAME }}/kaggle-gpu-tunnel",
+            "title": "GPU Tunnel CF",
+            "code_file": "kaggle.py",
             "language": "python",
             "kernel_type": "script",
             "is_private": true,
@@ -41,33 +33,6 @@ jobs:
           }
           EOF
           
-          cd push
-          kaggle kernels push -p .
-
-      - name: Wait
-        run: |
-          echo "Waiting 12 minutes..."
-          sleep 720
-
-      - name: Download
-        env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-        run: |
-          SLUG="${{ secrets.KAGGLE_USERNAME }}/gpu-${{ env.ID }}"
-          mkdir -p out
-          kaggle kernels output "$SLUG" -p out --force || true
-          
-          echo "=== FILES ==="
-          ls -la out/ || true
-          
-          echo "=== OUTPUT ==="
-          cat out/output.txt 2>/dev/null || echo "No output.txt"
-          
-          echo "=== OTHER ==="
-          find out -type f -exec echo "--- {}" \; -exec cat {} \;
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: gpu-result
-          path: out/**
+          kaggle kernels push -p ./
+          sleep 60
+          kaggle kernels status ${{ secrets.KAGGLE_USERNAME }}/kaggle-gpu-tunnel
