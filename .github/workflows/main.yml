@@ -9,14 +9,11 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Kaggle CLI
-        run: pip install kaggle
+      - run: pip install kaggle
 
-      - name: Kaggle Auth
-        run: |
+      - run: |
           mkdir -p ~/.kaggle
           echo "${{ secrets.KAGGLE_API_TOKEN }}" > ~/.kaggle/access_token
           chmod 600 ~/.kaggle/access_token
@@ -25,16 +22,16 @@ jobs:
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
-          ID="run-$(date +%s)"
-          echo "RUN_ID=$ID" >> $GITHUB_ENV
+          ID="test-$(date +%s)"
+          echo "ID=$ID" >> $GITHUB_ENV
           
-          mkdir -p kaggle_push
-          cp kaggle_gpu.py kaggle_push/script.py
+          mkdir -p push
+          cp kaggle_gpu.py push/script.py
           
-          cat > kaggle_push/kernel-metadata.json <<EOF
+          cat > push/kernel-metadata.json <<EOF
           {
-            "id": "${{ secrets.KAGGLE_USERNAME }}/repo-gpu-${ID}",
-            "title": "GPU ${ID}",
+            "id": "${{ secrets.KAGGLE_USERNAME }}/gpu-${ID}",
+            "title": "gpu-${ID}",
             "code_file": "script.py",
             "language": "python",
             "kernel_type": "script",
@@ -44,34 +41,33 @@ jobs:
           }
           EOF
           
-          cd kaggle_push
+          cd push
           kaggle kernels push -p .
-          echo "Pushed: repo-gpu-${ID}"
 
-      - name: Wait for Kaggle (Queue + Run)
+      - name: Wait
         run: |
-          echo "Sleeping 12 minutes for Queue + GPU run..."
-          sleep 720  # 12 دقیقه صبر
+          echo "Waiting 12 minutes..."
+          sleep 720
 
-      - name: Download Output
+      - name: Download
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
-          SLUG="${{ secrets.KAGGLE_USERNAME }}/repo-gpu-${{ env.RUN_ID }}"
-          mkdir -p output
-          kaggle kernels output "$SLUG" -p output --force || true
+          SLUG="${{ secrets.KAGGLE_USERNAME }}/gpu-${{ env.ID }}"
+          mkdir -p out
+          kaggle kernels output "$SLUG" -p out --force || true
+          
+          echo "=== FILES ==="
+          ls -la out/ || true
+          
+          echo "=== OUTPUT ==="
+          cat out/output.txt 2>/dev/null || echo "No output.txt"
+          
+          echo "=== OTHER ==="
+          find out -type f -exec echo "--- {}" \; -exec cat {} \;
 
-      - name: Show Logs
-        run: |
-          echo "========== LOG =========="
-          cat output/debug_log.txt 2>/dev/null || echo "No debug_log.txt"
-          echo ""
-          echo "========== FILES =========="
-          find output -type f
-
-      - name: Upload Artifact
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: kaggle-gpu-${{ env.RUN_ID }}
-          path: output/**
+          name: gpu-result
+          path: out/**
