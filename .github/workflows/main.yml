@@ -1,21 +1,80 @@
-# این کد روی Kaggle GPU اجرا می‌شه
-import torch
-import subprocess
+name: Run Repo File on Kaggle GPU
 
-# GPU Info
-smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
-print("GPU:", smi.stdout)
+on:
+  workflow_dispatch:
 
-# محاسبه
-print("Starting...")
-device = torch.device("cuda")
-a = torch.randn(5000, 5000, device=device)
-b = torch.randn(5000, 5000, device=device)
+jobs:
+  gpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
-torch.cuda.synchronize()
-c = torch.matmul(a, b)
-torch.cuda.synchronize()
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_API_TOKEN }}
 
-print("Result:", c.shape)
-print("Sum:", c.sum().item())
-print("Done!")
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Kaggle CLI
+        run: pip install kaggle
+
+      - name: Kaggle Auth
+        run: |
+          mkdir -p ~/.kaggle
+          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_API_TOKEN }}"}' > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Prepare Kaggle Kernel
+        run: |
+          mkdir -p kaggle_push
+          cp kaggle_gpu.py kaggle_push/script.py
+          cat > kaggle_push/kernel-metadata.json <<EOF
+          {
+            "id": "${{ secrets.KAGGLE_USERNAME }}/repo-gpu-run",
+            "title": "Repo GPU Run",
+            "code_file": "script.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": true,
+            "enable_gpu": true,
+            "enable_internet": true
+          }
+          EOF
+
+      - name: Push to Kaggle
+        run: |
+          cd kaggle_push
+          kaggle kernels push -p .
+
+      - name: Wait for Run
+        run: |
+          SLUG="${{ secrets.KAGGLE_USERNAME }}/repo-gpu-run"
+          for i in $(seq 1 120); do
+            STATUS=$(kaggle kernels status "$SLUG" 2>/dev/null | tail -1 | awk '{print $NF}')
+            echo "[$i/120] Status: ${STATUS:-waiting}"
+            [ "$STATUS" = "complete" ] && echo "Done!" && break
+            [ "$STATUS" = "error" ] && echo "Error!" && break
+            sleep 10
+          done
+
+      - name: Download Output
+        run: |
+          SLUG="${{ secrets.KAGGLE_USERNAME }}/repo-gpu-run"
+          mkdir -p output
+          kaggle kernels output "$SLUG" -p output --force || true
+
+      - name: Show Logs
+        run: |
+          echo "========== LOG =========="
+          cat output/log* 2>/dev/null || true
+          echo ""
+          echo "========== FILES =========="
+          find output -type f
+
+      - name: Upload Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-output
+          path: output/**
