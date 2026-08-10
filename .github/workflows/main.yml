@@ -20,13 +20,11 @@ jobs:
           mkdir -p ~/.kaggle
           echo "${{ secrets.KAGGLE_API_TOKEN }}" > ~/.kaggle/access_token
           chmod 600 ~/.kaggle/access_token
-          echo "KAGGLE_API_TOKEN=${{ secrets.KAGGLE_API_TOKEN }}" >> $GITHUB_ENV
 
-      - name: Prepare & Push Kaggle Kernel
+      - name: Push to Kaggle
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
-          # هر بار اسم جدید → force new run
           ID="run-$(date +%s)"
           echo "RUN_ID=$ID" >> $GITHUB_ENV
           
@@ -36,7 +34,7 @@ jobs:
           cat > kaggle_push/kernel-metadata.json <<EOF
           {
             "id": "${{ secrets.KAGGLE_USERNAME }}/repo-gpu-${ID}",
-            "title": "GPU Run ${ID}",
+            "title": "GPU ${ID}",
             "code_file": "script.py",
             "language": "python",
             "kernel_type": "script",
@@ -48,29 +46,12 @@ jobs:
           
           cd kaggle_push
           kaggle kernels push -p .
+          echo "Pushed: repo-gpu-${ID}"
 
-      - name: Wait for Run
-        env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      - name: Wait for Kaggle (Queue + Run)
         run: |
-          SLUG="${{ secrets.KAGGLE_USERNAME }}/repo-gpu-${{ env.RUN_ID }}"
-          echo "Waiting for: $SLUG"
-          
-          for i in $(seq 1 180); do
-            RAW=$(kaggle kernels status "$SLUG" 2>/dev/null | tail -1)
-            STATUS=$(echo "$RAW" | grep -oP 'status\s+\K\w+' || echo "$RAW" | awk '{print $NF}')
-            echo "[$i/180] $STATUS"
-            
-            if echo "$STATUS" | grep -qi "complete"; then
-              echo "Done!"
-              break
-            elif echo "$STATUS" | grep -qi "error"; then
-              echo "Error!"
-              break
-            fi
-            
-            sleep 10
-          done
+          echo "Sleeping 12 minutes for Queue + GPU run..."
+          sleep 720  # 12 دقیقه صبر
 
       - name: Download Output
         env:
@@ -79,18 +60,14 @@ jobs:
           SLUG="${{ secrets.KAGGLE_USERNAME }}/repo-gpu-${{ env.RUN_ID }}"
           mkdir -p output
           kaggle kernels output "$SLUG" -p output --force || true
-          
-          echo "=== FILES ==="
-          find output -type f -ls || true
 
       - name: Show Logs
         run: |
-          echo "========== DEBUG LOG =========="
+          echo "========== LOG =========="
           cat output/debug_log.txt 2>/dev/null || echo "No debug_log.txt"
-          
           echo ""
-          echo "========== ALL FILES =========="
-          find output -type f -exec echo "--- {}" \; -exec head -100 {} \;
+          echo "========== FILES =========="
+          find output -type f
 
       - name: Upload Artifact
         if: always()
