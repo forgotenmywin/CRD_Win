@@ -18,19 +18,9 @@ jobs:
       - name: Kaggle Auth
         run: |
           mkdir -p ~/.kaggle
-          # روش جدید: access_token
           echo "${{ secrets.KAGGLE_API_TOKEN }}" > ~/.kaggle/access_token
           chmod 600 ~/.kaggle/access_token
-          # روش پشتیبان: kaggle.json
-          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_API_TOKEN }}"}' > ~/.kaggle/kaggle.json
-          chmod 600 ~/.kaggle/kaggle.json
-          # متغیر محیطی
           echo "KAGGLE_API_TOKEN=${{ secrets.KAGGLE_API_TOKEN }}" >> $GITHUB_ENV
-
-      - name: Test Kaggle Auth
-        run: |
-          export KAGGLE_API_TOKEN="${{ secrets.KAGGLE_API_TOKEN }}"
-          kaggle kernels list --user "${{ secrets.KAGGLE_USERNAME }}" --page-size 1
 
       - name: Prepare Kaggle Kernel
         run: |
@@ -65,7 +55,7 @@ jobs:
             STATUS=$(kaggle kernels status "$SLUG" 2>/dev/null | tail -1 | awk '{print $NF}')
             echo "[$i/120] Status: ${STATUS:-waiting}"
             [ "$STATUS" = "complete" ] && echo "Done!" && break
-            [ "$STATUS" = "error" ] && echo "Error!" && break
+            [ "$STATUS" = "error" ] && echo "Error! Downloading logs anyway..." && break
             sleep 10
           done
 
@@ -79,11 +69,11 @@ jobs:
 
       - name: Show Logs
         run: |
-          echo "========== LOG =========="
-          cat output/log* 2>/dev/null || true
+          echo "========== DEBUG LOG =========="
+          cat output/debug_log.txt 2>/dev/null || echo "No debug_log.txt"
           echo ""
-          echo "========== FILES =========="
-          find output -type f
+          echo "========== ALL FILES =========="
+          find output -type f -exec echo "--- {}" \; -exec cat {} \;
 
       - name: Upload Artifact
         if: always()
