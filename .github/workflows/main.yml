@@ -1,38 +1,45 @@
-name: Run Kaggle GPU (Cloudflare)
+name: Kaggle GPU Worker
 
 on:
   workflow_dispatch:
 
 jobs:
-  run:
+  gpu-worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup Kaggle
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements
         run: |
-          pip install kaggle
-          mkdir -p ~/.kaggle
-          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' > ~/.kaggle/kaggle.json
-          chmod 600 ~/.kaggle/kaggle.json
-      
-      - name: Push to Kaggle
-        env:
-          TAILSCALE_AUT: ${{ secrets.TAILSCALE_AUT }}   # ← TAILSCALE_AUT
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check Kaggle API
         run: |
-          cat > kernel-metadata.json << 'EOF'
-          {
-            "id": "${{ secrets.KAGGLE_USERNAME }}/kaggle-gpu-tunnel",
-            "title": "GPU Tunnel CF",
-            "code_file": "kaggle.py",
-            "language": "python",
-            "kernel_type": "script",
-            "is_private": true,
-            "enable_gpu": true,
-            "enable_internet": true
-          }
-          EOF
-          
-          kaggle kernels push -p ./
-          sleep 60
-          kaggle kernels status ${{ secrets.KAGGLE_USERNAME }}/kaggle-gpu-tunnel
+          python - <<'PY'
+          import os
+
+          if not os.getenv("KAGGLE_USERNAME"):
+              raise SystemExit("KAGGLE_USERNAME is missing")
+
+          if not os.getenv("KAGGLE_API_TOKEN"):
+              raise SystemExit("KAGGLE_API_TOKEN is missing")
+
+          print("Kaggle credentials found")
+          PY
+
+      - name: Run worker
+        run: |
+          python worker.py
