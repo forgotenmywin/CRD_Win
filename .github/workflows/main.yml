@@ -22,14 +22,21 @@ jobs:
           chmod 600 ~/.kaggle/access_token
           echo "KAGGLE_API_TOKEN=${{ secrets.KAGGLE_API_TOKEN }}" >> $GITHUB_ENV
 
-      - name: Prepare Kaggle Kernel
+      - name: Prepare & Push Kaggle Kernel
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
+          # هر بار اسم جدید → force new run
+          ID="run-$(date +%s)"
+          echo "RUN_ID=$ID" >> $GITHUB_ENV
+          
           mkdir -p kaggle_push
           cp kaggle_gpu.py kaggle_push/script.py
+          
           cat > kaggle_push/kernel-metadata.json <<EOF
           {
-            "id": "${{ secrets.KAGGLE_USERNAME }}/repo-gpu-run",
-            "title": "Repo GPU Run",
+            "id": "${{ secrets.KAGGLE_USERNAME }}/repo-gpu-${ID}",
+            "title": "GPU Run ${ID}",
             "code_file": "script.py",
             "language": "python",
             "kernel_type": "script",
@@ -38,11 +45,7 @@ jobs:
             "enable_internet": true
           }
           EOF
-
-      - name: Push to Kaggle
-        env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-        run: |
+          
           cd kaggle_push
           kaggle kernels push -p .
 
@@ -50,16 +53,18 @@ jobs:
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
-          SLUG="${{ secrets.KAGGLE_USERNAME }}/repo-gpu-run"
-          for i in $(seq 1 120); do
-            # فیکس: کوتیشن ها رو حذف کن
-            STATUS=$(kaggle kernels status "$SLUG" 2>/dev/null | tail -1 | awk -F'"' '{print $2}' | tr '[:upper:]' '[:lower:]')
-            echo "[$i/120] Status: ${STATUS:-waiting}"
+          SLUG="${{ secrets.KAGGLE_USERNAME }}/repo-gpu-${{ env.RUN_ID }}"
+          echo "Waiting for: $SLUG"
+          
+          for i in $(seq 1 180); do
+            RAW=$(kaggle kernels status "$SLUG" 2>/dev/null | tail -1)
+            STATUS=$(echo "$RAW" | grep -oP 'status\s+\K\w+' || echo "$RAW" | awk '{print $NF}')
+            echo "[$i/180] $STATUS"
             
-            if [ "$STATUS" = "kernelworkerstatus.complete" ]; then
+            if echo "$STATUS" | grep -qi "complete"; then
               echo "Done!"
               break
-            elif [ "$STATUS" = "kernelworkerstatus.error" ]; then
+            elif echo "$STATUS" | grep -qi "error"; then
               echo "Error!"
               break
             fi
@@ -71,21 +76,25 @@ jobs:
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
-          SLUG="${{ secrets.KAGGLE_USERNAME }}/repo-gpu-run"
+          SLUG="${{ secrets.KAGGLE_USERNAME }}/repo-gpu-${{ env.RUN_ID }}"
           mkdir -p output
           kaggle kernels output "$SLUG" -p output --force || true
+          
+          echo "=== FILES ==="
+          find output -type f -ls || true
 
       - name: Show Logs
         run: |
           echo "========== DEBUG LOG =========="
           cat output/debug_log.txt 2>/dev/null || echo "No debug_log.txt"
+          
           echo ""
           echo "========== ALL FILES =========="
-          find output -type f
+          find output -type f -exec echo "--- {}" \; -exec head -100 {} \;
 
       - name: Upload Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kaggle-output
+          name: kaggle-gpu-${{ env.RUN_ID }}
           path: output/**
