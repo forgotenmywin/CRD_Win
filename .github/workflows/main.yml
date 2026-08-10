@@ -1,150 +1,21 @@
-name: GPU Relay
+# این کد روی Kaggle GPU اجرا می‌شه
+import torch
+import subprocess
 
-on:
-  workflow_dispatch:
+# GPU Info
+smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
+print("GPU:", smi.stdout)
 
-jobs:
-  relay:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+# محاسبه
+print("Starting...")
+device = torch.device("cuda")
+a = torch.randn(5000, 5000, device=device)
+b = torch.randn(5000, 5000, device=device)
 
-    env:
-      TOKEN: ${{ secrets.GPU_WORKER_TOKEN }}
+torch.cuda.synchronize()
+c = torch.matmul(a, b)
+torch.cuda.synchronize()
 
-    steps:
-      - name: Install
-        run: |
-          pip install websockets aiohttp
-          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/
-
-      - name: Start Relay
-        shell: bash
-        run: |
-          cat > relay.py <<'PY'
-          import asyncio, json, os, time, uuid
-          from datetime import datetime, timezone
-          import websockets
-          from aiohttp import web
-
-          AUTH = os.environ["TOKEN"]
-          jobs = asyncio.Queue()
-          results = {}
-          state = {"connected": False, "jobs_done": 0}
-
-          def log(m):
-              t = datetime.now(timezone.utc).strftime("%H:%M:%S")
-              print(f"[{t}] {m}", flush=True)
-
-          async def ws_handler(websocket):
-              # 1. Read auth FIRST
-              try:
-                  auth_msg = json.loads(await asyncio.wait_for(websocket.recv(), timeout=10))
-                  if auth_msg.get("token") != AUTH:
-                      await websocket.send(json.dumps({"type": "auth_failed"}))
-                      return
-                  await websocket.send(json.dumps({"type": "auth_ok"}))
-                  log(f"Worker auth OK: {auth_msg.get('worker_id', 'unknown')}")
-              except Exception as e:
-                  log(f"Auth error: {e}")
-                  return
-
-              state["connected"] = True
-              log("GPU Worker ready!")
-
-              # 2. Send jobs and receive results
-              try:
-                  while True:
-                      j = await jobs.get()
-                      j["_sent"] = time.perf_counter()
-                      await websocket.send(json.dumps(j))
-                      log(f"Sent job {j['id']}: {j.get('op')}")
-
-                      r = json.loads(await asyncio.wait_for(websocket.recv(), timeout=300))
-                      r["_relay_ms"] = (time.perf_counter() - j["_sent"]) * 1000
-                      results[j["id"]] = r
-                      state["jobs_done"] += 1
-                      log(f"Result job {j['id']} in {r['_relay_ms']:.1f}ms")
-              except Exception as e:
-                  log(f"Worker disconnected: {e}")
-                  state["connected"] = False
-
-          async def add_job(request):
-              try:
-                  d = await request.json()
-              except:
-                  d = {}
-              i = str(uuid.uuid4())[:8]
-              await jobs.put({"id": i, **d})
-              log(f"Queued job {i}")
-              return web.json_response({"job_id": i, "status": "queued"})
-
-          async def get_result(request):
-              i = request.match_info["id"]
-              if i in results:
-                  return web.json_response({"status": "done", "result": results[i]})
-              return web.json_response({"status": "pending"})
-
-          async def main():
-              await websockets.serve(ws_handler, "127.0.0.1", 8765, ping_interval=20, ping_timeout=60)
-              log("WS on :8765")
-
-              app = web.Application()
-              app.router.add_post("/job", add_job)
-              app.router.add_get("/result/{id}", get_result)
-              runner = web.AppRunner(app)
-              await runner.setup()
-              await web.TCPSite(runner, "127.0.0.1", 8080).start()
-              log("HTTP on :8080")
-
-              await asyncio.Future()
-
-          asyncio.run(main())
-          PY
-
-          python3 relay.py > relay.log 2>&1 &
-          sleep 3
-
-          nohup cloudflared tunnel --url http://127.0.0.1:8765 --no-autoupdate > ws.log 2>&1 &
-          nohup cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > api.log 2>&1 &
-
-          sleep 30
-
-          WS_URL=$(cat ws.log | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -1 || true)
-          API_URL=$(cat api.log | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -1 || true)
-
-          if [ -z "$WS_URL" ] || [ -z "$API_URL" ]; then
-            echo "ERROR"
-            cat ws.log
-            exit 1
-          fi
-
-          WSS_URL=$(echo "$WS_URL" | sed 's/^https:/wss:/')/
-
-          echo ""
-          echo "================================"
-          echo "WSS: $WSS_URL"
-          echo "API: $API_URL"
-          echo "================================"
-          echo ""
-
-          echo "$WSS_URL" > wss_url.txt
-          echo "$API_URL" > api_url.txt
-
-          for i in $(seq 1 4320); do
-            sleep 5
-            [ $((i % 60)) -eq 0 ] && echo "... $((i/12))min"
-          done
-
-      - name: Upload
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: relay-session
-          path: |
-            relay.log
-            ws.log
-            api.log
-            wss_url.txt
-            api_url.txt
+print("Result:", c.shape)
+print("Sum:", c.sum().item())
+print("Done!")
