@@ -2,6 +2,11 @@ name: Kaggle GPU Worker
 
 on:
   workflow_dispatch:
+    inputs:
+      job_code:
+        description: "Python code to run on Kaggle GPU"
+        required: true
+        type: string
 
 jobs:
   gpu-worker:
@@ -11,6 +16,7 @@ jobs:
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      JOB_CODE: ${{ inputs.job_code }}
 
     steps:
 
@@ -27,11 +33,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run GPU Worker
+      - name: Create job.py
+        run: |
+          python - <<'PY'
+          import os
+
+          code = os.environ["JOB_CODE"]
+
+          with open("job.py", "w", encoding="utf-8") as f:
+              f.write(code)
+
+          print("job.py created")
+          PY
+
+      - name: Run Kaggle GPU Worker
         run: |
           python worker.py
 
-      - name: Upload GPU Output
+      - name: Upload Kaggle output
         if: always()
         uses: actions/upload-artifact@v4
         with:
