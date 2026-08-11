@@ -1,161 +1,279 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-KERNEL = "darytredf/notebookd9d7092a0a"
+
+USERNAME = os.environ["KAGGLE_USERNAME"]
+KERNEL = f"{USERNAME}/notebookd9d7092a0a"
+
 WORK_DIR = Path("kaggle_kernel")
+OUTPUT_DIR = Path("kaggle_output")
 
 
-def run(command, check=True):
+def run(command):
     print(f"\n>>> {command}")
+
     result = subprocess.run(
         command,
         shell=True,
         text=True
     )
 
-    if check and result.returncode != 0:
+    if result.returncode != 0:
         sys.exit(result.returncode)
 
-    return result.returncode
-
 
 print("======================================")
-print("      Kaggle GPU Worker Controller")
+print("       KAGGLE GPU GENERIC WORKER")
 print("======================================")
 
-# --------------------------------------------------
-# 1. Check credentials
-# --------------------------------------------------
-
-if not os.getenv("KAGGLE_USERNAME"):
-    sys.exit("KAGGLE_USERNAME is missing")
-
-if not os.getenv("KAGGLE_API_TOKEN"):
-    sys.exit("KAGGLE_API_TOKEN is missing")
-
-print("\n[OK] Kaggle credentials found")
-
 
 # --------------------------------------------------
-# 2. Clean old files
+# 1. Clean
 # --------------------------------------------------
 
 if WORK_DIR.exists():
-    import shutil
     shutil.rmtree(WORK_DIR)
 
-WORK_DIR.mkdir(parents=True)
+if OUTPUT_DIR.exists():
+    shutil.rmtree(OUTPUT_DIR)
+
+WORK_DIR.mkdir()
+OUTPUT_DIR.mkdir()
 
 
 # --------------------------------------------------
-# 3. Download existing Kaggle notebook
+# 2. Pull existing Kaggle Notebook
 # --------------------------------------------------
 
-print("\n[1/5] Pulling Kaggle notebook...")
+print("\n[1] Pulling Kaggle Notebook...")
 
 run(
-    f"kaggle kernels pull {KERNEL} "
-    f"-p {WORK_DIR} -m"
+    f"python -m kaggle kernels pull "
+    f"{KERNEL} "
+    f"-p {WORK_DIR} "
+    f"-m"
 )
 
 
 # --------------------------------------------------
-# 4. Enable GPU in metadata
+# 3. Read job.py
 # --------------------------------------------------
 
-print("\n[2/5] Preparing GPU configuration...")
+print("\n[2] Reading GPU job...")
+
+job_code = Path("job.py").read_text(
+    encoding="utf-8"
+)
+
+print("Job loaded.")
+
+
+# --------------------------------------------------
+# 4. Find notebook
+# --------------------------------------------------
+
+notebook_file = next(
+    WORK_DIR.glob("*.ipynb"),
+    None
+)
+
+if notebook_file is None:
+    sys.exit("Notebook file not found")
+
+
+print("Notebook:", notebook_file)
+
+
+# --------------------------------------------------
+# 5. Replace notebook cells
+# --------------------------------------------------
+
+print("\n[3] Preparing GPU Worker...")
+
+
+notebook = json.loads(
+    notebook_file.read_text(
+        encoding="utf-8"
+    )
+)
+
+
+runner_code = f'''
+# ==========================================
+# GENERIC KAGGLE GPU WORKER
+# ==========================================
+
+import os
+import sys
+import time
+
+print("======================================")
+print("       KAGGLE GPU WORKER")
+print("======================================")
+
+print("Python:", sys.version)
+
+try:
+    import torch
+
+    print("PyTorch:", torch.__version__)
+    print("CUDA available:", torch.cuda.is_available())
+
+    if torch.cuda.is_available():
+        print("GPU:", torch.cuda.get_device_name(0))
+        print("CUDA:", torch.version.cuda)
+    else:
+        print("WARNING: CUDA is not available")
+
+except Exception as e:
+    print("Torch check error:", e)
+
+
+print("\\n======================================")
+print("           RUNNING JOB")
+print("======================================")
+
+{job_code}
+
+print("\\n======================================")
+print("          JOB FINISHED")
+print("======================================")
+'''
+
+
+notebook["cells"] = [
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": runner_code.splitlines(True)
+    }
+]
+
+
+# --------------------------------------------------
+# 6. Force GPU
+# --------------------------------------------------
 
 metadata_file = WORK_DIR / "kernel-metadata.json"
 
-if not metadata_file.exists():
-    sys.exit("kernel-metadata.json was not found")
-
-with open(metadata_file, "r", encoding="utf-8") as f:
-    metadata = json.load(f)
-
-metadata["enable_gpu"] = True
-
-with open(metadata_file, "w", encoding="utf-8") as f:
-    json.dump(metadata, f, indent=2)
-
-print("[OK] GPU enabled")
-
-
-# --------------------------------------------------
-# 5. Push notebook back to Kaggle and run it
-# --------------------------------------------------
-
-print("\n[3/5] Starting Kaggle GPU job...")
-
-run(
-    f"kaggle kernels push "
-    f"-p {WORK_DIR} "
-    f"--accelerator NvidiaTeslaP100"
+metadata = json.loads(
+    metadata_file.read_text(
+        encoding="utf-8"
+    )
 )
 
-print("\n[OK] Kaggle job submitted")
+metadata["enable_gpu"] = True
+metadata["machine_shape"] = "Gpu"
+
+
+metadata_file.write_text(
+    json.dumps(
+        metadata,
+        indent=2
+    ),
+    encoding="utf-8"
+)
+
+
+notebook_file.write_text(
+    json.dumps(
+        notebook,
+        indent=2
+    ),
+    encoding="utf-8"
+)
+
+
+print("GPU Worker prepared.")
 
 
 # --------------------------------------------------
-# 6. Wait for completion
+# 7. Push to Kaggle
 # --------------------------------------------------
 
-print("\n[4/5] Waiting for Kaggle...")
+print("\n[4] Starting Kaggle GPU Job...")
 
-for i in range(60):
+run(
+    f"python -m kaggle kernels push "
+    f"-p {WORK_DIR}"
+)
 
-    print(f"\n--- Status check {i + 1}/60 ---")
+
+# --------------------------------------------------
+# 8. Wait
+# --------------------------------------------------
+
+print("\n[5] Waiting for GPU...")
+
+for i in range(120):
+
+    print()
+    print("======================================")
+    print(f"Status check {i + 1}/120")
+    print("======================================")
+
 
     result = subprocess.run(
-        f"kaggle kernels status {KERNEL}",
+        f"python -m kaggle kernels status {KERNEL}",
         shell=True,
         capture_output=True,
         text=True
     )
 
-    output = result.stdout + result.stderr
+    status = result.stdout + result.stderr
 
-    print(output)
+    print(status)
 
-    lower = output.lower()
 
-    if "complete" in lower:
-        print("[OK] Kaggle job completed")
+    if "COMPLETE" in status.upper():
+        print("\nGPU job completed.")
         break
 
-    if "error" in lower or "failed" in lower:
-        print("[ERROR] Kaggle job failed")
+
+    if any(
+        x in status.upper()
+        for x in [
+            "ERROR",
+            "FAILED",
+            "CANCELLED"
+        ]
+    ):
+        print("\nGPU job failed.")
         sys.exit(1)
+
 
     time.sleep(10)
 
+
 else:
-    print("[ERROR] Timeout waiting for Kaggle")
+    print("\nGPU job timeout.")
     sys.exit(1)
 
 
 # --------------------------------------------------
-# 7. Download output
+# 9. Download output
 # --------------------------------------------------
 
-print("\n[5/5] Downloading Kaggle output...")
+print("\n[6] Downloading output...")
 
 run(
-    f"kaggle kernels output {KERNEL} "
-    f"-p kaggle_output"
+    f"python -m kaggle kernels output "
+    f"{KERNEL} "
+    f"-p {OUTPUT_DIR}"
 )
 
+
 print("\n======================================")
-print("          GPU JOB FINISHED")
+print("           WORKER COMPLETE")
 print("======================================")
 
-print("\nOutput files:")
-
-if Path("kaggle_output").exists():
-    for file in Path("kaggle_output").rglob("*"):
-        if file.is_file():
-            print(" -", file)
+for file in OUTPUT_DIR.rglob("*"):
+    if file.is_file():
+        print("OUTPUT:", file)
