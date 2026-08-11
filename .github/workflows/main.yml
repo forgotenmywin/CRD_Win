@@ -25,30 +25,105 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install kaggle
-          python -m kaggle --help
 
       - name: Check Kaggle authentication
         run: |
-          python -m kaggle kernels list --user "$KAGGLE_USERNAME" --page-size 1
+          python -m kaggle kernels list \
+            --user "$KAGGLE_USERNAME" \
+            --page-size 1
 
       - name: Pull Kaggle Notebook
         run: |
+          rm -rf kaggle_kernel
           mkdir -p kaggle_kernel
+
           python -m kaggle kernels pull \
-            darytredf/notebookd9d7092a0a \
+            "$KAGGLE_USERNAME/notebookd9d7092a0a" \
             -p kaggle_kernel \
             -m
 
-      - name: Show metadata
+      - name: Show GPU metadata
         run: |
           cat kaggle_kernel/kernel-metadata.json
+
+      - name: Enable GPU
+        run: |
+          python - <<'PY'
+          import json
+
+          path = "kaggle_kernel/kernel-metadata.json"
+
+          with open(path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          data["enable_gpu"] = True
+          data["machine_shape"] = "Gpu"
+
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2)
+
+          print("GPU enabled")
+          PY
 
       - name: Submit Kaggle GPU Job
         run: |
           python -m kaggle kernels push \
             -p kaggle_kernel
 
-      - name: Check status
+      - name: Wait for Kaggle GPU Job
+        shell: bash
         run: |
-          python -m kaggle kernels status \
-            darytredf/notebookd9d7092a0a
+          echo "Waiting for Kaggle GPU..."
+
+          for i in {1..120}; do
+
+            echo ""
+            echo "======================================"
+            echo "Status check $i / 120"
+            echo "======================================"
+
+            STATUS=$(python -m kaggle kernels status \
+              "$KAGGLE_USERNAME/notebookd9d7092a0a" 2>&1 || true)
+
+            echo "$STATUS"
+
+            if echo "$STATUS" | grep -qi "COMPLETE"; then
+              echo ""
+              echo "Kaggle GPU job completed."
+              exit 0
+            fi
+
+            if echo "$STATUS" | grep -qiE "ERROR|FAILED"; then
+              echo ""
+              echo "Kaggle GPU job failed."
+              exit 1
+            fi
+
+            echo "Still waiting..."
+            sleep 10
+
+          done
+
+          echo "Timed out waiting for Kaggle."
+          exit 1
+
+      - name: Download Kaggle Output
+        run: |
+          rm -rf kaggle_output
+          mkdir -p kaggle_output
+
+          python -m kaggle kernels output \
+            "$KAGGLE_USERNAME/notebookd9d7092a0a" \
+            -p kaggle_output
+
+      - name: Show Output Files
+        run: |
+          echo "Kaggle output:"
+          find kaggle_output -type f -print
+
+      - name: Upload Kaggle Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-gpu-output
+          path: kaggle_output/
+          if-no-files-found: warn
