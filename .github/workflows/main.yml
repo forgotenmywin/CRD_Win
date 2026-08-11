@@ -10,7 +10,6 @@ on:
 
 jobs:
   gpu-worker:
-
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -39,24 +38,37 @@ jobs:
           python - <<'PY'
           import os
 
-          code = os.environ["JOB_CODE"]
+          with open("job.py", "w", encoding="utf-8") as f:
+              f.write(os.environ["JOB_CODE"])
 
-          with open(
-              "job.py",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              f.write(code)
-
-          print("======================================")
-          print("        DYNAMIC JOB CREATED")
-          print("======================================")
-          print("Size:", len(code), "bytes")
+          print("Dynamic job created.")
           PY
 
       - name: Run Kaggle GPU Worker
         run: |
           python worker.py
+
+      - name: Show output
+        if: always()
+        run: |
+          echo "======================================"
+          echo "        KAGGLE OUTPUT FILES"
+          echo "======================================"
+
+          find kaggle_output -type f -maxdepth 3 -print || true
+
+          echo ""
+          echo "======================================"
+          echo "        OUTPUT CONTENT"
+          echo "======================================"
+
+          for file in kaggle_output/*; do
+            if [ -f "$file" ]; then
+              echo ""
+              echo "===== $file ====="
+              cat "$file" || true
+            fi
+          done
 
       - name: Upload result
         if: always()
