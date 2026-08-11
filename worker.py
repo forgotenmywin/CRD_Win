@@ -19,7 +19,7 @@ OUTPUT_DIR = Path("kaggle_output")
 
 
 # ==================================================
-# COMMAND RUNNER
+# COMMAND
 # ==================================================
 
 def run(command, check=True):
@@ -37,7 +37,6 @@ def run(command, check=True):
             f"Command failed: {result.returncode}",
             flush=True
         )
-
         sys.exit(result.returncode)
 
     return result.returncode
@@ -51,16 +50,8 @@ print("======================================")
 print("       KAGGLE GPU GENERIC WORKER")
 print("======================================")
 
-print(
-    "Kaggle user:",
-    USERNAME,
-    flush=True
-)
-
-
-# ==================================================
-# CHECK CREDENTIALS
-# ==================================================
+if not os.getenv("KAGGLE_USERNAME"):
+    sys.exit("KAGGLE_USERNAME is missing")
 
 if not os.getenv("KAGGLE_API_TOKEN"):
     sys.exit("KAGGLE_API_TOKEN is missing")
@@ -78,15 +69,8 @@ if WORK_DIR.exists():
 if OUTPUT_DIR.exists():
     shutil.rmtree(OUTPUT_DIR)
 
-WORK_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+WORK_DIR.mkdir(parents=True)
+OUTPUT_DIR.mkdir(parents=True)
 
 
 # ==================================================
@@ -107,16 +91,14 @@ run(
 # FIND NOTEBOOK
 # ==================================================
 
-notebook_files = list(
+notebooks = list(
     WORK_DIR.glob("*.ipynb")
 )
 
-if not notebook_files:
-    sys.exit(
-        "No .ipynb file found"
-    )
+if not notebooks:
+    sys.exit("Notebook .ipynb not found")
 
-notebook_file = notebook_files[0]
+notebook_file = notebooks[0]
 
 print(
     "[OK] Notebook:",
@@ -132,18 +114,13 @@ print(
 job_file = Path("job.py")
 
 if not job_file.exists():
-    sys.exit(
-        "job.py not found"
-    )
+    sys.exit("job.py not found")
 
 job_code = job_file.read_text(
     encoding="utf-8"
 )
 
-print(
-    "[OK] job.py loaded",
-    flush=True
-)
+print("[OK] job.py loaded")
 
 
 # ==================================================
@@ -158,71 +135,199 @@ notebook = json.loads(
 
 
 # ==================================================
-# CREATE WORKER CELL
+# KAGGLE GPU WORKER CODE
 # ==================================================
 
-worker_code = """
+worker_code = r'''
 print("======================================")
 print("       KAGGLE GPU WORKER START")
 print("======================================")
 
 import sys
+import subprocess
 
 print("Python:", sys.version)
 
-try:
 
-    import torch
+# --------------------------------------------------
+# Install P100-compatible PyTorch
+# --------------------------------------------------
 
-    print(
-        "PyTorch:",
-        torch.__version__
+print("")
+print("Installing PyTorch 2.3.1 + CUDA 11.8...")
+print("")
+
+
+subprocess.check_call([
+    sys.executable,
+    "-m",
+    "pip",
+    "install",
+    "--no-cache-dir",
+    "--force-reinstall",
+    "torch==2.3.1",
+    "torchvision==0.18.1",
+    "torchaudio==2.3.1",
+    "--index-url",
+    "https://download.pytorch.org/whl/cu118"
+])
+
+
+# --------------------------------------------------
+# IMPORTANT:
+# Reload torch after installation
+# --------------------------------------------------
+
+print("")
+print("PyTorch installation completed.")
+print("")
+
+
+import torch
+
+
+# --------------------------------------------------
+# GPU information
+# --------------------------------------------------
+
+print("======================================")
+print("             GPU CHECK")
+print("======================================")
+
+print("PyTorch:", torch.__version__)
+
+print(
+    "CUDA available:",
+    torch.cuda.is_available()
+)
+
+print(
+    "CUDA version:",
+    torch.version.cuda
+)
+
+
+if not torch.cuda.is_available():
+
+    raise RuntimeError(
+        "CUDA GPU is not available"
     )
 
-    print(
-        "CUDA available:",
-        torch.cuda.is_available()
-    )
 
-    if not torch.cuda.is_available():
+gpu_name = torch.cuda.get_device_name(0)
 
-        raise RuntimeError(
-            "CUDA GPU is NOT available"
-        )
+print(
+    "GPU:",
+    gpu_name
+)
 
-    print(
-        "GPU:",
-        torch.cuda.get_device_name(0)
-    )
 
-    print(
-        "CUDA version:",
-        torch.version.cuda
-    )
+print(
+    "Compute capability:",
+    torch.cuda.get_device_capability(0)
+)
 
-except Exception as e:
 
-    print("GPU CHECK ERROR")
-    print(
-        type(e).__name__,
-        str(e)
-    )
+print(
+    "Supported architectures:",
+    torch.cuda.get_arch_list()
+)
 
-    raise
 
+# --------------------------------------------------
+# Real GPU test
+# --------------------------------------------------
+
+print("")
+print("======================================")
+print("          REAL GPU TEST")
+print("======================================")
+
+size = 2048
+
+print(
+    f"Creating {size}x{size} tensors..."
+)
+
+
+x = torch.randn(
+    size,
+    size,
+    device="cuda"
+)
+
+
+y = torch.randn(
+    size,
+    size,
+    device="cuda"
+)
+
+
+torch.cuda.synchronize()
+
+
+print("Running matrix multiplication...")
+
+
+import time
+
+start = time.perf_counter()
+
+
+z = torch.matmul(
+    x,
+    y
+)
+
+
+torch.cuda.synchronize()
+
+
+elapsed = (
+    time.perf_counter()
+    - start
+)
+
+
+print("")
+print("======================================")
+print("         GPU TEST SUCCESS")
+print("======================================")
+
+print(
+    "GPU:",
+    gpu_name
+)
+
+print(
+    "Result shape:",
+    z.shape
+)
+
+print(
+    "Time:",
+    elapsed,
+    "seconds"
+)
+
+
+# --------------------------------------------------
+# USER JOB
+# --------------------------------------------------
 
 print("")
 print("======================================")
 print("          RUNNING USER JOB")
 print("======================================")
 
-""" + job_code + """
+''' + job_code + r'''
 
 print("")
 print("======================================")
 print("          USER JOB FINISHED")
 print("======================================")
-"""
+'''
 
 
 # ==================================================
@@ -243,20 +348,13 @@ notebook["cells"] = [
 
 
 # ==================================================
-# UPDATE METADATA
+# GPU METADATA
 # ==================================================
 
 metadata_file = (
     WORK_DIR /
     "kernel-metadata.json"
 )
-
-if not metadata_file.exists():
-
-    sys.exit(
-        "kernel-metadata.json not found"
-    )
-
 
 metadata = json.loads(
     metadata_file.read_text(
@@ -291,20 +389,17 @@ notebook_file.write_text(
 )
 
 
-print(
-    "\n[OK] Notebook prepared",
-    flush=True
-)
+print("")
+print("[OK] Notebook prepared")
 
 
 # ==================================================
 # PUSH
 # ==================================================
 
-print(
-    "\n[2] Pushing to Kaggle...",
-    flush=True
-)
+print("")
+print("[2] Pushing GPU Worker to Kaggle...")
+
 
 push_result = run(
     f"python -m kaggle kernels push "
@@ -312,27 +407,22 @@ push_result = run(
     check=False
 )
 
+
 if push_result != 0:
-
-    sys.exit(
-        push_result
-    )
+    sys.exit(push_result)
 
 
-print(
-    "\n[OK] Kaggle job submitted",
-    flush=True
-)
+print("")
+print("[OK] Kaggle GPU job submitted")
 
 
 # ==================================================
-# WAIT FOR KAGGLE
+# WAIT
 # ==================================================
 
-print(
-    "\n[3] Waiting for Kaggle...",
-    flush=True
-)
+print("")
+print("[3] Waiting for Kaggle...")
+
 
 final_status = None
 
@@ -343,12 +433,15 @@ for i in range(120):
     print(
         "======================================"
     )
+
     print(
         f"STATUS {i + 1}/120"
     )
+
     print(
         "======================================"
     )
+
 
     result = subprocess.run(
         f"python -m kaggle kernels status {KERNEL}",
@@ -357,15 +450,18 @@ for i in range(120):
         text=True
     )
 
+
     status = (
         result.stdout +
         result.stderr
     )
 
+
     print(
         status,
         flush=True
     )
+
 
     upper = status.upper()
 
@@ -402,13 +498,12 @@ for i in range(120):
 
 
 # ==================================================
-# DOWNLOAD OUTPUT / LOG
+# DOWNLOAD OUTPUT
 # ==================================================
 
-print(
-    "\n[4] Downloading Kaggle output...",
-    flush=True
-)
+print("")
+print("[4] Downloading Kaggle output...")
+
 
 subprocess.run(
     f"python -m kaggle kernels output "
@@ -420,63 +515,34 @@ subprocess.run(
 
 
 # ==================================================
-# LIST OUTPUT
+# LIST FILES
 # ==================================================
 
 print("")
-print(
-    "======================================"
-)
-
-print(
-    "           KAGGLE OUTPUT"
-)
-
-print(
-    "======================================"
-)
+print("======================================")
+print("           KAGGLE OUTPUT")
+print("======================================")
 
 
-files = list(
-    OUTPUT_DIR.rglob("*")
-)
+for file in OUTPUT_DIR.rglob("*"):
 
+    if file.is_file():
 
-if not files:
-
-    print(
-        "No files returned."
-    )
-
-else:
-
-    for file in files:
-
-        if file.is_file():
-
-            print(
-                "OUTPUT:",
-                file,
-                flush=True
-            )
+        print(
+            "OUTPUT:",
+            file,
+            flush=True
+        )
 
 
 # ==================================================
-# PRINT LOG CONTENT
+# PRINT LOG
 # ==================================================
 
 print("")
-print(
-    "======================================"
-)
-
-print(
-    "           KAGGLE LOG"
-)
-
-print(
-    "======================================"
-)
+print("======================================")
+print("           KAGGLE LOG")
+print("======================================")
 
 
 log_files = list(
@@ -486,9 +552,7 @@ log_files = list(
 
 if not log_files:
 
-    print(
-        "No .log file found."
-    )
+    print("No log file found.")
 
 else:
 
@@ -521,40 +585,29 @@ else:
 
 
 # ==================================================
-# FINAL STATUS
+# FINAL
 # ==================================================
 
 print("")
-print(
-    "======================================"
-)
-
-print(
-    "           FINAL STATUS"
-)
-
-print(
-    "======================================"
-)
+print("======================================")
+print("           FINAL STATUS")
+print("======================================")
 
 print(
     "Kaggle:",
-    final_status,
-    flush=True
+    final_status
 )
 
 
 if final_status != "COMPLETE":
 
     print(
-        "\nGPU Worker failed.",
-        flush=True
+        "\nGPU Worker failed."
     )
 
     sys.exit(1)
 
 
 print(
-    "\nGPU Worker completed successfully.",
-    flush=True
-            )
+    "\nGPU Worker completed successfully."
+)
