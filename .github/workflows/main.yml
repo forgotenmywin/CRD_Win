@@ -6,7 +6,6 @@ on:
 jobs:
   kaggle-gpu:
     runs-on: ubuntu-latest
-
     timeout-minutes: 30
 
     env:
@@ -14,8 +13,7 @@ jobs:
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
 
     steps:
-
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -23,19 +21,34 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Kaggle API
+      - name: Install Kaggle CLI
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install kaggle
+          python -m kaggle --help
 
-      - name: Run Kaggle GPU Worker
+      - name: Check Kaggle authentication
         run: |
-          python worker.py
+          python -m kaggle kernels list --user "$KAGGLE_USERNAME" --page-size 1
 
-      - name: Upload Kaggle output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kaggle-gpu-output
-          path: kaggle_output/
-          if-no-files-found: ignore
+      - name: Pull Kaggle Notebook
+        run: |
+          mkdir -p kaggle_kernel
+          python -m kaggle kernels pull \
+            darytredf/notebookd9d7092a0a \
+            -p kaggle_kernel \
+            -m
+
+      - name: Show metadata
+        run: |
+          cat kaggle_kernel/kernel-metadata.json
+
+      - name: Submit Kaggle GPU Job
+        run: |
+          python -m kaggle kernels push \
+            -p kaggle_kernel
+
+      - name: Check status
+        run: |
+          python -m kaggle kernels status \
+            darytredf/notebookd9d7092a0a
