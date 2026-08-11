@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  gpu-worker:
+  kaggle-gpu:
     runs-on: ubuntu-latest
+
     timeout-minutes: 30
 
     env:
@@ -13,7 +14,8 @@ jobs:
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
 
     steps:
-      - name: Checkout
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -21,25 +23,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install requirements
+      - name: Install Kaggle API
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Check Kaggle API
-        run: |
-          python - <<'PY'
-          import os
-
-          if not os.getenv("KAGGLE_USERNAME"):
-              raise SystemExit("KAGGLE_USERNAME is missing")
-
-          if not os.getenv("KAGGLE_API_TOKEN"):
-              raise SystemExit("KAGGLE_API_TOKEN is missing")
-
-          print("Kaggle credentials found")
-          PY
-
-      - name: Run worker
+      - name: Run Kaggle GPU Worker
         run: |
           python worker.py
+
+      - name: Upload Kaggle output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-gpu-output
+          path: kaggle_output/
+          if-no-files-found: ignore
