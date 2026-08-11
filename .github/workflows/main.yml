@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "Session action"
+        description: "GPU session action"
         required: true
         type: choice
         options:
@@ -30,13 +30,12 @@ jobs:
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-
       SESSION_ID: ${{ inputs.session_id }}
       MAX_SESSION_MINUTES: ${{ inputs.duration }}
 
     steps:
 
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -44,17 +43,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Kaggle
+      - name: Install Kaggle CLI
         run: |
           python -m pip install --upgrade pip
           pip install kaggle
 
-      - name: Check Kaggle credentials
+      - name: Check Kaggle CLI
         run: |
           python -m kaggle --version
-          python -m kaggle kernels list --user "$KAGGLE_USERNAME" --max-size 1
+          echo "Kaggle credentials configured"
 
-      - name: Prepare session notebook
+      # ==========================================
+      # START SESSION
+      # ==========================================
+
+      - name: Prepare GPU session
         if: inputs.action == 'start'
         run: |
           mkdir -p kaggle_session
@@ -63,8 +66,8 @@ jobs:
           import json
           import os
 
+          username = os.environ["KAGGLE_USERNAME"]
           session_id = os.environ["SESSION_ID"]
-          duration = os.environ["MAX_SESSION_MINUTES"]
 
           with open("session_server.py", "r", encoding="utf-8") as f:
               code = f.read()
@@ -76,9 +79,7 @@ jobs:
                       "execution_count": None,
                       "metadata": {},
                       "outputs": [],
-                      "source": [
-                          code
-                      ]
+                      "source": code.splitlines(True)
                   }
               ],
               "metadata": {
@@ -104,7 +105,7 @@ jobs:
               json.dump(notebook, f, indent=2)
 
           metadata = {
-              "id": f"{os.environ['KAGGLE_USERNAME']}/gpu-session-{session_id}",
+              "id": f"{username}/gpu-session-{session_id}",
               "title": f"GPU Session {session_id}",
               "code_file": "gpu_session.ipynb",
               "language": "python",
@@ -121,9 +122,13 @@ jobs:
               encoding="utf-8"
           ) as f:
               json.dump(metadata, f, indent=2)
+
+          print("GPU session prepared")
+          print("Session ID:", session_id)
+          print("Kaggle kernel:", f"{username}/gpu-session-{session_id}")
           PY
 
-      - name: Start Kaggle GPU session
+      - name: Push GPU session to Kaggle
         if: inputs.action == 'start'
         run: |
           cd kaggle_session
@@ -134,9 +139,15 @@ jobs:
           echo "KAGGLE GPU SESSION REQUESTED"
           echo "======================================"
 
-          echo "Waiting for Kaggle..."
+      - name: Wait for GPU
+        if: inputs.action == 'start'
+        run: |
+          echo "Waiting for Kaggle GPU..."
 
           for i in $(seq 1 60); do
+
+            echo ""
+            echo "========== STATUS $i/60 =========="
 
             STATUS=$(python -m kaggle kernels status \
               "$KAGGLE_USERNAME/gpu-session-$SESSION_ID" 2>&1 || true)
@@ -146,42 +157,62 @@ jobs:
             if echo "$STATUS" | grep -q "RUNNING"; then
               echo ""
               echo "======================================"
-              echo "GPU SESSION IS RUNNING"
+              echo "       GPU SESSION IS RUNNING"
               echo "======================================"
+              echo "GPU session started successfully."
               exit 0
             fi
 
             if echo "$STATUS" | grep -q "ERROR"; then
               echo ""
-              echo "GPU SESSION FAILED"
-              echo "Reason: Kaggle returned ERROR"
+              echo "======================================"
+              echo "       GPU SESSION ERROR"
+              echo "======================================"
+              echo "Kaggle returned an ERROR."
+              echo "Possible reasons:"
+              echo "- GPU quota reached"
+              echo "- GPU unavailable"
+              echo "- Kaggle rejected the notebook"
               exit 1
             fi
 
             if echo "$STATUS" | grep -q "CANCEL"; then
               echo ""
-              echo "GPU SESSION CANCELLED"
+              echo "GPU session was cancelled."
               exit 1
             fi
 
             sleep 5
           done
 
-          echo "GPU did not become available in time."
-          echo "Reason: Kaggle queue or availability limit."
+          echo ""
+          echo "======================================"
+          echo "       GPU UNAVAILABLE"
+          echo "======================================"
+          echo "Kaggle did not start the GPU within the waiting period."
+          echo "Possible reason: GPU queue or quota."
           exit 1
 
-      - name: Stop Kaggle GPU session
+      # ==========================================
+      # STOP SESSION
+      # ==========================================
+
+      - name: Stop GPU session
         if: inputs.action == 'stop'
         run: |
-          echo "Stopping GPU session..."
+          echo "======================================"
+          echo "       STOPPING GPU SESSION"
+          echo "======================================"
 
           python -m kaggle kernels cancel \
             "$KAGGLE_USERNAME/gpu-session-$SESSION_ID" || true
 
-          echo "======================================"
-          echo "GPU SESSION STOPPED"
-          echo "======================================"
+          echo ""
+          echo "GPU session stop requested."
+
+      # ==========================================
+      # OUTPUT
+      # ==========================================
 
       - name: Download session output
         if: always() && inputs.action == 'start'
@@ -192,12 +223,56 @@ jobs:
             "$KAGGLE_USERNAME/gpu-session-$SESSION_ID" \
             -p kaggle_output || true
 
-          find kaggle_output -type f -print || true
+          echo ""
+          echo "======================================"
+          echo "       KAGGLE OUTPUT"
+          echo "======================================"
 
-      - name: Upload result
+          if [ -d "kaggle_output" ]; then
+            find kaggle_output -type f -print
+          else
+            echo "No output directory."
+          fi
+
+      - name: Create session result
+        if: always() && inputs.action == 'start'
+        run: |
+          mkdir -p kaggle_output
+
+          cat > kaggle_output/session_result.txt <<EOF
+          
+======================================
+       KAGGLE GPU SESSION
+======================================
+
+Session ID: $SESSION_ID
+Action: ${{ inputs.action }}
+Duration: $MAX_SESSION_MINUTES minutes
+
+GitHub Run ID: $GITHUB_RUN_ID
+Repository: $GITHUB_REPOSITORY
+
+======================================
+EOF
+
+      - name: Upload session result
         if: always() && inputs.action == 'start'
         uses: actions/upload-artifact@v4
         with:
           name: gpu-session-${{ inputs.session_id }}
           path: kaggle_output/
           if-no-files-found: ignore
+
+      - name: Final status
+        if: success()
+        run: |
+          echo ""
+          echo "======================================"
+          echo "       GPU SESSION COMPLETE"
+          echo "======================================"
+
+          if [ "${{ inputs.action }}" = "start" ]; then
+            echo "GPU session started successfully."
+          else
+            echo "GPU session stopped successfully."
+          fi
