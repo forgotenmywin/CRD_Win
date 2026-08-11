@@ -4,12 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       job_code:
-        description: "Python code to run on Kaggle GPU"
+        description: "Python GPU job"
         required: true
         type: string
 
 jobs:
   gpu-worker:
+
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -33,27 +34,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Create job.py
+      - name: Create dynamic job
         run: |
           python - <<'PY'
           import os
 
           code = os.environ["JOB_CODE"]
 
-          with open("job.py", "w", encoding="utf-8") as f:
+          with open(
+              "job.py",
+              "w",
+              encoding="utf-8"
+          ) as f:
               f.write(code)
 
-          print("job.py created")
+          print("======================================")
+          print("        DYNAMIC JOB CREATED")
+          print("======================================")
+          print("Size:", len(code), "bytes")
           PY
 
       - name: Run Kaggle GPU Worker
         run: |
           python worker.py
 
-      - name: Upload Kaggle output
+      - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kaggle-gpu-output
+          name: kaggle-gpu-result
           path: kaggle_output/
           if-no-files-found: ignore
