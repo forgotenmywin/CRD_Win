@@ -10,7 +10,6 @@ on:
 
 jobs:
   gpu-worker:
-
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -20,203 +19,82 @@ jobs:
       JOB_CODE: ${{ inputs.job_code }}
 
     steps:
-
-      # ==========================================
-      # 1. CHECKOUT
-      # ==========================================
-
       - name: Checkout repository
         uses: actions/checkout@v4
-
-
-      # ==========================================
-      # 2. PYTHON
-      # ==========================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-
-      # ==========================================
-      # 3. INSTALL
-      # ==========================================
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-
-      # ==========================================
-      # 4. CREATE DYNAMIC JOB
-      # ==========================================
 
       - name: Create dynamic job
         run: |
           python - <<'PY'
           import os
 
-          job_code = os.environ["JOB_CODE"]
+          code = os.environ["JOB_CODE"]
 
-          with open(
-              "job.py",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              f.write(job_code)
+          with open("job.py", "w", encoding="utf-8") as f:
+              f.write(code)
 
-          print("======================================")
-          print("        DYNAMIC JOB CREATED")
-          print("======================================")
-
-          print("Job size:", len(job_code), "bytes")
+          print("Dynamic job created")
+          print("Job size:", len(code), "bytes")
           PY
-
-
-      # ==========================================
-      # 5. SHOW JOB
-      # ==========================================
 
       - name: Show job information
         run: |
-          echo "======================================"
-          echo "          JOB INFORMATION"
-          echo "======================================"
-
-          echo "File:"
+          echo "Job file:"
           ls -lh job.py
-
-          echo ""
           echo "Lines:"
           wc -l job.py
 
-
-      # ==========================================
-      # 6. RUN KAGGLE WORKER
-      # ==========================================
-
       - name: Run Kaggle GPU Worker
         run: |
-          echo "======================================"
-          echo "       STARTING KAGGLE WORKER"
-          echo "======================================"
-
           python worker.py
-
-
-      # ==========================================
-      # 7. SHOW KAGGLE OUTPUT
-      # ==========================================
 
       - name: Show Kaggle output
         if: always()
         run: |
-
           echo "======================================"
-          echo "        KAGGLE OUTPUT FILES"
+          echo "KAGGLE OUTPUT FILES"
           echo "======================================"
 
           if [ -d "kaggle_output" ]; then
-
-            find kaggle_output \
-              -type f \
-              -print
-
+            find kaggle_output -type f -print
           else
-
-            echo "kaggle_output directory not found"
-
+            echo "No kaggle_output directory"
           fi
-
-
-          echo ""
-          echo "======================================"
-          echo "        OUTPUT CONTENT"
-          echo "======================================"
-
-
-          if [ -d "kaggle_output" ]; then
-
-            find kaggle_output \
-              -type f \
-              -print0 |
-            while IFS= read -r -d '' file
-            do
-
-              echo ""
-              echo "======================================"
-              echo "FILE: $file"
-              echo "======================================"
-
-              # فقط فایل‌های متنی را نمایش بده
-              if file "$file" | grep -qi text; then
-                cat "$file"
-              else
-                echo "[Binary file]"
-                ls -lh "$file"
-              fi
-
-            done
-
-          fi
-
-
-      # ==========================================
-      # 8. CREATE RESULT INFO
-      # ==========================================
 
       - name: Create result information
         if: always()
         run: |
-
           mkdir -p kaggle_output
 
-          cat > kaggle_output/github_result.txt <<EOF
-======================================
-       KAGGLE GPU WORKER RESULT
-======================================
-
-GitHub Repository:
-${GITHUB_REPOSITORY}
-
-GitHub Run:
-${GITHUB_RUN_ID}
-
-Workflow:
-${GITHUB_WORKFLOW}
-
-Status:
-completed
-
-GPU Worker:
-Kaggle
-
-======================================
-EOF
-
-
-      # ==========================================
-      # 9. LIST FINAL OUTPUT
-      # ==========================================
+          printf '%s\n' \
+            '======================================' \
+            '       KAGGLE GPU WORKER RESULT' \
+            '======================================' \
+            "Repository: ${GITHUB_REPOSITORY}" \
+            "Run ID: ${GITHUB_RUN_ID}" \
+            "Workflow: ${GITHUB_WORKFLOW}" \
+            '======================================' \
+            > kaggle_output/github_result.txt
 
       - name: Final output check
         if: always()
         run: |
-
           echo "======================================"
-          echo "          FINAL OUTPUT"
+          echo "FINAL OUTPUT"
           echo "======================================"
 
-          find kaggle_output \
-            -type f \
-            -exec ls -lh {} \;
-
-
-      # ==========================================
-      # 10. UPLOAD ARTIFACT
-      # ==========================================
+          if [ -d "kaggle_output" ]; then
+            find kaggle_output -type f -exec ls -lh {} \;
+          fi
 
       - name: Upload Kaggle result
         if: always()
@@ -226,22 +104,11 @@ EOF
           path: kaggle_output/
           if-no-files-found: ignore
 
-
-      # ==========================================
-      # 11. FINAL STATUS
-      # ==========================================
-
       - name: Final status
         if: success()
         run: |
-
-          echo ""
           echo "======================================"
-          echo "      GPU WORKER COMPLETED"
+          echo "GPU WORKER COMPLETED"
           echo "======================================"
-
           echo "Kaggle GPU job completed successfully."
-
-          echo ""
-          echo "Artifact:"
-          echo "kaggle-gpu-result"
+          echo "Artifact: kaggle-gpu-result"
