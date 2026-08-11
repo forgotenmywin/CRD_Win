@@ -1,41 +1,34 @@
+print("======================================")
+print("        USER JOB TEST")
+print("======================================")
+
 import torch
-import time
 
-print("======================================")
-print("        GPU WORKER JOB")
-print("======================================")
+print("CUDA:", torch.cuda.is_available())
 
-print("PyTorch:", torch.__version__)
-print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print(
+        "GPU:",
+        torch.cuda.get_device_name(0)
+    )
 
-if not torch.cuda.is_available():
-    raise RuntimeError("CUDA GPU is not available")
+print("USER JOB IS RUNNING")
 
-print("GPU:", torch.cuda.get_device_name(0))
-print("CUDA:", torch.version.cuda)
+x = torch.randn(
+    4096,
+    4096,
+    device="cuda"
+)
 
-# GPU test
-size = 4096
+y = torch.randn(
+    4096,
+    4096,
+    device="cuda"
+)
 
-print(f"\nRunning GPU calculation: {size}x{size}")
-
-a = torch.randn(size, size, device="cuda")
-b = torch.randn(size, size, device="cuda")
-
-torch.cuda.synchronize()
-
-start = time.perf_counter()
-
-c = torch.matmul(a, b)
+z = x @ y
 
 torch.cuda.synchronize()
 
-elapsed = time.perf_counter() - start
-
-print("\n======================================")
-print("GPU JOB FINISHED")
-print("======================================")
-
-print("GPU:", torch.cuda.get_device_name(0))
-print("Result:", c.shape)
-print(f"Time: {elapsed:.4f} seconds")
+print("Calculation completed.")
+print("Result shape:", z.shape)
