@@ -7,64 +7,131 @@ on:
         description: "GPU Job ID"
         required: true
         type: string
-
       operation:
         description: "GPU operation"
-        required: true
+        required: false
+        default: "matrix"
         type: string
-
       matrix_size:
         description: "Matrix size"
-        required: true
+        required: false
+        default: "1024"
         type: string
 
 jobs:
-
   gpu-job:
-
     runs-on: ubuntu-latest
-
-    timeout-minutes: 30
+    timeout-minutes: 25
 
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-
       JOB_ID: ${{ inputs.job_id }}
       OPERATION: ${{ inputs.operation }}
       MATRIX_SIZE: ${{ inputs.matrix_size }}
 
     steps:
 
+      # ==========================================
+      # CHECKOUT
+      # ==========================================
+
       - name: Checkout
         uses: actions/checkout@v4
+
+      # ==========================================
+      # PYTHON
+      # ==========================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install Kaggle
-        run: |
-          python -m pip install --upgrade pip
-          pip install kaggle==2.2.4
+      # ==========================================
+      # KAGGLE CLI
+      # ==========================================
 
-      - name: Create Kaggle GPU Job
+      - name: Install Kaggle
+        shell: bash
         run: |
+          set -e
+
+          python -m pip install --upgrade pip
+
+          python -m pip install --upgrade kaggle
+
+          echo "======================================"
+          echo "          KAGGLE VERSION"
+          echo "======================================"
+
+          python -m kaggle --version
+
+      # ==========================================
+      # CHECK SECRETS
+      # ==========================================
+
+      - name: Check Kaggle credentials
+        shell: bash
+        run: |
+          set -e
+
+          echo "Checking Kaggle credentials..."
+
+          if [[ -z "$KAGGLE_USERNAME" ]]; then
+            echo "ERROR: KAGGLE_USERNAME is empty"
+            exit 1
+          fi
+
+          if [[ -z "$KAGGLE_API_TOKEN" ]]; then
+            echo "ERROR: KAGGLE_API_TOKEN is empty"
+            exit 1
+          fi
+
+          echo "KAGGLE_USERNAME is configured."
+          echo "KAGGLE_API_TOKEN is configured."
+
+      # ==========================================
+      # CREATE GPU PYTHON FILE
+      # ==========================================
+
+      - name: Create GPU job
+        shell: bash
+        run: |
+
+          set -e
 
           mkdir -p kaggle_job
 
           cat > kaggle_job/gpu_job.py <<'PY'
 
           import json
+          import os
           import subprocess
           import sys
           import time
-          import os
+          import traceback
 
-          print("======================================")
-          print("          KAGGLE GPU WORKER")
-          print("======================================")
+          print("=" * 60)
+          print("              KAGGLE GPU WORKER")
+          print("=" * 60)
+
+          JOB_ID = os.environ.get("JOB_ID", "unknown")
+          OPERATION = os.environ.get("OPERATION", "matrix")
+          MATRIX_SIZE = int(os.environ.get("MATRIX_SIZE", "1024"))
+
+          print("JOB ID:", JOB_ID)
+          print("OPERATION:", OPERATION)
+          print("MATRIX SIZE:", MATRIX_SIZE)
+
+          # =====================================================
+          # INSTALL PYTORCH
+          # =====================================================
+
+          print("")
+          print("=" * 60)
+          print("       INSTALLING PYTORCH")
+          print("=" * 60)
 
           subprocess.run(
               [
@@ -73,26 +140,36 @@ jobs:
                   "pip",
                   "install",
                   "--no-cache-dir",
-                  "-q",
                   "torch==2.5.1",
                   "--index-url",
-                  "https://download.pytorch.org/whl/cu124"
+                  "https://download.pytorch.org/whl/cu124",
               ],
-              check=True
+              check=True,
           )
+
+          # =====================================================
+          # IMPORT TORCH
+          # =====================================================
+
+          print("")
+          print("=" * 60)
+          print("             IMPORT TORCH")
+          print("=" * 60)
 
           import torch
 
-          JOB_ID = os.environ["JOB_ID"]
-          OPERATION = os.environ["OPERATION"]
-          MATRIX_SIZE = int(os.environ["MATRIX_SIZE"])
-
           print("PyTorch:", torch.__version__)
-          print("CUDA:", torch.version.cuda)
+          print("CUDA version:", torch.version.cuda)
           print("CUDA available:", torch.cuda.is_available())
 
           if not torch.cuda.is_available():
-              raise RuntimeError("CUDA is not available")
+              raise RuntimeError(
+                  "CUDA is NOT available inside Kaggle GPU worker."
+              )
+
+          # =====================================================
+          # GPU INFORMATION
+          # =====================================================
 
           gpu = torch.cuda.get_device_name(0)
 
@@ -102,11 +179,23 @@ jobs:
 
           memory_mb = props.total_memory / 1024 / 1024
 
+          print("")
+          print("=" * 60)
+          print("              GPU INFORMATION")
+          print("=" * 60)
+
           print("GPU:", gpu)
           print("Compute capability:", capability)
-          print("GPU memory:", memory_mb, "MB")
+          print("GPU memory MB:", round(memory_mb, 2))
 
-          # Basic GPU test
+          # =====================================================
+          # BASIC GPU TEST
+          # =====================================================
+
+          print("")
+          print("=" * 60)
+          print("            BASIC GPU TEST")
+          print("=" * 60)
 
           x = torch.randn(
               1024,
@@ -124,13 +213,25 @@ jobs:
 
           elapsed = time.perf_counter() - start
 
+          print("Basic matrix multiplication successful.")
+          print("Time:", elapsed)
+
+          # =====================================================
+          # REQUESTED OPERATION
+          # =====================================================
+
           requested_time = None
           requested_shape = None
 
           if OPERATION == "matrix":
 
+              print("")
+              print("=" * 60)
+              print("             MATRIX JOB")
+              print("=" * 60)
+
               print(
-                  "Running matrix:",
+                  "Matrix:",
                   MATRIX_SIZE,
                   "x",
                   MATRIX_SIZE
@@ -156,23 +257,47 @@ jobs:
 
               torch.cuda.synchronize()
 
-              requested_time = (
-                  time.perf_counter()
-                  - start
-              )
+              requested_time = time.perf_counter() - start
 
               requested_shape = list(c.shape)
+
+              print("Matrix multiplication successful.")
+              print("Time:", requested_time)
+
+              # Make sure GPU actually completed work.
+              checksum = float(c[0, 0].item())
+
+              print("Checksum:", checksum)
+
+          else:
+
+              raise ValueError(
+                  f"Unknown operation: {OPERATION}"
+              )
+
+          # =====================================================
+          # RESULT
+          # =====================================================
 
           result = {
               "job_id": JOB_ID,
               "operation": OPERATION,
               "status": "SUCCESS",
+
               "cuda": True,
+
               "gpu": gpu,
+
               "cuda_version": torch.version.cuda,
+
               "pytorch_version": torch.__version__,
+
               "compute_capability": list(capability),
-              "gpu_memory_mb": round(memory_mb, 2),
+
+              "gpu_memory_mb": round(
+                  memory_mb,
+                  2
+              ),
 
               "basic_test": {
                   "shape": list(y.shape),
@@ -186,13 +311,19 @@ jobs:
               }
           }
 
+          # =====================================================
+          # SAVE RESULT
+          # =====================================================
+
           os.makedirs(
               "/kaggle/working",
               exist_ok=True
           )
 
+          result_path = "/kaggle/working/result.json"
+
           with open(
-              "/kaggle/working/result.json",
+              result_path,
               "w"
           ) as f:
 
@@ -203,9 +334,9 @@ jobs:
               )
 
           print("")
-          print("======================================")
-          print("             GPU SUCCESS")
-          print("======================================")
+          print("=" * 60)
+          print("                GPU SUCCESS")
+          print("=" * 60)
 
           print(
               json.dumps(
@@ -216,20 +347,30 @@ jobs:
 
           print("")
           print("RESULT FILE:")
-          print("/kaggle/working/result.json")
+          print(result_path)
 
           PY
 
-      - name: Create Notebook
+          echo "GPU job Python file created."
+
+      # ==========================================
+      # CREATE NOTEBOOK
+      # ==========================================
+
+      - name: Create Kaggle notebook
+        shell: bash
         run: |
+
+          set -e
 
           python - <<'PY'
 
           import json
+          from pathlib import Path
 
-          code = open(
+          source = Path(
               "kaggle_job/gpu_job.py"
-          ).read()
+          ).read_text()
 
           notebook = {
               "cells": [
@@ -238,7 +379,7 @@ jobs:
                       "execution_count": None,
                       "metadata": {},
                       "outputs": [],
-                      "source": code.splitlines(True)
+                      "source": source.splitlines(True)
                   }
               ],
               "metadata": {
@@ -246,31 +387,43 @@ jobs:
                       "display_name": "Python 3",
                       "language": "python",
                       "name": "python3"
+                  },
+                  "language_info": {
+                      "name": "python"
                   }
               },
               "nbformat": 4,
               "nbformat_minor": 5
           }
 
-          with open(
-              "kaggle_job/gpu_job.ipynb",
-              "w"
-          ) as f:
-
-              json.dump(
+          Path(
+              "kaggle_job/gpu_job.ipynb"
+          ).write_text(
+              json.dumps(
                   notebook,
-                  f,
                   indent=2
               )
+          )
 
           PY
 
-      - name: Create Kaggle Metadata
+          echo "Notebook created."
+
+      # ==========================================
+      # KAGGLE METADATA
+      # ==========================================
+
+      - name: Create Kaggle metadata
+        shell: bash
         run: |
+
+          set -e
+
+          KERNEL="${KAGGLE_USERNAME}/gpu-job-${JOB_ID}"
 
           cat > kaggle_job/kernel-metadata.json <<EOF
           {
-            "id": "${KAGGLE_USERNAME}/gpu-job-${JOB_ID}",
+            "id": "${KERNEL}",
             "title": "GPU Job ${JOB_ID}",
             "code_file": "gpu_job.ipynb",
             "language": "python",
@@ -282,89 +435,290 @@ jobs:
           }
           EOF
 
-      - name: Submit Kaggle Job
-        working-directory: kaggle_job
+          cat kaggle_job/kernel-metadata.json
+
+      # ==========================================
+      # SUBMIT KAGGLE
+      # ==========================================
+
+      - name: Submit Kaggle GPU job
+        shell: bash
         run: |
 
-          kaggle kernels push
-
-      - name: Wait for Kaggle
-        run: |
+          set -e
 
           KERNEL="${KAGGLE_USERNAME}/gpu-job-${JOB_ID}"
 
+          echo "======================================"
+          echo "       SUBMITTING KAGGLE JOB"
+          echo "======================================"
+
+          echo "Kernel:"
+          echo "$KERNEL"
+
+          cd kaggle_job
+
+          set +e
+
+          python -m kaggle kernels push \
+            -p .
+
+          PUSH_EXIT=$?
+
+          set -e
+
+          if [[ "$PUSH_EXIT" != "0" ]]; then
+
+            echo ""
+            echo "======================================"
+            echo "       KAGGLE SUBMISSION FAILED"
+            echo "======================================"
+
+            exit "$PUSH_EXIT"
+
+          fi
+
+          echo ""
+          echo "Kaggle job submitted successfully."
+
+      # ==========================================
+      # WAIT FOR KAGGLE
+      # ==========================================
+
+      - name: Wait for Kaggle GPU
+        shell: bash
+        run: |
+
+          set -u
+
+          KERNEL="${KAGGLE_USERNAME}/gpu-job-${JOB_ID}"
+
+          mkdir -p kaggle_status
           mkdir -p kaggle_output
 
-          echo "======================================"
-          echo "       WAITING FOR KAGGLE GPU"
-          echo "======================================"
+          MAX_CHECKS=180
 
-          for i in $(seq 1 180)
+          for i in $(seq 1 "$MAX_CHECKS")
           do
 
             echo ""
-            echo "CHECK $i/180"
+            echo "======================================"
+            echo "CHECK $i/$MAX_CHECKS"
+            echo "======================================"
 
-            STATUS=$(python -m kaggle kernels status "$KERNEL" 2>&1 || true)
+            STATUS_FILE="kaggle_status/status-${i}.txt"
 
-            echo "$STATUS"
+            python -m kaggle kernels status \
+              "$KERNEL" \
+              > "$STATUS_FILE" \
+              2>&1
 
-            if echo "$STATUS" | grep -q "KernelWorkerStatus.COMPLETE"
+            STATUS_EXIT=$?
+
+            cat "$STATUS_FILE"
+
+            # ==========================================
+            # COMPLETE
+            # ==========================================
+
+            if grep -Fq "KernelWorkerStatus.COMPLETE" "$STATUS_FILE"
             then
 
-              echo "Kaggle job complete."
+              echo ""
+              echo "======================================"
+              echo "       KAGGLE JOB COMPLETE"
+              echo "======================================"
 
               break
 
             fi
 
-            if echo "$STATUS" | grep -q "KernelWorkerStatus.ERROR"
+            # ==========================================
+            # ERROR
+            # ==========================================
+
+            if grep -Fq "KernelWorkerStatus.ERROR" "$STATUS_FILE"
             then
 
-              echo "Kaggle job failed."
+              echo ""
+              echo "======================================"
+              echo "       KAGGLE JOB FAILED"
+              echo "======================================"
+
+              echo ""
+              echo "Downloading Kaggle output..."
+
+              python -m kaggle kernels output \
+                "$KERNEL" \
+                -p kaggle_output \
+                --force \
+                > kaggle_output_download.log \
+                2>&1
+
+              cat kaggle_output_download.log
+
+              echo ""
+              echo "======================================"
+              echo "       KAGGLE OUTPUT FILES"
+              echo "======================================"
+
+              find kaggle_output \
+                -type f \
+                -print || true
+
+              echo ""
+              echo "======================================"
+              echo "       KAGGLE OUTPUT CONTENT"
+              echo "======================================"
+
+              while IFS= read -r FILE
+              do
+                echo ""
+                echo "--------------------------------------"
+                echo "FILE: $FILE"
+                echo "--------------------------------------"
+
+                cat "$FILE" 2>/dev/null || true
+
+              done < <(
+                find kaggle_output \
+                  -type f \
+                  -print
+              )
+
+              echo ""
+              echo "======================================"
+              echo "       KAGGLE STATUS LOG"
+              echo "======================================"
+
+              cat "$STATUS_FILE"
 
               exit 1
 
             fi
 
+            # ==========================================
+            # API ERROR
+            # ==========================================
+
+            if grep -Fq "404 Client Error" "$STATUS_FILE"
+            then
+
+              echo ""
+              echo "Kaggle status API returned 404."
+
+              echo "Trying output download..."
+
+              python -m kaggle kernels output \
+                "$KERNEL" \
+                -p kaggle_output \
+                --force \
+                > output-check.log \
+                2>&1 || true
+
+              cat output-check.log
+
+              if [[ -f "kaggle_output/result.json" ]]
+              then
+
+                echo ""
+                echo "RESULT FOUND."
+
+                break
+
+              fi
+
+            fi
+
+            # ==========================================
+            # WAIT
+            # ==========================================
+
+            echo ""
+            echo "Kaggle job still running..."
+
             sleep 5
 
           done
 
-      - name: Download Result
+      # ==========================================
+      # DOWNLOAD RESULT
+      # ==========================================
+
+      - name: Download Kaggle result
+        shell: bash
         run: |
+
+          set -u
 
           KERNEL="${KAGGLE_USERNAME}/gpu-job-${JOB_ID}"
 
           mkdir -p kaggle_output
 
+          echo "======================================"
+          echo "       DOWNLOADING RESULT"
+          echo "======================================"
+
           python -m kaggle kernels output \
             "$KERNEL" \
             -p kaggle_output \
-            --force
+            --force \
+            > final-download.log \
+            2>&1
 
-          echo ""
+          DOWNLOAD_EXIT=$?
+
+          cat final-download.log
+
+          if [[ "$DOWNLOAD_EXIT" != "0" ]]; then
+
+            echo "Kaggle output download failed."
+
+          fi
+
+      # ==========================================
+      # SHOW RESULT
+      # ==========================================
+
+      - name: Show GPU result
+        shell: bash
+        run: |
+
           echo "======================================"
           echo "          GPU RESULT"
           echo "======================================"
 
-          find kaggle_output -type f -print
-
-          if [ -f "kaggle_output/result.json" ]
+          if [[ -f "kaggle_output/result.json" ]]
           then
 
             cat kaggle_output/result.json
 
           else
 
-            echo "result.json not found"
+            echo "ERROR: result.json not found."
+
+            echo ""
+            echo "Available files:"
+
+            find kaggle_output \
+              -type f \
+              -print || true
 
             exit 1
 
           fi
 
-      - name: Upload Result
+      # ==========================================
+      # UPLOAD DEBUG ARTIFACTS
+      # ==========================================
+
+      - name: Upload Kaggle debug logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gpu-result-${{ inputs.job_id }}
-          path: kaggle_output/result.json
+          name: kaggle-debug-${{ inputs.job_id }}
+          path: |
+            kaggle_status/
+            kaggle_output/
+            *.log
+          if-no-files-found: ignore
