@@ -13,19 +13,18 @@ on:
       operation:
         description: "Operation"
         required: true
-        default: "matrix"
         type: string
+        default: "matrix"
 
       size:
         description: "Matrix size"
         required: true
-        default: "1024"
         type: string
+        default: "1024"
 
 jobs:
   gpu-job:
     runs-on: ubuntu-latest
-
     timeout-minutes: 15
 
     env:
@@ -34,39 +33,102 @@ jobs:
 
       JOB_ID: ${{ inputs.job_id }}
       OPERATION: ${{ inputs.operation }}
-      SIZE: ${{ inputs.size }}
+      MATRIX_SIZE: ${{ inputs.size }}
 
     steps:
+
+      # ==================================================
+      # CHECKOUT
+      # ==================================================
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Kaggle
-        run: |
-          python -m pip install --upgrade pip
-          pip install kaggle
+      # ==================================================
+      # PYTHON
+      # ==================================================
 
-      - name: Check Kaggle
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ==================================================
+      # KAGGLE
+      # ==================================================
+
+      - name: Install Kaggle
+        shell: bash
         run: |
+          set -e
+
+          python -m pip install --upgrade pip
+          python -m pip install kaggle
+
+          echo "======================================"
+          echo "          KAGGLE VERSION"
+          echo "======================================"
+
           kaggle --version
 
-      - name: Create Kaggle files
-        run: |
-          mkdir -p kaggle_job
-          mkdir -p kaggle_output
+      # ==================================================
+      # CREDENTIAL CHECK
+      # ==================================================
 
-          cat > kaggle_job/script.py <<'PY'
-          import os
+      - name: Check Kaggle credentials
+        shell: bash
+        run: |
+          set -e
+
+          if [[ -z "$KAGGLE_USERNAME" ]]; then
+            echo "ERROR: KAGGLE_USERNAME is empty"
+            exit 1
+          fi
+
+          if [[ -z "$KAGGLE_API_TOKEN" ]]; then
+            echo "ERROR: KAGGLE_API_TOKEN is empty"
+            exit 1
+          fi
+
+          echo "Kaggle credentials are configured."
+
+      # ==================================================
+      # CREATE KAGGLE WORKER
+      # ==================================================
+
+      - name: Create Kaggle worker
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf kaggle_job
+          mkdir -p kaggle_job
+
+          # IMPORTANT:
+          # No quoted heredoc delimiter here.
+          #
+          # We intentionally allow GitHub Actions to substitute:
+          # ${{ inputs.job_id }}
+          # ${{ inputs.operation }}
+          # ${{ inputs.size }}
+
+          cat > kaggle_job/script.py <<PYEOF
           import json
           import time
           import traceback
+          import subprocess
+          import sys
 
-          JOB_ID = os.environ.get("JOB_ID", "unknown")
-          OPERATION = os.environ.get("OPERATION", "matrix")
-          SIZE = int(os.environ.get("SIZE", "1024"))
+          # ==================================================
+          # DIRECT VALUES FROM GITHUB ACTION
+          # ==================================================
+
+          JOB_ID = "${{ inputs.job_id }}"
+          OPERATION = "${{ inputs.operation }}"
+          SIZE = int("${{ inputs.size }}")
 
           print("=" * 60)
-          print("KAGGLE GPU WORKER")
+          print("            KAGGLE GPU WORKER")
           print("=" * 60)
 
           print("JOB_ID:", JOB_ID)
@@ -81,58 +143,234 @@ jobs:
           }
 
           try:
-              import numba
+
+              # ==================================================
+              # NVIDIA INFORMATION
+              # ==================================================
+
+              print("")
+              print("=" * 60)
+              print("             NVIDIA GPU")
+              print("=" * 60)
+
+              try:
+                  nvidia = subprocess.run(
+                      [
+                          "nvidia-smi",
+                          "--query-gpu=name,memory.total,driver_version",
+                          "--format=csv,noheader"
+                      ],
+                      capture_output=True,
+                      text=True
+                  )
+
+                  print("nvidia-smi return code:", nvidia.returncode)
+                  print(nvidia.stdout)
+
+                  if nvidia.stderr:
+                      print(nvidia.stderr)
+
+              except Exception as e:
+                  print("nvidia-smi error:", e)
+
+              # ==================================================
+              # NUMBA
+              # ==================================================
+
+              print("")
+              print("=" * 60)
+              print("              NUMBA CUDA")
+              print("=" * 60)
+
+              try:
+                  import numba
+              except ImportError:
+                  print("Installing Numba...")
+
+                  subprocess.run(
+                      [
+                          sys.executable,
+                          "-m",
+                          "pip",
+                          "install",
+                          "--no-cache-dir",
+                          "numba==0.60.0"
+                      ],
+                      check=True
+                  )
+
+                  import numba
+
               from numba import cuda
               import numpy as np
 
-              print()
               print("Numba:", numba.__version__)
-              print("CUDA available:", cuda.is_available())
+              print(
+                  "CUDA available:",
+                  cuda.is_available()
+              )
 
               if not cuda.is_available():
-                  raise RuntimeError("CUDA is not available")
+                  raise RuntimeError(
+                      "CUDA is not available"
+                  )
+
+              # ==================================================
+              # GPU
+              # ==================================================
 
               device = cuda.get_current_device()
 
-              print("GPU:", device.name)
-              print("Compute capability:", device.compute_capability)
+              gpu_name = str(device.name)
 
+              capability = (
+                  device.compute_capability
+              )
+
+              print("")
+              print("GPU:", gpu_name)
+              print(
+                  "Compute capability:",
+                  capability
+              )
+
+              result["gpu"] = gpu_name
+
+              result["compute_capability"] = [
+                  int(capability[0]),
+                  int(capability[1])
+              ]
+
+              result["cuda_available"] = True
+
+              result["numba_version"] = (
+                  numba.__version__
+              )
+
+              # ==================================================
+              # MATRIX KERNEL
+              # ==================================================
+
+              if OPERATION != "matrix":
+                  raise ValueError(
+                      "Unsupported operation: "
+                      + OPERATION
+                  )
+
+              if SIZE < 1:
+                  raise ValueError(
+                      "Matrix size must be positive"
+                  )
+
+              if SIZE > 4096:
+                  raise ValueError(
+                      "Matrix size too large"
+                  )
+
+              print("")
               print("=" * 60)
-              print("GPU TEST")
+              print("             MATRIX TEST")
               print("=" * 60)
+
+              print(
+                  "Matrix:",
+                  SIZE,
+                  "x",
+                  SIZE
+              )
 
               @cuda.jit
               def matrix_kernel(a, b, c):
+
                   row, col = cuda.grid(2)
 
-                  if row < a.shape[0] and col < b.shape[1]:
-                      tmp = 0.0
+                  if (
+                      row < a.shape[0]
+                      and col < b.shape[1]
+                  ):
 
-                      for k in range(a.shape[1]):
-                          tmp += a[row, k] * b[k, col]
+                      total = 0.0
 
-                      c[row, col] = tmp
+                      for k in range(
+                          a.shape[1]
+                      ):
 
-              n = SIZE
+                          total += (
+                              a[row, k]
+                              * b[k, col]
+                          )
 
-              # کوچک‌تر برای اینکه تست سریع باشد
-              a = np.random.rand(n, n).astype(np.float32)
-              b = np.random.rand(n, n).astype(np.float32)
-              c = np.zeros((n, n), dtype=np.float32)
+                      c[row, col] = total
+
+              # ==================================================
+              # HOST ARRAYS
+              # ==================================================
+
+              a = np.random.rand(
+                  SIZE,
+                  SIZE
+              ).astype(
+                  np.float32
+              )
+
+              b = np.random.rand(
+                  SIZE,
+                  SIZE
+              ).astype(
+                  np.float32
+              )
+
+              c = np.zeros(
+                  (
+                      SIZE,
+                      SIZE
+                  ),
+                  dtype=np.float32
+              )
+
+              # ==================================================
+              # COPY TO GPU
+              # ==================================================
 
               d_a = cuda.to_device(a)
               d_b = cuda.to_device(b)
               d_c = cuda.to_device(c)
 
-              threads = (16, 16)
-              blocks = (
-                  (n + threads[0] - 1) // threads[0],
-                  (n + threads[1] - 1) // threads[1]
+              threads = (
+                  16,
+                  16
               )
+
+              blocks = (
+                  (SIZE + threads[0] - 1)
+                  // threads[0],
+
+                  (SIZE + threads[1] - 1)
+                  // threads[1]
+              )
+
+              print(
+                  "Blocks:",
+                  blocks
+              )
+
+              print(
+                  "Threads:",
+                  threads
+              )
+
+              # ==================================================
+              # EXECUTE
+              # ==================================================
+
+              cuda.synchronize()
 
               start = time.perf_counter()
 
-              matrix_kernel[blocks, threads](
+              matrix_kernel[
+                  blocks,
+                  threads
+              ](
                   d_a,
                   d_b,
                   d_c
@@ -140,62 +378,145 @@ jobs:
 
               cuda.synchronize()
 
-              elapsed = time.perf_counter() - start
+              elapsed = (
+                  time.perf_counter()
+                  - start
+              )
 
-              c = d_c.copy_to_host()
+              # ==================================================
+              # COPY RESULT
+              # ==================================================
 
-              checksum = float(np.sum(c))
+              result_matrix = (
+                  d_c.copy_to_host()
+              )
 
-              print()
-              print("GPU computation successful!")
-              print("Matrix:", n, "x", n)
-              print("Time:", elapsed)
-              print("Checksum:", checksum)
+              checksum = float(
+                  np.sum(result_matrix)
+              )
 
-              result = {
-                  "job_id": JOB_ID,
-                  "operation": OPERATION,
-                  "size": n,
-                  "status": "SUCCESS",
-                  "gpu": str(device.name),
-                  "compute_capability": list(device.compute_capability),
-                  "cuda_available": True,
-                  "numba_version": numba.__version__,
+              print("")
+              print(
+                  "GPU computation successful."
+              )
+
+              print(
+                  "Time:",
+                  elapsed,
+                  "seconds"
+              )
+
+              print(
+                  "Checksum:",
+                  checksum
+              )
+
+              # ==================================================
+              # RESULT
+              # ==================================================
+
+              result["status"] = "SUCCESS"
+
+              result["requested_matrix"] = {
+                  "size": SIZE,
+                  "shape": [
+                      SIZE,
+                      SIZE
+                  ],
                   "time_seconds": elapsed,
                   "checksum": checksum
               }
 
+              # Free memory
+
+              del d_a
+              del d_b
+              del d_c
+
+              del a
+              del b
+              del c
+              del result_matrix
+
+              print("")
+              print("=" * 60)
+              print("              GPU SUCCESS")
+              print("=" * 60)
+
           except Exception as e:
 
-              print()
+              result["status"] = "ERROR"
+
+              result["error"] = str(e)
+
+              result["exception"] = (
+                  type(e).__name__
+              )
+
+              result["traceback"] = (
+                  traceback.format_exc()
+              )
+
+              print("")
               print("=" * 60)
-              print("GPU JOB ERROR")
+              print("               GPU ERROR")
               print("=" * 60)
+
+              print(
+                  str(e)
+              )
 
               traceback.print_exc()
 
-              result = {
-                  "job_id": JOB_ID,
-                  "operation": OPERATION,
-                  "size": SIZE,
-                  "status": "ERROR",
-                  "error": str(e),
-                  "traceback": traceback.format_exc()
-              }
+          # ==================================================
+          # SAVE RESULT
+          # ==================================================
 
-          print()
+          print("")
           print("=" * 60)
-          print("FINAL RESULT")
+          print("              FINAL RESULT")
           print("=" * 60)
 
-          print(json.dumps(result, indent=2))
+          print(
+              json.dumps(
+                  result,
+                  indent=2
+              )
+          )
 
-          with open("/kaggle/working/result.json", "w") as f:
-              json.dump(result, f, indent=2)
+          with open(
+              "/kaggle/working/result.json",
+              "w"
+          ) as f:
+
+              json.dump(
+                  result,
+                  f,
+                  indent=2
+              )
+
+          print("")
+          print(
+              "RESULT FILE:"
+          )
+
+          print(
+              "/kaggle/working/result.json"
+          )
+
+          # ==================================================
+          # FAIL KAGGLE JOB IF GPU FAILED
+          # ==================================================
 
           if result["status"] != "SUCCESS":
+
               raise SystemExit(1)
-          PY
+
+          PYEOF
+
+          # ==================================================
+          # METADATA
+          # ==================================================
 
           cat > kaggle_job/kernel-metadata.json <<EOF
           {
@@ -207,31 +528,57 @@ jobs:
             "is_private": true,
             "enable_gpu": true,
             "enable_tpu": false,
-            "dataset_sources": [],
-            "competition_sources": [],
-            "kernel_sources": [],
-            "model_sources": [],
-            "model_instance_ids": []
+            "enable_internet": true
           }
           EOF
 
-      - name: Submit Kaggle job
-        working-directory: kaggle_job
+          echo ""
+          echo "======================================"
+          echo "        GENERATED SCRIPT"
+          echo "======================================"
+
+          head -20 kaggle_job/script.py
+
+          echo ""
+          echo "======================================"
+          echo "        KAGGLE METADATA"
+          echo "======================================"
+
+          cat kaggle_job/kernel-metadata.json
+
+      # ==================================================
+      # SUBMIT KAGGLE
+      # ==================================================
+
+      - name: Submit Kaggle GPU job
+        shell: bash
         run: |
+          set -e
+
           echo "======================================"
           echo "       SUBMITTING KAGGLE JOB"
           echo "======================================"
 
-          echo "JOB_ID=$JOB_ID"
-          echo "OPERATION=$OPERATION"
-          echo "SIZE=$SIZE"
+          kaggle kernels push \
+            -p kaggle_job
 
-          kaggle kernels push
+          echo ""
+          echo "Kaggle job submitted."
 
-      - name: Wait for Kaggle
-        working-directory: kaggle_job
+      # ==================================================
+      # WAIT FOR KAGGLE
+      # ==================================================
+
+      - name: Wait for Kaggle GPU
+        shell: bash
         run: |
+          set +e
+
           KERNEL="${KAGGLE_USERNAME}/gpu-job-${JOB_ID}"
+
+          mkdir -p kaggle_output
+
+          FINAL_STATUS="UNKNOWN"
 
           echo "======================================"
           echo "       WAITING FOR KAGGLE GPU"
@@ -240,120 +587,243 @@ jobs:
           echo "Kernel:"
           echo "$KERNEL"
 
-          FINAL_STATUS="ERROR"
+          for i in $(seq 1 180)
+          do
 
-          for i in $(seq 1 180); do
-
-            STATUS=$(kaggle kernels status "$KERNEL" 2>&1 || true)
-
-            echo
+            echo ""
             echo "======================================"
             echo "CHECK $i/180"
             echo "======================================"
 
+            STATUS="$(
+              kaggle kernels status \
+                "$KERNEL" \
+                2>&1
+            )"
+
             echo "$STATUS"
 
-            if echo "$STATUS" | grep -q "COMPLETE"; then
+            if echo "$STATUS" | grep -q \
+              "KernelWorkerStatus.COMPLETE"
+            then
+
               FINAL_STATUS="COMPLETE"
+
+              echo ""
+              echo "KAGGLE JOB COMPLETE"
+
               break
             fi
 
-            if echo "$STATUS" | grep -q "ERROR"; then
-              FINAL_STATUS="ERROR"
-              break
-            fi
+            if echo "$STATUS" | grep -q \
+              "KernelWorkerStatus.ERROR"
+            then
 
-            if echo "$STATUS" | grep -q "CANCEL"; then
               FINAL_STATUS="ERROR"
+
+              echo ""
+              echo "KAGGLE JOB ERROR"
+
               break
             fi
 
             sleep 5
+
           done
 
-          echo
+          echo ""
           echo "FINAL_STATUS=$FINAL_STATUS"
 
-          mkdir -p ../kaggle_output
+          # ==================================================
+          # DOWNLOAD
+          # ==================================================
 
-          echo "Downloading Kaggle output..."
+          echo ""
+          echo "======================================"
+          echo "       DOWNLOADING KAGGLE OUTPUT"
+          echo "======================================"
 
-          kaggle kernels output "$KERNEL" \
-            -p ../kaggle_output \
-            --force || true
+          kaggle kernels output \
+            "$KERNEL" \
+            -p kaggle_output \
+            --force
 
-          echo
-          echo "Kaggle output:"
-          find ../kaggle_output -type f -maxdepth 3 -print || true
+          OUTPUT_EXIT=$?
 
-          if [ "$FINAL_STATUS" != "COMPLETE" ]; then
-            echo "Kaggle job failed."
-            exit 1
+          echo "Output exit code: $OUTPUT_EXIT"
+
+          echo ""
+          echo "======================================"
+          echo "          OUTPUT FILES"
+          echo "======================================"
+
+          find kaggle_output \
+            -type f \
+            -print || true
+
+          # ==================================================
+          # SHOW RESULT
+          # ==================================================
+
+          echo ""
+          echo "======================================"
+          echo "             RESULT.JSON"
+          echo "======================================"
+
+          RESULT_FILE="$(
+            find kaggle_output \
+              -type f \
+              -name "result.json" \
+              | head -n 1
+          )"
+
+          if [[ -n "$RESULT_FILE" ]]
+          then
+
+            cat "$RESULT_FILE"
+
+          else
+
+            echo "result.json not found."
+
           fi
 
+          # ==================================================
+          # VALIDATE KAGGLE STATUS
+          # ==================================================
+
+          if [[ "$FINAL_STATUS" != "COMPLETE" ]]
+          then
+
+            echo ""
+            echo "Kaggle job failed."
+
+            exit 1
+
+          fi
+
+          if [[ -z "$RESULT_FILE" ]]
+          then
+
+            echo ""
+            echo "Kaggle completed but result.json missing."
+
+            exit 1
+
+          fi
+
+      # ==================================================
+      # VALIDATE RESULT
+      # ==================================================
+
       - name: Validate result
+        shell: bash
         run: |
+          set -e
+
           echo "======================================"
           echo "       VALIDATING RESULT"
           echo "======================================"
 
-          if [ ! -f kaggle_output/result.json ]; then
-            echo "ERROR: result.json not found"
-            find kaggle_output -type f -print
+          RESULT_FILE="$(
+            find kaggle_output \
+              -type f \
+              -name "result.json" \
+              | head -n 1
+          )"
+
+          if [[ -z "$RESULT_FILE" ]]
+          then
+            echo "result.json not found"
             exit 1
           fi
 
-          cat kaggle_output/result.json
+          cat "$RESULT_FILE"
 
-          python - <<'PY'
+          EXPECTED_JOB="${{ inputs.job_id }}"
+
+          ACTUAL_JOB="$(
+            python -c '
           import json
-          import os
           import sys
 
-          path = "kaggle_output/result.json"
+          with open(sys.argv[1]) as f:
+              data = json.load(f)
 
-          with open(path) as f:
-              result = json.load(f)
+          print(data.get("job_id", ""))
+          ' "$RESULT_FILE"
+          )"
 
-          expected = os.environ["JOB_ID"]
-          actual = result.get("job_id")
+          echo ""
+          echo "Expected: $EXPECTED_JOB"
+          echo "Actual: $ACTUAL_JOB"
 
-          print("Expected:", expected)
-          print("Actual:", actual)
+          if [[ "$ACTUAL_JOB" != "$EXPECTED_JOB" ]]
+          then
 
-          if actual != expected:
-              print("ERROR: Job ID mismatch")
-              sys.exit(1)
+            echo ""
+            echo "ERROR: Job ID mismatch"
 
-          if result.get("status") != "SUCCESS":
-              print("ERROR: GPU computation failed")
-              sys.exit(1)
+            exit 1
 
-          print("Result validation successful!")
-          PY
+          fi
+
+          STATUS="$(
+            python -c '
+          import json
+          import sys
+
+          with open(sys.argv[1]) as f:
+              data = json.load(f)
+
+          print(data.get("status", ""))
+          ' "$RESULT_FILE"
+          )"
+
+          if [[ "$STATUS" != "SUCCESS" ]]
+          then
+
+            echo ""
+            echo "ERROR: GPU worker failed"
+
+            exit 1
+
+          fi
+
+          echo ""
+          echo "======================================"
+          echo "       RESULT VALIDATION SUCCESS"
+          echo "======================================"
+
+      # ==================================================
+      # UPLOAD
+      # ==================================================
 
       - name: Upload GPU result
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gpu-result-${{ inputs.job_id }}
-          path: |
-            kaggle_output/result.json
-            kaggle_output/*.log
+          path: kaggle_output/
           if-no-files-found: warn
 
+      # ==================================================
+      # FINAL
+      # ==================================================
+
       - name: Final
+        if: always()
         run: |
-          echo
+          echo ""
           echo "======================================"
           echo "          WORKFLOW FINISHED"
           echo "======================================"
 
           echo "JOB ID:"
-          echo "$JOB_ID"
+          echo "${{ inputs.job_id }}"
 
           echo "OPERATION:"
-          echo "$OPERATION"
+          echo "${{ inputs.operation }}"
 
           echo "SIZE:"
-          echo "$SIZE"
+          echo "${{ inputs.size }}"
