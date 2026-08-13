@@ -35,27 +35,13 @@ jobs:
 
     steps:
 
-      # ======================================================
-      # CHECKOUT
-      # ======================================================
-
       - name: Checkout
         uses: actions/checkout@v4
-
-
-      # ======================================================
-      # PYTHON
-      # ======================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-
-      # ======================================================
-      # INSTALL KAGGLE + NUMBA
-      # ======================================================
 
       - name: Install dependencies
         shell: bash
@@ -63,16 +49,7 @@ jobs:
           set -e
 
           python -m pip install --upgrade pip
-
-          python -m pip install \
-            kaggle \
-            numba \
-            numpy
-
-          echo ""
-          echo "======================================"
-          echo "ENVIRONMENT"
-          echo "======================================"
+          python -m pip install kaggle numba numpy requests
 
           python --version
           kaggle --version
@@ -80,43 +57,14 @@ jobs:
           python -c "import numba; print('Numba:', numba.__version__)"
           python -c "import numpy; print('NumPy:', numpy.__version__)"
 
-          echo ""
-          echo "======================================"
-          echo "CREDENTIAL CHECK"
-          echo "======================================"
-
-          if [ -z "$KAGGLE_USERNAME" ]; then
-            echo "ERROR: KAGGLE_USERNAME missing"
-            exit 1
-          fi
-
-          if [ -z "$KAGGLE_API_TOKEN" ]; then
-            echo "ERROR: KAGGLE_API_TOKEN missing"
-            exit 1
-          fi
-
-          if [ -z "$SESSION_ID" ]; then
-            echo "ERROR: SESSION_ID missing"
-            exit 1
-          fi
-
-          if [ -z "$API_URL" ]; then
-            echo "ERROR: API_URL missing"
-            exit 1
-          fi
-
-          if [ -z "$WORKER_TOKEN" ]; then
-            echo "ERROR: WORKER_TOKEN missing"
-            exit 1
-          fi
+          test -n "$KAGGLE_USERNAME"
+          test -n "$KAGGLE_API_TOKEN"
+          test -n "$SESSION_ID"
+          test -n "$API_URL"
+          test -n "$WORKER_TOKEN"
 
           echo "Session: $SESSION_ID"
           echo "API: $API_URL"
-
-
-      # ======================================================
-      # CREATE KAGGLE WORKER
-      # ======================================================
 
       - name: Create Kaggle worker
         shell: bash
@@ -126,39 +74,22 @@ jobs:
           rm -rf kaggle_session
           mkdir -p kaggle_session
 
-          cat > kaggle_session/script.py <<'PYEOF'
-          import os
+          cat > kaggle_session/script.py <<PYEOF
           import time
           import json
           import traceback
           import subprocess
+          import requests
 
           import numpy as np
           from numba import cuda
 
-
-          # ==================================================
-          # CONFIG
-          # ==================================================
-
-          SESSION_ID = os.environ.get(
-              "SESSION_ID",
-              "unknown"
-          )
-
-          API_URL = os.environ.get(
-              "API_URL",
-              ""
-          ).rstrip("/")
-
-          WORKER_TOKEN = os.environ.get(
-              "WORKER_TOKEN",
-              ""
-          )
-
+          SESSION_ID = "${{ inputs.session_id }}"
+          API_URL = "${{ inputs.api_url }}".rstrip("/")
+          WORKER_TOKEN = "${{ inputs.worker_token }}"
 
           print("=" * 70)
-          print("                  GPU SESSION WORKER")
+          print("                    GPU SESSION WORKER")
           print("=" * 70)
 
           print("SESSION_ID:", SESSION_ID)
@@ -169,105 +100,63 @@ jobs:
               "status": "ERROR",
               "gpu": None,
               "compute_capability": None,
-              "cuda_available": False
+              "cuda_available": False,
           }
-
 
           try:
 
-              # ==================================================
-              # NVIDIA SMI
-              # ==================================================
-
               print("")
               print("=" * 70)
-              print("                    NVIDIA GPU")
+              print("                     NVIDIA GPU")
               print("=" * 70)
 
               try:
-
                   smi = subprocess.run(
                       [
                           "nvidia-smi",
                           "--query-gpu=name,memory.total,driver_version",
-                          "--format=csv,noheader"
+                          "--format=csv,noheader",
                       ],
                       capture_output=True,
                       text=True,
-                      timeout=30
+                      timeout=30,
                   )
 
-                  print(
-                      "nvidia-smi return code:",
-                      smi.returncode
-                  )
-
-                  print(
-                      smi.stdout
-                  )
+                  print("nvidia-smi return code:", smi.returncode)
+                  print(smi.stdout)
 
                   if smi.stderr:
-                      print(
-                          "nvidia-smi stderr:"
-                      )
-                      print(
-                          smi.stderr
-                      )
+                      print("nvidia-smi stderr:")
+                      print(smi.stderr)
 
               except Exception as e:
-
-                  print(
-                      "nvidia-smi failed:",
-                      repr(e)
-                  )
-
-
-              # ==================================================
-              # CUDA
-              # ==================================================
+                  print("nvidia-smi error:", repr(e))
 
               print("")
               print("=" * 70)
-              print("                    NUMBA CUDA")
+              print("                     NUMBA CUDA")
               print("=" * 70)
 
-              cuda_available = (
-                  cuda.is_available()
-              )
+              cuda_available = cuda.is_available()
 
               print(
                   "CUDA available:",
                   cuda_available
               )
 
-              result[
-                  "cuda_available"
-              ] = bool(
+              result["cuda_available"] = bool(
                   cuda_available
               )
 
               if not cuda_available:
-
                   raise RuntimeError(
-                      "Numba reports CUDA unavailable"
+                      "Numba CUDA is not available"
                   )
 
+              device = cuda.get_current_device()
 
-              # ==================================================
-              # GPU INFORMATION
-              # ==================================================
-
-              device = (
-                  cuda.get_current_device()
-              )
-
-              gpu_name = str(
-                  device.name
-              )
-
-              capability = (
-                  device.compute_capability
-              )
+              gpu_name = str(device.name)
+              capability = device.compute_capability
 
               print(
                   "GPU:",
@@ -279,73 +168,26 @@ jobs:
                   capability
               )
 
-              result[
-                  "gpu"
-              ] = gpu_name
+              result["gpu"] = gpu_name
 
-              result[
-                  "compute_capability"
-              ] = [
+              result["compute_capability"] = [
                   int(capability[0]),
-                  int(capability[1])
+                  int(capability[1]),
               ]
-
-
-              # ==================================================
-              # P100 CHECK
-              # ==================================================
-
-              if tuple(capability) == (6, 0):
-
-                  print(
-                      "Tesla P100 / sm_60 detected."
-                  )
-
-              else:
-
-                  print(
-                      "Warning: GPU is not sm_60"
-                  )
-
-
-              # ==================================================
-              # GPU KERNEL
-              # ==================================================
 
               print("")
               print("=" * 70)
-              print("                 GPU COMPUTATION")
+              print("                    GPU TEST")
               print("=" * 70)
-
 
               N = 1024 * 1024
 
-
               @cuda.jit
-              def add_kernel(
-                  a,
-                  b,
-                  c
-              ):
-
+              def add_kernel(a, b, c):
                   i = cuda.grid(1)
 
                   if i < c.size:
-
-                      c[i] = (
-                          a[i]
-                          + b[i]
-                      )
-
-
-              # ==================================================
-              # HOST DATA
-              # ==================================================
-
-              print(
-                  "Creating arrays:",
-                  N
-              )
+                      c[i] = a[i] + b[i]
 
               a = np.random.rand(
                   N
@@ -364,34 +206,14 @@ jobs:
                   dtype=np.float32
               )
 
-
-              # ==================================================
-              # COPY TO GPU
-              # ==================================================
-
-              print(
-                  "Copying data to GPU..."
-              )
-
-              d_a = cuda.to_device(
-                  a
-              )
-
-              d_b = cuda.to_device(
-                  b
-              )
-
-              d_c = cuda.to_device(
-                  c
-              )
-
+              d_a = cuda.to_device(a)
+              d_b = cuda.to_device(b)
+              d_c = cuda.to_device(c)
 
               threads = 256
-
               blocks = (
                   N + threads - 1
               ) // threads
-
 
               print(
                   "Threads:",
@@ -403,15 +225,7 @@ jobs:
                   blocks
               )
 
-
-              # ==================================================
-              # WARMUP
-              # ==================================================
-
-              print(
-                  "CUDA warm-up..."
-              )
-
+              # Warmup
               add_kernel[
                   blocks,
                   threads
@@ -423,15 +237,7 @@ jobs:
 
               cuda.synchronize()
 
-
-              # ==================================================
-              # BENCHMARK
-              # ==================================================
-
-              print(
-                  "Running benchmark..."
-              )
-
+              # Benchmark
               start = time.perf_counter()
 
               add_kernel[
@@ -450,15 +256,7 @@ jobs:
                   - start
               )
 
-
-              # ==================================================
-              # COPY BACK
-              # ==================================================
-
-              output = (
-                  d_c.copy_to_host()
-              )
-
+              output = d_c.copy_to_host()
 
               checksum = float(
                   np.sum(
@@ -466,15 +264,8 @@ jobs:
                   )
               )
 
-
-              print("")
               print(
-                  "GPU computation successful."
-              )
-
-              print(
-                  "Elements:",
-                  N
+                  "GPU computation successful"
               )
 
               print(
@@ -488,53 +279,63 @@ jobs:
                   checksum
               )
 
+              result["status"] = "READY"
 
-              # ==================================================
-              # RESULT
-              # ==================================================
-
-              result[
-                  "status"
-              ] = "READY"
-
-              result[
-                  "test"
-              ] = {
-                  "operation":
-                      "vector_add",
-
-                  "elements":
-                      N,
-
-                  "blocks":
-                      blocks,
-
-                  "threads":
-                      threads,
-
-                  "time_seconds":
-                      elapsed,
-
-                  "checksum":
-                      checksum
+              result["test"] = {
+                  "operation": "vector_add",
+                  "elements": N,
+                  "blocks": blocks,
+                  "threads": threads,
+                  "time_seconds": elapsed,
+                  "checksum": checksum,
               }
 
+              # ------------------------------------------------
+              # NOTIFY RAILWAY
+              # ------------------------------------------------
 
-              # ==================================================
-              # SAVE RESULT
-              # ==================================================
+              print("")
+              print("=" * 70)
+              print("                 NOTIFY RAILWAY")
+              print("=" * 70)
 
-              with open(
-                  "/kaggle/working/session_result.json",
-                  "w"
-              ) as f:
+              ready_payload = {
+                  "worker_token": WORKER_TOKEN,
+                  "gpu": gpu_name,
+                  "compute_capability": [
+                      int(capability[0]),
+                      int(capability[1]),
+                  ],
+              }
 
-                  json.dump(
-                      result,
-                      f,
-                      indent=2
+              ready_url = (
+                  API_URL
+                  + "/gpu/session/"
+                  + SESSION_ID
+                  + "/worker-ready"
+              )
+
+              ready_response = requests.post(
+                  ready_url,
+                  json=ready_payload,
+                  timeout=30,
+              )
+
+              print(
+                  "Railway HTTP:",
+                  ready_response.status_code
+              )
+
+              print(
+                  "Railway response:",
+                  ready_response.text
+              )
+
+              if ready_response.status_code != 200:
+                  raise RuntimeError(
+                      "Railway worker-ready request failed: "
+                      + ready_response.text
                   )
-
 
               print("")
               print("=" * 70)
@@ -548,20 +349,14 @@ jobs:
                   )
               )
 
-
-              # ==================================================
-              # KEEP ALIVE
-              # ==================================================
+              # ------------------------------------------------
+              # KEEP GPU ALIVE
+              # ------------------------------------------------
 
               print("")
               print(
-                  "GPU worker is now alive."
+                  "Keeping GPU worker alive..."
               )
-
-              print(
-                  "Session duration: 600 seconds"
-              )
-
 
               for i in range(600):
 
@@ -573,35 +368,31 @@ jobs:
 
                   time.sleep(1)
 
-
-              print("")
               print(
-                  "GPU SESSION TIME EXPIRED"
+                  "GPU worker session finished."
               )
 
+              with open(
+                  "/kaggle/working/session_result.json",
+                  "w",
+              ) as f:
+
+                  json.dump(
+                      result,
+                      f,
+                      indent=2
+                  )
 
           except Exception as e:
 
-              result[
-                  "status"
-              ] = "ERROR"
-
-              result[
-                  "error"
-              ] = str(e)
-
-              result[
-                  "exception"
-              ] = type(e).__name__
-
-              result[
-                  "traceback"
-              ] = traceback.format_exc()
-
+              result["status"] = "ERROR"
+              result["error"] = str(e)
+              result["exception"] = type(e).__name__
+              result["traceback"] = traceback.format_exc()
 
               print("")
               print("=" * 70)
-              print("                    GPU ERROR")
+              print("                     GPU ERROR")
               print("=" * 70)
 
               print(
@@ -613,13 +404,10 @@ jobs:
 
               traceback.print_exc()
 
-
-              # Save error
               try:
-
                   with open(
                       "/kaggle/working/session_result.json",
-                      "w"
+                      "w",
                   ) as f:
 
                       json.dump(
@@ -627,20 +415,12 @@ jobs:
                           f,
                           indent=2
                       )
-
               except Exception:
                   pass
 
-
               raise
 
-
           PYEOF
-
-
-          # ==================================================
-          # KAGGLE METADATA
-          # ==================================================
 
           cat > kaggle_session/kernel-metadata.json <<EOF
           {
@@ -656,38 +436,20 @@ jobs:
           }
           EOF
 
-
-          echo ""
           echo "======================================"
-          echo "          KAGGLE WORKER"
+          echo "KAGGLE METADATA"
           echo "======================================"
 
           cat kaggle_session/kernel-metadata.json
-
-
-      # ======================================================
-      # SUBMIT KAGGLE
-      # ======================================================
 
       - name: Submit Kaggle GPU
         shell: bash
         run: |
           set -e
 
-          echo "======================================"
-          echo "       SUBMITTING KAGGLE"
-          echo "======================================"
+          kaggle kernels push -p kaggle_session
 
-          kaggle kernels push \
-            -p kaggle_session
-
-          echo ""
           echo "Kaggle worker submitted."
-
-
-      # ======================================================
-      # WAIT
-      # ======================================================
 
       - name: Wait for Kaggle
         shell: bash
@@ -700,23 +462,17 @@ jobs:
 
           FINAL_STATUS="UNKNOWN"
 
-          echo ""
           echo "======================================"
-          echo "          WAITING FOR KAGGLE"
+          echo "WAITING FOR KAGGLE"
           echo "======================================"
 
           echo "Kernel:"
           echo "$KERNEL"
 
-
-          for i in $(seq 1 180)
-          do
+          for i in $(seq 1 180); do
 
             echo ""
-            echo "======================================"
             echo "CHECK $i/180"
-            echo "======================================"
-
 
             STATUS="$(
               kaggle kernels status \
@@ -724,31 +480,15 @@ jobs:
                 2>&1
             )"
 
-
             echo "$STATUS"
-
-
-            # ------------------------------------------------
-            # COMPLETE
-            # ------------------------------------------------
 
             if echo "$STATUS" | grep -q \
               "KernelWorkerStatus.COMPLETE"
             then
-
               FINAL_STATUS="COMPLETE"
-
-              echo ""
-              echo "KAGGLE SESSION COMPLETE"
-
+              echo "Kaggle session complete."
               break
-
             fi
-
-
-            # ------------------------------------------------
-            # ERROR
-            # ------------------------------------------------
 
             if echo "$STATUS" | grep -q \
               "KernelWorkerStatus.ERROR"
@@ -758,18 +498,11 @@ jobs:
 
               echo ""
               echo "======================================"
-              echo "          KAGGLE SESSION ERROR"
+              echo "KAGGLE SESSION ERROR"
               echo "======================================"
 
-
-              echo ""
-              echo "Downloading Kaggle output..."
-
-
               rm -rf kaggle_output
-
               mkdir -p kaggle_output
-
 
               kaggle kernels output \
                 "$KERNEL" \
@@ -777,84 +510,49 @@ jobs:
                 --force \
                 2>&1 || true
 
-
               echo ""
-              echo "======================================"
-              echo "             OUTPUT FILES"
-              echo "======================================"
-
+              echo "OUTPUT FILES:"
 
               find kaggle_output \
                 -type f \
                 -print \
                 2>/dev/null || true
 
-
               echo ""
-              echo "======================================"
-              echo "            OUTPUT CONTENT"
-              echo "======================================"
+              echo "OUTPUT CONTENT:"
 
-
-              while IFS= read -r file
-              do
-
+              while IFS= read -r file; do
                 echo ""
                 echo "===== $file ====="
-
-                cat "$file" \
-                  2>/dev/null || true
-
+                cat "$file" 2>/dev/null || true
               done < <(
                 find kaggle_output \
                   -type f \
                   2>/dev/null
               )
 
-
               break
-
             fi
-
 
             sleep 5
 
           done
 
-
           echo ""
-          echo "======================================"
-          echo "             FINAL STATUS"
-          echo "======================================"
-
           echo "FINAL_STATUS=$FINAL_STATUS"
 
-
-          if [
-            "$FINAL_STATUS"
-            != "COMPLETE"
-          ]
-          then
-
-            echo ""
+          if [ "$FINAL_STATUS" != "COMPLETE" ]; then
             echo "Kaggle worker failed."
-
             exit 1
-
           fi
 
-
-      # ======================================================
-      # DOWNLOAD RESULT
-      # ======================================================
-
-      - name: Download final Kaggle output
+      - name: Download final output
         if: always()
         shell: bash
         run: |
-
           KERNEL="${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
 
+          rm -rf final_output
           mkdir -p final_output
 
           kaggle kernels output \
@@ -863,9 +561,8 @@ jobs:
             --force \
             2>&1 || true
 
-          echo ""
           echo "======================================"
-          echo "          FINAL KAGGLE FILES"
+          echo "FINAL KAGGLE FILES"
           echo "======================================"
 
           find final_output \
@@ -873,36 +570,19 @@ jobs:
             -print \
             2>/dev/null || true
 
-
-      # ======================================================
-      # ARTIFACT
-      # ======================================================
-
-      - name: Upload session result
+      - name: Upload session artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gpu-session-${{ inputs.session_id }}
-          path: |
-            final_output/
+          path: final_output/
           if-no-files-found: warn
-
-
-      # ======================================================
-      # FINAL
-      # ======================================================
 
       - name: Final
         if: always()
         run: |
-
-          echo ""
           echo "======================================"
-          echo "       GPU SESSION FINISHED"
+          echo "GPU SESSION FINISHED"
           echo "======================================"
-
-          echo "Session:"
-          echo "$SESSION_ID"
-
-          echo "API:"
-          echo "$API_URL"
+          echo "SESSION_ID=$SESSION_ID"
+          echo "API_URL=$API_URL"
