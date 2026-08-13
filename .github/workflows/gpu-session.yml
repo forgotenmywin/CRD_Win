@@ -23,7 +23,7 @@ on:
 jobs:
   gpu-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
 
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
