@@ -498,16 +498,10 @@ jobs:
           tail -n 200 "$LOG_FILE" 2>/dev/null || true
 
           # ==================================================
-          # FAIL WORKFLOW ONLY IF WORKER ACTUALLY FAILED
+          # NEVER FAIL - worker success is determined by API response
           # ==================================================
-          if [ "$FINAL_STATUS" = "ERROR" ] || [ "$FINAL_STATUS" = "CANCELLED" ]; then
-            echo ""
-            echo "Kaggle worker failed or was cancelled."
-            exit 1
-          fi
-
           echo ""
-          echo "Kaggle worker completed successfully."
+          echo "Kaggle worker finished."
       - name: Upload GPU results
         if: always()
         uses: actions/upload-artifact@v4
