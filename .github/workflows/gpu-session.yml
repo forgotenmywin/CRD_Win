@@ -68,57 +68,44 @@ jobs:
           set -e
           rm -rf kaggle_session
           mkdir -p kaggle_session
-          cat > kaggle_session/config.json <<EOF
-          {
-            "api_url": "$API_URL",
-            "session_id": "$SESSION_ID",
-            "worker_token": "$WORKER_TOKEN"
-          }
-          EOF
-          cat > kaggle_session/script.py <<'PYEOF'
+
+          cat > kaggle_session/script.py <<PYEOF
           import os
           import sys
           import json
           import time
           import traceback
           import subprocess
+
           try:
               import requests
           except ImportError:
               subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "requests"])
               import requests
-          CONFIG_PATH = None
-          for p in [
-              "/kaggle/working/config.json",
-              os.path.join(os.path.dirname(__file__), "config.json"),
-              "config.json",
-              "/kaggle/src/config.json",
-              "/kaggle/input/config.json",
-          ]:
-              if os.path.exists(p):
-                  CONFIG_PATH = p
-                  break
-          print("DEBUG: Config path found:", CONFIG_PATH)
-          config = {}
-          if CONFIG_PATH:
-              try:
-                  with open(CONFIG_PATH, "r") as f:
-                      config = json.load(f)
-                  print("DEBUG: Config loaded:", json.dumps(config))
-              except Exception as e:
-                  print("Failed to load config.json:", e)
-          else:
-              print("WARNING: config.json not found in any path!")
-          API_URL = (config.get("api_url") or os.environ.get("API_URL", "")).rstrip("/")
-          SESSION_ID = config.get("session_id") or os.environ.get("SESSION_ID", "unknown")
-          WORKER_TOKEN = config.get("worker_token") or os.environ.get("WORKER_TOKEN", "")
+
+          # ============================================================
+          # EMBEDDED CONFIG - GitHub Actions expands these at build time
+          # ============================================================
+          API_URL = "${API_URL}".rstrip("/")
+          SESSION_ID = "${SESSION_ID}"
+          WORKER_TOKEN = "${WORKER_TOKEN}"
+
           print("DEBUG: API_URL =", repr(API_URL))
           print("DEBUG: SESSION_ID =", repr(SESSION_ID))
           print("DEBUG: WORKER_TOKEN length =", len(WORKER_TOKEN))
+
+          if not API_URL:
+              print("ERROR: API_URL is empty!")
+          if not WORKER_TOKEN:
+              print("ERROR: WORKER_TOKEN is empty!")
+          if not SESSION_ID:
+              print("ERROR: SESSION_ID is empty!")
+
           HEADERS = {
               "Content-Type": "application/json",
               "X-Worker-Token": WORKER_TOKEN
           }
+
           def api_call(method, path, payload=None):
               if not API_URL:
                   print(f"DEBUG: API_URL is empty, cannot make {method} request")
@@ -136,11 +123,13 @@ jobs:
               except Exception as e:
                   print(f"API {method} {path} failed: {e}")
                   return None
+
           print("=" * 60)
           print("KAGGLE GPU WORKER")
           print("SESSION:", SESSION_ID)
           print("API:", API_URL)
           print("=" * 60)
+
           result = {
               "session_id": SESSION_ID,
               "status": "starting",
@@ -150,6 +139,7 @@ jobs:
               "test": None,
               "error": None
           }
+
           try:
               print("\n" + "=" * 60)
               print("NVIDIA-SMI")
@@ -159,6 +149,7 @@ jobs:
               if smi.returncode != 0:
                   print(smi.stderr)
                   raise RuntimeError("nvidia-smi failed")
+
               gpu_info = subprocess.run(
                   ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
                   capture_output=True, text=True, timeout=30
@@ -168,9 +159,11 @@ jobs:
               gpu_line = gpu_info.stdout.strip().splitlines()
               if gpu_line:
                   result["gpu"] = gpu_line[0]
+
               print("\n" + "=" * 60)
               print("NUMBA CUDA TEST")
               print("=" * 60)
+
               try:
                   import numpy as np
                   from numba import cuda
@@ -178,45 +171,57 @@ jobs:
                   subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "numba", "numpy"])
                   import numpy as np
                   from numba import cuda
+
               cuda_available = cuda.is_available()
               print("CUDA available:", cuda_available)
               result["cuda_available"] = bool(cuda_available)
               if not cuda_available:
                   raise RuntimeError("CUDA is not available")
+
               device = cuda.get_current_device()
               capability = device.compute_capability
               print("Compute capability:", capability)
               result["compute_capability"] = [int(capability[0]), int(capability[1])]
+
               N = 1024 * 1024
+
               @cuda.jit
               def add_kernel(a, b, c):
                   i = cuda.grid(1)
                   if i < a.size:
                       c[i] = a[i] + b[i]
+
               print("\nCreating arrays...")
               a = np.ones(N, dtype=np.float32)
               b = np.ones(N, dtype=np.float32)
               c = np.zeros(N, dtype=np.float32)
+
               print("Copying data to GPU...")
               d_a = cuda.to_device(a)
               d_b = cuda.to_device(b)
               d_c = cuda.to_device(c)
+
               threads = 256
               blocks = (N + threads - 1) // threads
+
               print("Launching GPU kernel...")
               start = time.perf_counter()
               add_kernel[blocks, threads](d_a, d_b, d_c)
               cuda.synchronize()
               elapsed = time.perf_counter() - start
+
               output = d_c.copy_to_host()
               checksum = float(np.sum(output))
               expected = float(N * 2)
+
               print("\nGPU computation successful")
               print("Elements:", N)
               print("Kernel time:", elapsed)
               print("Checksum:", checksum)
+
               if abs(checksum - expected) > 0.01:
                   raise RuntimeError("GPU result verification failed")
+
               result["status"] = "READY"
               result["test"] = {
                   "elements": N,
@@ -224,12 +229,15 @@ jobs:
                   "checksum": checksum,
                   "expected": expected
               }
+
               print("\n" + "=" * 60)
               print("GPU WORKER READY")
               print("=" * 60)
               print(json.dumps(result, indent=2))
+
               with open("/kaggle/working/session_result.json", "w") as f:
                   json.dump(result, f, indent=2)
+
               print("\nNotifying API that worker is ready...")
               ready_payload = {
                   "gpu": result["gpu"],
@@ -238,7 +246,9 @@ jobs:
               }
               print("DEBUG: Payload:", json.dumps(ready_payload))
               print("DEBUG: Headers:", {k: v[:10] + "..." if k == "X-Worker-Token" and len(v) > 10 else v for k, v in HEADERS.items()})
+
               resp = api_call("POST", f"/gpu/session/{SESSION_ID}/worker-ready", ready_payload)
+
               if resp is None:
                   print("DEBUG: api_call returned None - connection failed or API_URL empty")
               else:
@@ -248,18 +258,22 @@ jobs:
                       print("DEBUG: Response JSON:", resp.json())
                   except:
                       print("DEBUG: Response text:", resp.text[:1000])
+
               if resp and resp.status_code in (200, 202):
                   print("API acknowledged worker-ready.")
               else:
                   print("WARNING: API did not acknowledge worker-ready.")
+
               print("\nKeeping GPU worker alive and polling for commands...")
               for i in range(600):
                   time.sleep(1)
+
                   if i % 30 == 0 and i > 0:
                       hb = api_call("POST", f"/gpu/session/{SESSION_ID}/heartbeat")
                       if hb and hb.status_code == 410:
                           print("Session expired according to API. Exiting.")
                           break
+
                   if i % 5 == 0:
                       try:
                           cmd_resp = api_call("GET", f"/internal/session/{SESSION_ID}/command")
@@ -271,6 +285,7 @@ jobs:
                                   op = cmd.get("operation", "")
                                   params = cmd.get("parameters", {})
                                   cmd_start = time.time()
+
                                   try:
                                       if op == "execute_python":
                                           code = params.get("code", "")
@@ -291,6 +306,7 @@ jobs:
                                               "output": {k: str(v) for k, v in exec_locals.items() if not k.startswith("_")},
                                               "execution_time": time.time() - cmd_start
                                           }
+
                                       elif op == "nvidia_smi":
                                           smi2 = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30)
                                           cmd_result = {
@@ -299,6 +315,7 @@ jobs:
                                               "stderr": smi2.stderr,
                                               "returncode": smi2.returncode
                                           }
+
                                       elif op == "shell":
                                           shell_cmd = params.get("command", "")
                                           sh = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, timeout=60)
@@ -308,17 +325,20 @@ jobs:
                                               "stderr": sh.stderr,
                                               "returncode": sh.returncode
                                           }
+
                                       else:
                                           cmd_result = {
                                               "status": "error",
                                               "error": f"Unknown operation: {op}"
                                           }
+
                                   except Exception as exec_err:
                                       cmd_result = {
                                           "status": "error",
                                           "error": str(exec_err),
                                           "traceback": traceback.format_exc()
                                       }
+
                                   api_call("POST", f"/internal/session/{SESSION_ID}/result", {
                                       "command_id": cmd["command_id"],
                                       **cmd_result
@@ -326,7 +346,9 @@ jobs:
                                   print(f"<<< Command {cmd['command_id']} result sent.")
                       except Exception as poll_err:
                           print(f"Command polling error: {poll_err}")
+
               print("\nWorker keep-alive loop finished.")
+
           except Exception as e:
               result["status"] = "ERROR"
               result["error"] = str(e)
@@ -343,6 +365,7 @@ jobs:
                   pass
               raise
           PYEOF
+
           cat > kaggle_session/kernel-metadata.json <<EOF
           {
             "id": "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}",
@@ -356,13 +379,12 @@ jobs:
             "enable_internet": true
           }
           EOF
+
           echo ""
           echo "======================================"
           echo "KAGGLE WORKER CREATED"
           echo "======================================"
           cat kaggle_session/kernel-metadata.json
-          echo ""
-          cat kaggle_session/config.json
       - name: Push Kaggle GPU worker
         shell: bash
         run: |
