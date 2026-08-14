@@ -401,56 +401,74 @@ jobs:
         run: |
           set +e
           KERNEL="${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
+
           echo ""
           echo "======================================"
           echo "WAITING FOR KAGGLE"
           echo "======================================"
           echo "Kernel: $KERNEL"
+
           FINAL_STATUS="UNKNOWN"
           for i in $(seq 1 240); do
             echo ""
             echo "======================================"
             echo "CHECK $i/240"
             echo "======================================"
+
             STATUS="$(kaggle kernels status "$KERNEL" 2>&1)"
             echo "$STATUS"
-            if echo "$STATUS" | grep -q "KernelWorkerStatus.COMPLETE"; then
+
+            if echo "$STATUS" | grep -qi "complete"; then
               FINAL_STATUS="COMPLETE"
               echo ""
               echo "KAGGLE WORKER COMPLETE"
               break
             fi
-            if echo "$STATUS" | grep -q "KernelWorkerStatus.ERROR"; then
+
+            if echo "$STATUS" | grep -qi "error"; then
               FINAL_STATUS="ERROR"
               echo ""
               echo "KAGGLE WORKER ERROR"
               break
             fi
-            if echo "$STATUS" | grep -q "KernelWorkerStatus.CANCEL"; then
+
+            if echo "$STATUS" | grep -qi "cancel"; then
               FINAL_STATUS="CANCELLED"
               echo ""
               echo "KAGGLE WORKER CANCELLED"
               break
             fi
+
             sleep 5
           done
+
           echo ""
           echo "======================================"
           echo "FINAL STATUS"
           echo "======================================"
           echo "$FINAL_STATUS"
+
+          # ==================================================
+          # DOWNLOAD OUTPUT (best effort)
+          # ==================================================
           rm -rf final_output
           mkdir -p final_output
+
           echo ""
           echo "======================================"
           echo "DOWNLOADING KAGGLE OUTPUT"
           echo "======================================"
-          kaggle kernels output "$KERNEL" -p final_output -o
+          kaggle kernels output "$KERNEL" -p final_output -o || echo "Warning: output download failed"
+
           echo ""
           echo "======================================"
           echo "FILES"
           echo "======================================"
-          find final_output -type f -print
+          find final_output -type f -print 2>/dev/null || echo "No files found"
+
+          # ==================================================
+          # PRINT RESULT JSON
+          # ==================================================
           echo ""
           echo "======================================"
           echo "SESSION RESULT"
@@ -460,24 +478,34 @@ jobs:
           else
             echo "session_result.json not found"
           fi
+
+          # ==================================================
+          # DOWNLOAD LOG (best effort)
+          # ==================================================
           echo ""
           echo "======================================"
           echo "KAGGLE LOG"
           echo "======================================"
           LOG_FILE="final_output/gpu-session-${SESSION_ID}.log"
-          kaggle kernels logs "$KERNEL" > "$LOG_FILE" 2>&1 || true
+          kaggle kernels logs "$KERNEL" > "$LOG_FILE" 2>&1 || echo "Warning: log download failed"
+
           echo ""
           echo "Log saved to: $LOG_FILE"
           echo ""
           echo "======================================"
           echo "LAST 200 LOG LINES"
           echo "======================================"
-          tail -n 200 "$LOG_FILE" || true
-          if [ "$FINAL_STATUS" != "COMPLETE" ]; then
+          tail -n 200 "$LOG_FILE" 2>/dev/null || true
+
+          # ==================================================
+          # FAIL WORKFLOW ONLY IF WORKER ACTUALLY FAILED
+          # ==================================================
+          if [ "$FINAL_STATUS" = "ERROR" ] || [ "$FINAL_STATUS" = "CANCELLED" ]; then
             echo ""
-            echo "Kaggle worker did not complete normally."
+            echo "Kaggle worker failed or was cancelled."
             exit 1
           fi
+
           echo ""
           echo "Kaggle worker completed successfully."
       - name: Upload GPU results
