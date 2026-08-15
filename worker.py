@@ -1,315 +1,498 @@
 import os
 import sys
-import time
-import shutil
-import subprocess
-from pathlib import Path
-
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME")
-KAGGLE_KERNEL = f"{KAGGLE_USERNAME}/notebookd9d7092a0a"
-
-KERNEL_DIR = Path("kaggle_kernel")
-OUTPUT_DIR = Path("kaggle_output")
-
-KERNEL_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-
-# =========================================================
-# HELPERS
-# =========================================================
-
-def run(command, check=True):
-
-    print()
-    print(">>>", " ".join(command))
-
-    result = subprocess.run(
-        command,
-        text=True
-    )
-
-    if check and result.returncode != 0:
-        print("Command failed.")
-        sys.exit(result.returncode)
-
-    return result.returncode
-
-
-def kaggle(*args, check=True):
-
-    return run(
-        ["python", "-m", "kaggle"] + list(args),
-        check=check
-    )
-
-
-# =========================================================
-# START
-# =========================================================
-
-print("======================================")
-print("      KAGGLE GPU WORKER")
-print("======================================")
-
-
-if not KAGGLE_USERNAME:
-    print("ERROR: KAGGLE_USERNAME missing")
-    sys.exit(1)
-
-
-# =========================================================
-# 1. CLEAN
-# =========================================================
-
-if KERNEL_DIR.exists():
-    shutil.rmtree(KERNEL_DIR)
-
-KERNEL_DIR.mkdir()
-
-print()
-print("[1] Downloading Kaggle notebook...")
-
-
-# =========================================================
-# 2. PULL NOTEBOOK
-# =========================================================
-
-kaggle(
-    "kernels",
-    "pull",
-    KAGGLE_KERNEL,
-    "-p",
-    str(KERNEL_DIR),
-    "-m"
-)
-
-
-# =========================================================
-# 3. CHECK METADATA
-# =========================================================
-
-metadata_file = (
-    KERNEL_DIR /
-    "kernel-metadata.json"
-)
-
-if not metadata_file.exists():
-
-    print("ERROR: kernel-metadata.json not found")
-    sys.exit(1)
-
-
-print()
-print("[2] Checking Kaggle metadata...")
-
-metadata = metadata_file.read_text(
-    encoding="utf-8"
-)
-
-print(metadata)
-
-
-# =========================================================
-# 4. FIND NOTEBOOK
-# =========================================================
-
-notebooks = list(
-    KERNEL_DIR.glob("*.ipynb")
-)
-
-if not notebooks:
-
-    print("ERROR: notebook not found")
-    sys.exit(1)
-
-notebook = notebooks[0]
-
-print()
-print("[3] Notebook:")
-print(notebook)
-
-
-# =========================================================
-# 5. INJECT JOB
-# =========================================================
-
-print()
-print("[4] Injecting dynamic GPU job...")
-
-
 import json
+import time
+import traceback
+import subprocess
 
-data = json.loads(
-    notebook.read_text(
-        encoding="utf-8"
-    )
-)
+try:
+    import requests
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "requests"])
+    import requests
 
+API_URL = os.environ.get("API_URL", "").rstrip("/")
+SESSION_ID = os.environ.get("SESSION_ID", "")
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 
-job_file = Path("job.py")
+print("DEBUG: API_URL =", repr(API_URL))
+print("DEBUG: SESSION_ID =", repr(SESSION_ID))
+print("DEBUG: WORKER_TOKEN length =", len(WORKER_TOKEN))
 
-if not job_file.exists():
+if not API_URL:
+    print("ERROR: API_URL is empty!")
+if not WORKER_TOKEN:
+    print("ERROR: WORKER_TOKEN is empty!")
+if not SESSION_ID:
+    print("ERROR: SESSION_ID is empty!")
 
-    print("ERROR: job.py not found")
-    sys.exit(1)
-
-
-job_code = job_file.read_text(
-    encoding="utf-8"
-)
-
-
-cell = {
-    "cell_type": "code",
-    "execution_count": None,
-    "metadata": {},
-    "outputs": [],
-    "source": job_code.splitlines(
-        keepends=True
-    )
+HEADERS = {
+    "Content-Type": "application/json",
+    "X-Worker-Token": WORKER_TOKEN
 }
 
+def api_call(method, path, payload=None):
+    if not API_URL:
+        print(f"DEBUG: API_URL is empty, cannot make {method} request")
+        return None
+    url = f"{API_URL}{path}"
+    print(f"DEBUG: {method} {url}")
+    try:
+        if method == "GET":
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+        else:
+            resp = requests.post(url, headers=HEADERS, json=payload or {}, timeout=30)
+        print(f"DEBUG: Response status: {resp.status_code}")
+        print(f"DEBUG: Response text: {resp.text[:500]}")
+        return resp
+    except Exception as e:
+        print(f"API {method} {path} failed: {e}")
+        return None
 
-data["cells"].append(cell)
+print("=" * 60)
+print("KAGGLE GPU WORKER")
+print("SESSION:", SESSION_ID)
+print("API:", API_URL)
+print("=" * 60)
 
+result = {
+    "session_id": SESSION_ID,
+    "status": "starting",
+    "gpu": None,
+    "compute_capability": None,
+    "cuda_available": False,
+    "test": None,
+    "error": None
+}
 
-notebook.write_text(
-    json.dumps(
-        data,
-        ensure_ascii=False,
-        indent=1
-    ),
-    encoding="utf-8"
-)
+def op_nvidia_smi(params):
+    smi = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30)
+    return {
+        "status": "ok",
+        "stdout": smi.stdout,
+        "stderr": smi.stderr,
+        "returncode": smi.returncode
+    }
 
+def op_shell(params):
+    shell_cmd = params.get("command", "")
+    timeout = params.get("timeout", 60)
+    sh = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return {
+        "status": "ok",
+        "stdout": sh.stdout,
+        "stderr": sh.stderr,
+        "returncode": sh.returncode
+    }
 
-print("Dynamic job injected.")
+def op_execute_python(params):
+    code = params.get("code", "")
+    exec_globals = {
+        "__builtins__": __builtins__,
+        "np": __import__("numpy"),
+        "cuda": __import__("numba.cuda", fromlist=["cuda"]),
+    }
+    try:
+        import torch
+        exec_globals["torch"] = torch
+    except ImportError:
+        pass
+    try:
+        import tensorflow as tf
+        exec_globals["tf"] = tf
+    except ImportError:
+        pass
+    exec_locals = {}
+    exec(code, exec_globals, exec_locals)
+    return {
+        "status": "ok",
+        "output": {k: str(v) for k, v in exec_locals.items() if not k.startswith("_")},
+    }
 
+def op_matrix(params):
+    size = params.get("size", 1024)
+    dtype_str = params.get("dtype", "float32")
+    try:
+        import torch
+        dtype_map = {
+            "float16": torch.float16,
+            "float32": torch.float32,
+            "float64": torch.float64,
+        }
+        dtype = dtype_map.get(dtype_str, torch.float32)
+        a = torch.rand(size, size, device="cuda", dtype=dtype)
+        b = torch.rand(size, size, device="cuda", dtype=dtype)
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        c = torch.matmul(a, b)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        return {
+            "status": "ok",
+            "size": size,
+            "dtype": dtype_str,
+            "time_seconds": elapsed,
+            "device": str(c.device),
+            "mean": float(c.mean()),
+            "std": float(c.std()),
+            "backend": "pytorch-cuda"
+        }
+    except ImportError:
+        import numpy as np
+        dtype_map = {
+            "float16": np.float16,
+            "float32": np.float32,
+            "float64": np.float64,
+        }
+        dtype = dtype_map.get(dtype_str, np.float32)
+        a = np.random.rand(size, size).astype(dtype)
+        b = np.random.rand(size, size).astype(dtype)
+        start = time.perf_counter()
+        c = np.matmul(a, b)
+        elapsed = time.perf_counter() - start
+        return {
+            "status": "ok",
+            "size": size,
+            "dtype": dtype_str,
+            "time_seconds": elapsed,
+            "backend": "numpy-cpu",
+            "mean": float(c.mean()),
+            "std": float(c.std())
+        }
 
-# =========================================================
-# 6. PUSH TO KAGGLE
-# =========================================================
+def op_benchmark(params):
+    bench_type = params.get("type", "matmul")
+    size = params.get("size", 4096)
+    try:
+        import torch
+        results = {}
 
-print()
-print("[5] Pushing notebook to Kaggle...")
+        if bench_type in ("matmul", "all"):
+            a = torch.rand(size, size, device="cuda")
+            b = torch.rand(size, size, device="cuda")
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            c = torch.matmul(a, b)
+            torch.cuda.synchronize()
+            results["matmul"] = {
+                "size": size,
+                "time_seconds": time.perf_counter() - start,
+                "device": "cuda",
+                "flops_estimated": 2 * (size ** 3)
+            }
 
+        if bench_type in ("bandwidth", "all"):
+            n = size * size * 4
+            x = torch.rand(n, device="cuda")
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            y = x * 2.0
+            torch.cuda.synchronize()
+            results["bandwidth"] = {
+                "elements": n,
+                "time_seconds": time.perf_counter() - start,
+                "device": "cuda"
+            }
 
-kaggle(
-    "kernels",
-    "push",
-    "-p",
-    str(KERNEL_DIR)
-)
+        if bench_type in ("conv2d", "all"):
+            import torch.nn.functional as F
+            batch = params.get("batch", 32)
+            channels = params.get("channels", 64)
+            kernel = params.get("kernel", 3)
+            x = torch.rand(batch, channels, size, size, device="cuda")
+            w = torch.rand(channels, channels, kernel, kernel, device="cuda")
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            out = F.conv2d(x, w, padding=kernel // 2)
+            torch.cuda.synchronize()
+            results["conv2d"] = {
+                "batch": batch,
+                "channels": channels,
+                "size": size,
+                "kernel": kernel,
+                "time_seconds": time.perf_counter() - start,
+                "device": "cuda"
+            }
 
+        return {"status": "ok", "benchmark": bench_type, "results": results}
+    except ImportError:
+        return {"status": "error", "error": "PyTorch not available for benchmark"}
 
-# =========================================================
-# 7. WAIT FOR GPU
-# =========================================================
-
-print()
-print("======================================")
-print("       WAITING FOR KAGGLE GPU")
-print("======================================")
-
-
-MAX_CHECKS = 120
-
-final_status = None
-
-
-for i in range(1, MAX_CHECKS + 1):
-
-    print()
-    print(
-        f"========== STATUS {i}/{MAX_CHECKS} =========="
+def op_info(params):
+    smi = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,memory.total,memory.free,memory.used,temperature.gpu,utilization.gpu,power.draw", "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=30
     )
+    try:
+        import torch
+        cuda_available = torch.cuda.is_available()
+        device_count = torch.cuda.device_count()
+        current_device = torch.cuda.current_device()
+        device_name = torch.cuda.get_device_name(current_device)
+        return {
+            "status": "ok",
+            "nvidia_smi": smi.stdout.strip(),
+            "torch_cuda_available": cuda_available,
+            "torch_device_count": device_count,
+            "torch_current_device": current_device,
+            "torch_device_name": device_name
+        }
+    except ImportError:
+        return {
+            "status": "ok",
+            "nvidia_smi": smi.stdout.strip(),
+            "torch_cuda_available": False,
+            "note": "PyTorch not installed"
+        }
 
-    result = subprocess.run(
-        [
-            "python",
-            "-m",
-            "kaggle",
-            "kernels",
-            "status",
-            KAGGLE_KERNEL
-        ],
-        text=True,
-        capture_output=True
+def op_install(params):
+    packages = params.get("packages", [])
+    if isinstance(packages, str):
+        packages = [packages]
+    results = []
+    for pkg in packages:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pkg])
+            results.append({"package": pkg, "status": "installed"})
+        except Exception as e:
+            results.append({"package": pkg, "status": "failed", "error": str(e)})
+    return {"status": "ok", "installations": results}
+
+def op_file(params):
+    action = params.get("action", "read")
+    filepath = params.get("path", "")
+    content = params.get("content", "")
+    if action == "read":
+        try:
+            with open(filepath, "r") as f:
+                data = f.read()
+            return {"status": "ok", "path": filepath, "content": data}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+    elif action == "write":
+        try:
+            with open(filepath, "w") as f:
+                f.write(content)
+            return {"status": "ok", "path": filepath, "action": "write"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+    elif action == "list":
+        try:
+            files = os.listdir(filepath or ".")
+            return {"status": "ok", "path": filepath or ".", "files": files}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+    else:
+        return {"status": "error", "error": f"Unknown file action: {action}"}
+
+BUILTIN_OPS = {
+    "nvidia_smi": op_nvidia_smi,
+    "shell": op_shell,
+    "execute_python": op_execute_python,
+    "matrix": op_matrix,
+    "benchmark": op_benchmark,
+    "info": op_info,
+    "install": op_install,
+    "file": op_file,
+}
+
+try:
+    print("\n" + "=" * 60)
+    print("NVIDIA-SMI")
+    print("=" * 60)
+    smi = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30)
+    print(smi.stdout)
+    if smi.returncode != 0:
+        print(smi.stderr)
+        raise RuntimeError("nvidia-smi failed")
+
+    gpu_info = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=30
     )
+    print("\nGPU INFO:")
+    print(gpu_info.stdout)
+    gpu_line = gpu_info.stdout.strip().splitlines()
+    if gpu_line:
+        result["gpu"] = gpu_line[0]
 
-    output = (
-        result.stdout +
-        result.stderr
-    )
+    print("\n" + "=" * 60)
+    print("NUMBA CUDA TEST")
+    print("=" * 60)
 
-    print(output.strip())
+    try:
+        import numpy as np
+        from numba import cuda
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "numba", "numpy"])
+        import numpy as np
+        from numba import cuda
 
-    if "COMPLETE" in output:
+    cuda_available = cuda.is_available()
+    print("CUDA available:", cuda_available)
+    result["cuda_available"] = bool(cuda_available)
+    if not cuda_available:
+        raise RuntimeError("CUDA is not available")
 
-        final_status = "COMPLETE"
-        break
+    device = cuda.get_current_device()
+    capability = device.compute_capability
+    print("Compute capability:", capability)
+    result["compute_capability"] = [int(capability[0]), int(capability[1])]
 
-    if "ERROR" in output:
+    N = 1024 * 1024
 
-        final_status = "ERROR"
-        break
+    from numba import cuda
 
-    if "CANCEL" in output:
+    @cuda.jit
+    def add_kernel(a, b, c):
+        i = cuda.grid(1)
+        if i < a.size:
+            c[i] = a[i] + b[i]
 
-        final_status = "CANCELLED"
-        break
+    print("\nCreating arrays...")
+    a = np.ones(N, dtype=np.float32)
+    b = np.ones(N, dtype=np.float32)
+    c = np.zeros(N, dtype=np.float32)
 
-    time.sleep(5)
+    print("Copying data to GPU...")
+    d_a = cuda.to_device(a)
+    d_b = cuda.to_device(b)
+    d_c = cuda.to_device(c)
 
+    threads = 256
+    blocks = (N + threads - 1) // threads
 
-# =========================================================
-# 8. DOWNLOAD OUTPUT
-# =========================================================
+    print("Launching GPU kernel...")
+    start = time.perf_counter()
+    add_kernel[blocks, threads](d_a, d_b, d_c)
+    cuda.synchronize()
+    elapsed = time.perf_counter() - start
 
-print()
-print("======================================")
-print("       DOWNLOADING KAGGLE OUTPUT")
-print("======================================")
+    output = d_c.copy_to_host()
+    checksum = float(np.sum(output))
+    expected = float(N * 2)
 
+    print("\nGPU computation successful")
+    print("Elements:", N)
+    print("Kernel time:", elapsed)
+    print("Checksum:", checksum)
 
-kaggle(
-    "kernels",
-    "output",
-    KAGGLE_KERNEL,
-    "-p",
-    str(OUTPUT_DIR),
-    check=False
-)
+    if abs(checksum - expected) > 0.01:
+        raise RuntimeError("GPU result verification failed")
 
+    result["status"] = "READY"
+    result["test"] = {
+        "elements": N,
+        "time_seconds": elapsed,
+        "checksum": checksum,
+        "expected": expected
+    }
 
-# =========================================================
-# 9. FINAL
-# =========================================================
+    print("\n" + "=" * 60)
+    print("GPU WORKER READY")
+    print("=" * 60)
+    print(json.dumps(result, indent=2))
 
-print()
-print("======================================")
-print("           FINAL STATUS")
-print("======================================")
+    with open("/kaggle/working/session_result.json", "w") as f:
+        json.dump(result, f, indent=2)
 
-print(
-    "Kaggle status:",
-    final_status
-)
+    print("\nNotifying API that worker is ready...")
+    ready_payload = {
+        "gpu": result["gpu"],
+        "compute_capability": result["compute_capability"],
+        "cuda_available": result["cuda_available"]
+    }
+    print("DEBUG: Payload:", json.dumps(ready_payload))
+    print("DEBUG: Headers:", {k: v[:10] + "..." if k == "X-Worker-Token" and len(v) > 10 else v for k, v in HEADERS.items()})
 
+    resp = api_call("POST", f"/gpu/session/{SESSION_ID}/worker-ready", ready_payload)
 
-if final_status != "COMPLETE":
+    if resp is None:
+        print("DEBUG: api_call returned None - connection failed or API_URL empty")
+    else:
+        print("DEBUG: Status code:", resp.status_code)
+        print("DEBUG: Response headers:", dict(resp.headers))
+        try:
+            print("DEBUG: Response JSON:", resp.json())
+        except Exception:
+            print("DEBUG: Response text:", resp.text[:1000])
 
-    print()
-    print("GPU Worker failed.")
+    if resp and resp.status_code in (200, 202):
+        print("API acknowledged worker-ready.")
+    else:
+        print("WARNING: API did not acknowledge worker-ready.")
 
-    sys.exit(1)
+    print("\nKeeping GPU worker alive and polling for commands...")
+    for i in range(600):
+        time.sleep(1)
 
+        if i % 30 == 0 and i > 0:
+            hb = api_call("POST", f"/gpu/session/{SESSION_ID}/heartbeat")
+            if hb and hb.status_code == 410:
+                print("Session expired according to API. Exiting.")
+                break
 
-print()
-print("GPU Worker completed successfully.")
+        if i % 5 == 0:
+            try:
+                cmd_resp = api_call("GET", f"/internal/session/{SESSION_ID}/command")
+                if cmd_resp and cmd_resp.status_code == 200:
+                    data = cmd_resp.json()
+                    cmd = data.get("command")
+                    if cmd:
+                        print(f"\n>>> Received command: {cmd['command_id']} | op: {cmd.get('operation')}")
+                        op = cmd.get("operation", "")
+                        params = cmd.get("parameters", {})
+                        cmd_start = time.time()
+
+                        try:
+                            if op in BUILTIN_OPS:
+                                cmd_result = BUILTIN_OPS[op](params)
+                            elif op.endswith(".py") or op == "python":
+                                code = params.get("code", params.get("script", ""))
+                                cmd_result = op_execute_python({"code": code})
+                            elif op == "exec":
+                                shell_cmd = params.get("command", params.get("cmd", ""))
+                                cmd_result = op_shell({"command": shell_cmd})
+                            else:
+                                code = params.get("code", "")
+                                if code:
+                                    cmd_result = op_execute_python({"code": code})
+                                else:
+                                    cmd_result = {
+                                        "status": "error",
+                                        "error": f"Unknown operation: {op}",
+                                        "available_operations": list(BUILTIN_OPS.keys())
+                                    }
+
+                        except Exception as exec_err:
+                            cmd_result = {
+                                "status": "error",
+                                "error": str(exec_err),
+                                "traceback": traceback.format_exc()
+                            }
+
+                        api_call("POST", f"/internal/session/{SESSION_ID}/result", {
+                            "command_id": cmd["command_id"],
+                            **cmd_result
+                        })
+                        print(f"<<< Command {cmd['command_id']} result sent.")
+            except Exception as poll_err:
+                print(f"Command polling error: {poll_err}")
+
+    print("\nWorker keep-alive loop finished.")
+
+except Exception as e:
+    result["status"] = "ERROR"
+    result["error"] = str(e)
+    result["exception"] = type(e).__name__
+    result["traceback"] = traceback.format_exc()
+    print("\n" + "=" * 60)
+    print("GPU WORKER ERROR")
+    print("=" * 60)
+    traceback.print_exc()
+    try:
+        with open("/kaggle/working/session_result.json", "w") as f:
+            json.dump(result, f, indent=2)
+    except Exception:
+        pass
+    raise
