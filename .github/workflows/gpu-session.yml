@@ -140,6 +140,246 @@ jobs:
               "error": None
           }
 
+          # ============================================================
+          # BUILT-IN OPERATION HANDLERS
+          # ============================================================
+
+          def op_nvidia_smi(params):
+              smi = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30)
+              return {
+                  "status": "ok",
+                  "stdout": smi.stdout,
+                  "stderr": smi.stderr,
+                  "returncode": smi.returncode
+              }
+
+          def op_shell(params):
+              shell_cmd = params.get("command", "")
+              timeout = params.get("timeout", 60)
+              sh = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+              return {
+                  "status": "ok",
+                  "stdout": sh.stdout,
+                  "stderr": sh.stderr,
+                  "returncode": sh.returncode
+              }
+
+          def op_execute_python(params):
+              code = params.get("code", "")
+              exec_globals = {
+                  "__builtins__": __builtins__,
+                  "np": __import__("numpy"),
+                  "cuda": __import__("numba.cuda", fromlist=["cuda"]),
+              }
+              try:
+                  import torch
+                  exec_globals["torch"] = torch
+              except ImportError:
+                  pass
+              try:
+                  import tensorflow as tf
+                  exec_globals["tf"] = tf
+              except ImportError:
+                  pass
+              exec_locals = {}
+              exec(code, exec_globals, exec_locals)
+              return {
+                  "status": "ok",
+                  "output": {k: str(v) for k, v in exec_locals.items() if not k.startswith("_")},
+              }
+
+          def op_matrix(params):
+              size = params.get("size", 1024)
+              dtype_str = params.get("dtype", "float32")
+              try:
+                  import torch
+                  dtype_map = {
+                      "float16": torch.float16,
+                      "float32": torch.float32,
+                      "float64": torch.float64,
+                  }
+                  dtype = dtype_map.get(dtype_str, torch.float32)
+                  a = torch.rand(size, size, device='cuda', dtype=dtype)
+                  b = torch.rand(size, size, device='cuda', dtype=dtype)
+                  torch.cuda.synchronize()
+                  start = time.perf_counter()
+                  c = torch.matmul(a, b)
+                  torch.cuda.synchronize()
+                  elapsed = time.perf_counter() - start
+                  return {
+                      "status": "ok",
+                      "size": size,
+                      "dtype": dtype_str,
+                      "time_seconds": elapsed,
+                      "device": str(c.device),
+                      "mean": float(c.mean()),
+                      "std": float(c.std()),
+                      "backend": "pytorch-cuda"
+                  }
+              except ImportError:
+                  import numpy as np
+                  dtype_map = {
+                      "float16": np.float16,
+                      "float32": np.float32,
+                      "float64": np.float64,
+                  }
+                  dtype = dtype_map.get(dtype_str, np.float32)
+                  a = np.random.rand(size, size).astype(dtype)
+                  b = np.random.rand(size, size).astype(dtype)
+                  start = time.perf_counter()
+                  c = np.matmul(a, b)
+                  elapsed = time.perf_counter() - start
+                  return {
+                      "status": "ok",
+                      "size": size,
+                      "dtype": dtype_str,
+                      "time_seconds": elapsed,
+                      "backend": "numpy-cpu",
+                      "mean": float(c.mean()),
+                      "std": float(c.std())
+                  }
+
+          def op_benchmark(params):
+              bench_type = params.get("type", "matmul")
+              size = params.get("size", 4096)
+              try:
+                  import torch
+                  results = {}
+
+                  if bench_type in ("matmul", "all"):
+                      a = torch.rand(size, size, device='cuda')
+                      b = torch.rand(size, size, device='cuda')
+                      torch.cuda.synchronize()
+                      start = time.perf_counter()
+                      c = torch.matmul(a, b)
+                      torch.cuda.synchronize()
+                      results["matmul"] = {
+                          "size": size,
+                          "time_seconds": time.perf_counter() - start,
+                          "device": "cuda",
+                          "flops_estimated": 2 * (size ** 3)
+                      }
+
+                  if bench_type in ("bandwidth", "all"):
+                      n = size * size * 4
+                      x = torch.rand(n, device='cuda')
+                      torch.cuda.synchronize()
+                      start = time.perf_counter()
+                      y = x * 2.0
+                      torch.cuda.synchronize()
+                      results["bandwidth"] = {
+                          "elements": n,
+                          "time_seconds": time.perf_counter() - start,
+                          "device": "cuda"
+                      }
+
+                  if bench_type in ("conv2d", "all"):
+                      import torch.nn.functional as F
+                      batch = params.get("batch", 32)
+                      channels = params.get("channels", 64)
+                      kernel = params.get("kernel", 3)
+                      x = torch.rand(batch, channels, size, size, device='cuda')
+                      w = torch.rand(channels, channels, kernel, kernel, device='cuda')
+                      torch.cuda.synchronize()
+                      start = time.perf_counter()
+                      out = F.conv2d(x, w, padding=kernel//2)
+                      torch.cuda.synchronize()
+                      results["conv2d"] = {
+                          "batch": batch,
+                          "channels": channels,
+                          "size": size,
+                          "kernel": kernel,
+                          "time_seconds": time.perf_counter() - start,
+                          "device": "cuda"
+                      }
+
+                  return {"status": "ok", "benchmark": bench_type, "results": results}
+              except ImportError:
+                  return {"status": "error", "error": "PyTorch not available for benchmark"}
+
+          def op_info(params):
+              smi = subprocess.run(
+                  ["nvidia-smi", "--query-gpu=name,memory.total,memory.free,memory.used,temperature.gpu,utilization.gpu,power.draw", "--format=csv,noheader"],
+                  capture_output=True, text=True, timeout=30
+              )
+              try:
+                  import torch
+                  cuda_available = torch.cuda.is_available()
+                  device_count = torch.cuda.device_count()
+                  current_device = torch.cuda.current_device()
+                  device_name = torch.cuda.get_device_name(current_device)
+                  return {
+                      "status": "ok",
+                      "nvidia_smi": smi.stdout.strip(),
+                      "torch_cuda_available": cuda_available,
+                      "torch_device_count": device_count,
+                      "torch_current_device": current_device,
+                      "torch_device_name": device_name
+                  }
+              except ImportError:
+                  return {
+                      "status": "ok",
+                      "nvidia_smi": smi.stdout.strip(),
+                      "torch_cuda_available": False,
+                      "note": "PyTorch not installed"
+                  }
+
+          def op_install(params):
+              packages = params.get("packages", [])
+              if isinstance(packages, str):
+                  packages = [packages]
+              results = []
+              for pkg in packages:
+                  try:
+                      subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pkg])
+                      results.append({"package": pkg, "status": "installed"})
+                  except Exception as e:
+                      results.append({"package": pkg, "status": "failed", "error": str(e)})
+              return {"status": "ok", "installations": results}
+
+          def op_file(params):
+              action = params.get("action", "read")
+              filepath = params.get("path", "")
+              content = params.get("content", "")
+              if action == "read":
+                  try:
+                      with open(filepath, "r") as f:
+                          data = f.read()
+                      return {"status": "ok", "path": filepath, "content": data}
+                  except Exception as e:
+                      return {"status": "error", "error": str(e)}
+              elif action == "write":
+                  try:
+                      with open(filepath, "w") as f:
+                          f.write(content)
+                      return {"status": "ok", "path": filepath, "action": "write"}
+                  except Exception as e:
+                      return {"status": "error", "error": str(e)}
+              elif action == "list":
+                  try:
+                      files = os.listdir(filepath or ".")
+                      return {"status": "ok", "path": filepath or ".", "files": files}
+                  except Exception as e:
+                      return {"status": "error", "error": str(e)}
+              else:
+                  return {"status": "error", "error": f"Unknown file action: {action}"}
+
+          # Registry of built-in operations
+          BUILTIN_OPS = {
+              "nvidia_smi": op_nvidia_smi,
+              "shell": op_shell,
+              "execute_python": op_execute_python,
+              "matrix": op_matrix,
+              "benchmark": op_benchmark,
+              "info": op_info,
+              "install": op_install,
+              "file": op_file,
+          }
+
+          # ============================================================
+          # MAIN WORKER LOGIC
+          # ============================================================
+
           try:
               print("\n" + "=" * 60)
               print("NVIDIA-SMI")
@@ -185,7 +425,7 @@ jobs:
 
               N = 1024 * 1024
 
-              @cuda.jit
+@cuda.jit
               def add_kernel(a, b, c):
                   i = cuda.grid(1)
                   if i < a.size:
@@ -287,50 +527,31 @@ jobs:
                                   cmd_start = time.time()
 
                                   try:
-                                      if op == "execute_python":
-                                          code = params.get("code", "")
-                                          exec_globals = {
-                                              "__builtins__": __builtins__,
-                                              "np": __import__("numpy"),
-                                              "cuda": __import__("numba.cuda", fromlist=["cuda"]),
-                                          }
-                                          try:
-                                              import torch
-                                              exec_globals["torch"] = torch
-                                          except ImportError:
-                                              pass
-                                          exec_locals = {}
-                                          exec(code, exec_globals, exec_locals)
-                                          cmd_result = {
-                                              "status": "ok",
-                                              "output": {k: str(v) for k, v in exec_locals.items() if not k.startswith("_")},
-                                              "execution_time": time.time() - cmd_start
-                                          }
+                                      # Check built-in operations first
+                                      if op in BUILTIN_OPS:
+                                          cmd_result = BUILTIN_OPS[op](params)
 
-                                      elif op == "nvidia_smi":
-                                          smi2 = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30)
-                                          cmd_result = {
-                                              "status": "ok",
-                                              "stdout": smi2.stdout,
-                                              "stderr": smi2.stderr,
-                                              "returncode": smi2.returncode
-                                          }
+                                      # Fallback: try to execute as Python code directly
+                                      elif op.endswith(".py") or op == "python":
+                                          code = params.get("code", params.get("script", ""))
+                                          cmd_result = op_execute_python({"code": code})
 
-                                      elif op == "shell":
-                                          shell_cmd = params.get("command", "")
-                                          sh = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, timeout=60)
-                                          cmd_result = {
-                                              "status": "ok",
-                                              "stdout": sh.stdout,
-                                              "stderr": sh.stderr,
-                                              "returncode": sh.returncode
-                                          }
+                                      # Fallback: try as shell command
+                                      elif op == "exec":
+                                          shell_cmd = params.get("command", params.get("cmd", ""))
+                                          cmd_result = op_shell({"command": shell_cmd})
 
+                                      # Unknown operation - try to interpret parameters
                                       else:
-                                          cmd_result = {
-                                              "status": "error",
-                                              "error": f"Unknown operation: {op}"
-                                          }
+                                          code = params.get("code", "")
+                                          if code:
+                                              cmd_result = op_execute_python({"code": code})
+                                          else:
+                                              cmd_result = {
+                                                  "status": "error",
+                                                  "error": f"Unknown operation: {op}",
+                                                  "available_operations": list(BUILTIN_OPS.keys())
+                                              }
 
                                   except Exception as exec_err:
                                       cmd_result = {
