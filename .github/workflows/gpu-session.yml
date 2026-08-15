@@ -69,7 +69,7 @@ jobs:
           rm -rf kaggle_session
           mkdir -p kaggle_session
 
-          cat > kaggle_session/script.py <<'PYEOF'
+          cat > kaggle_session/script.py <<\PYEOF
 import os
 import sys
 import json
@@ -412,6 +412,8 @@ try:
     result["compute_capability"] = [int(capability[0]), int(capability[1])]
 
     N = 1024 * 1024
+
+    from numba import cuda
 
     @cuda.jit
     def add_kernel(a, b, c):
