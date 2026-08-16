@@ -6,7 +6,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "requests"])
     import requests
 
-# ── injected by CI (sed) ─────────────────────────────────
+# ── injected by CI (sed replaces placeholders) ──────────
 API_URL      = "%%API_URL%%".rstrip("/")
 SESSION_ID   = "%%SESSION_ID%%"
 WORKER_TOKEN = "%%WORKER_TOKEN%%"
@@ -22,22 +22,23 @@ print("TOKEN len:", len(WORKER_TOKEN))
 print("=" * 60)
 
 
-# ── API helper ────────────────────────────────────────────
-def api(method, path, body=None, timeout=30):
+def api(method, path, body=None, timeout=30, retries=3):
     url = f"{API_URL}{path}"
-    try:
-        if method == "GET":
-            r = requests.get(url, headers=HEADERS, timeout=timeout)
-        else:
-            r = requests.post(url, headers=HEADERS, json=body or {}, timeout=timeout)
-        print(f"[API] {method} {path} → {r.status_code}")
-        return r
-    except Exception as e:
-        print(f"[API] {method} {path} error: {e}")
-        return None
+    for attempt in range(retries):
+        try:
+            if method == "GET":
+                r = requests.get(url, headers=HEADERS, timeout=timeout)
+            else:
+                r = requests.post(url, headers=HEADERS, json=body or {}, timeout=timeout)
+            print(f"[API] {method} {path} → {r.status_code}")
+            return r
+        except Exception as e:
+            print(f"[API] {method} {path} attempt {attempt+1} error: {e}")
+            if attempt < retries - 1:
+                time.sleep(3)
+    return None
 
 
-# ── result skeleton ───────────────────────────────────────
 result = {
     "session_id":         SESSION_ID,
     "status":             "starting",
@@ -49,7 +50,8 @@ result = {
 }
 
 try:
-    # ── nvidia-smi ───────────────────────────────────────────
+    # ── nvidia-smi ──────────────────────────────────────────
+    print("\n=== nvidia-smi ===")
     smi = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30)
     print(smi.stdout)
     if smi.returncode != 0:
@@ -66,7 +68,8 @@ try:
         result["gpu"] = lines[0]
     print("GPU:", result["gpu"])
 
-    # ── numba / CUDA ──────────────────────────────────────────
+    # ── install / import numba ───────────────────────────────
+    print("\n=== CUDA via numba ===")
     try:
         import numpy as np
         from numba import cuda
@@ -82,9 +85,9 @@ try:
 
     cap = cuda.get_current_device().compute_capability
     result["compute_capability"] = [int(cap[0]), int(cap[1])]
-    print("Compute:", cap)
+    print("Compute capability:", cap)
 
-    # ── kernel smoke-test ─────────────────────────────────────
+    # ── kernel smoke-test ────────────────────────────────────
     N = 1024 * 1024
 
     @cuda.jit
@@ -111,40 +114,53 @@ try:
     result["status"] = "READY"
     print(f"Kernel OK — {N} elems in {elapsed:.4f}s")
 
-    # ── notify API: worker ready ──────────────────────────────
-    r = api("POST", f"/gpu/session/{SESSION_ID}/worker-ready", {
+    # ── notify API: worker-ready (with retry) ────────────────
+    print("\n=== Notifying API: worker-ready ===")
+    ready_payload = {
         "gpu":                result["gpu"],
         "compute_capability": result["compute_capability"],
         "cuda_available":     result["cuda_available"],
-    })
-    if r and r.status_code in (200, 202):
-        print("API acknowledged worker-ready.")
-    else:
-        print("WARNING: API did not acknowledge worker-ready.")
+    }
 
+    notified = False
+    for attempt in range(5):
+        r = api("POST", f"/gpu/session/{SESSION_ID}/worker-ready",
+                ready_payload, retries=1)
+        if r and r.status_code in (200, 202):
+            print("API acknowledged worker-ready.")
+            notified = True
+            break
+        print(f"Retry worker-ready {attempt+1}/5 ...")
+        time.sleep(5)
+
+    if not notified:
+        print("WARNING: API never acknowledged worker-ready. Continuing anyway.")
+
+    # ── save result ──────────────────────────────────────────
     with open("/kaggle/working/session_result.json", "w") as f:
         json.dump(result, f, indent=2)
 
-    # ── command poll loop ─────────────────────────────────────
+    # ── command poll loop ────────────────────────────────────
     print("\n=== COMMAND LOOP (max 10 min) ===")
     for tick in range(600):
         time.sleep(1)
 
-        # heartbeat every 30 s
+        # heartbeat every 30s
         if tick > 0 and tick % 30 == 0:
             hb = api("POST", f"/gpu/session/{SESSION_ID}/heartbeat")
             if hb and hb.status_code == 410:
                 print("Session expired. Exiting.")
                 break
 
-        # poll for command every 5 s
+        # poll for command every 5s
         if tick % 5 != 0:
             continue
 
         try:
-            cr = api("GET", f"/internal/session/{SESSION_ID}/command")
+            cr = api("GET", f"/internal/session/{SESSION_ID}/command", retries=1)
             if not (cr and cr.status_code == 200):
                 continue
+
             data = cr.json()
             if data.get("expired"):
                 print("Session expired. Exiting.")
@@ -153,14 +169,11 @@ try:
             if not cmd:
                 continue
 
-            op     = cmd.get("operation", "")
-            params = cmd.get("parameters", {})
-            cid    = cmd["command_id"]
+            op, params, cid = cmd.get("operation",""), cmd.get("parameters",{}), cmd["command_id"]
             print(f"\n>>> {cid}  op={op}")
             t_start = time.time()
 
             try:
-                # ── execute_python ────────────────────────────
                 if op == "execute_python":
                     g = {"__builtins__": __builtins__, "np": np, "cuda": cuda}
                     try:
@@ -168,34 +181,27 @@ try:
                     except ImportError:
                         pass
                     loc = {}
-                    exec(params.get("code", ""), g, loc)
+                    exec(params.get("code",""), g, loc)
                     cmd_out = {
-                        "status": "ok",
-                        "output": {k: str(v) for k, v in loc.items()
-                                   if not k.startswith("_")},
+                        "status":         "ok",
+                        "output":         {k: str(v) for k, v in loc.items()
+                                           if not k.startswith("_")},
                         "execution_time": time.time() - t_start,
                     }
 
-                # ── nvidia_smi ────────────────────────────────
                 elif op == "nvidia_smi":
                     s2 = subprocess.run(
                         ["nvidia-smi"], capture_output=True, text=True, timeout=30)
-                    cmd_out = {
-                        "status": "ok", "stdout": s2.stdout,
-                        "stderr": s2.stderr, "returncode": s2.returncode,
-                    }
+                    cmd_out = {"status":"ok","stdout":s2.stdout,
+                               "stderr":s2.stderr,"returncode":s2.returncode}
 
-                # ── shell ─────────────────────────────────────
                 elif op == "shell":
                     sh = subprocess.run(
-                        params.get("command", ""), shell=True,
+                        params.get("command",""), shell=True,
                         capture_output=True, text=True, timeout=60)
-                    cmd_out = {
-                        "status": "ok", "stdout": sh.stdout,
-                        "stderr": sh.stderr, "returncode": sh.returncode,
-                    }
+                    cmd_out = {"status":"ok","stdout":sh.stdout,
+                               "stderr":sh.stderr,"returncode":sh.returncode}
 
-                # ── info ──────────────────────────────────────
                 elif op == "info":
                     mem = subprocess.run(
                         ["nvidia-smi",
@@ -214,14 +220,12 @@ try:
                         "platform":           platform.platform(),
                     }
 
-                # ── unknown ───────────────────────────────────
                 else:
-                    cmd_out = {"status": "error",
-                               "error": f"Unknown operation: {op}"}
+                    cmd_out = {"status":"error","error":f"Unknown operation: {op}"}
 
             except Exception as ex:
-                cmd_out = {"status": "error", "error": str(ex),
-                           "traceback": traceback.format_exc()}
+                cmd_out = {"status":"error","error":str(ex),
+                           "traceback":traceback.format_exc()}
 
             api("POST", f"/internal/session/{SESSION_ID}/result",
                 {"command_id": cid, **cmd_out})
@@ -232,7 +236,6 @@ try:
 
     print("Worker loop finished.")
 
-# ── fatal error ───────────────────────────────────────────
 except Exception as e:
     result.update({
         "status":    "ERROR",
