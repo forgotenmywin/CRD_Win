@@ -68,7 +68,19 @@ jobs:
           set -e
           rm -rf kaggle_session
           mkdir -p kaggle_session
-          cp worker.py kaggle_session/script.py
+
+          # Embed API_URL, SESSION_ID, WORKER_TOKEN into worker.py
+          sed -e 's|os.environ.get("API_URL", "").rstrip("/")|"'"${API_URL}"'".rstrip("/")|g' \
+              -e 's|os.environ.get("SESSION_ID", "")|"'"${SESSION_ID}"'"|g' \
+              -e 's|os.environ.get("WORKER_TOKEN", "")|"'"${WORKER_TOKEN}"'"|g' \
+              worker.py > kaggle_session/script.py
+
+          echo ""
+          echo "======================================"
+          echo "GENERATED SCRIPT (first 30 lines)"
+          echo "======================================"
+          head -30 kaggle_session/script.py
+
           cat > kaggle_session/kernel-metadata.json <<EOF
           {
             "id": "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}",
@@ -82,6 +94,7 @@ jobs:
             "enable_internet": true
           }
           EOF
+
           echo ""
           echo "======================================"
           echo "KAGGLE WORKER CREATED"
@@ -103,56 +116,68 @@ jobs:
         run: |
           set +e
           KERNEL="${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
+
           echo ""
           echo "======================================"
           echo "WAITING FOR KAGGLE"
           echo "======================================"
           echo "Kernel: $KERNEL"
+
           FINAL_STATUS="UNKNOWN"
           for i in $(seq 1 240); do
             echo ""
             echo "======================================"
             echo "CHECK $i/240"
             echo "======================================"
+
             STATUS="$(kaggle kernels status "$KERNEL" 2>&1)"
             echo "$STATUS"
+
             if echo "$STATUS" | grep -qi "complete"; then
               FINAL_STATUS="COMPLETE"
               echo ""
               echo "KAGGLE WORKER COMPLETE"
               break
             fi
+
             if echo "$STATUS" | grep -qi "error"; then
               FINAL_STATUS="ERROR"
               echo ""
               echo "KAGGLE WORKER ERROR"
               break
             fi
+
             if echo "$STATUS" | grep -qi "cancel"; then
               FINAL_STATUS="CANCELLED"
               echo ""
               echo "KAGGLE WORKER CANCELLED"
               break
             fi
+
             sleep 5
           done
+
           echo ""
           echo "======================================"
           echo "FINAL STATUS"
           echo "======================================"
           echo "$FINAL_STATUS"
+
           rm -rf final_output
           mkdir -p final_output
+
           echo ""
           echo "======================================"
           echo "DOWNLOADING KAGGLE OUTPUT"
           echo "======================================"
           kaggle kernels output "$KERNEL" -p final_output -o || echo "Warning: output download failed"
+
           echo ""
           echo "======================================"
           echo "FILES"
           echo "======================================"
           find final_output -type f -print 2>/dev/null || echo "No files found"
+
           echo ""
           echo "======================================"
           echo "SESSION RESULT"
@@ -162,12 +187,14 @@ jobs:
           else
             echo "session_result.json not found"
           fi
+
           echo ""
           echo "======================================"
           echo "KAGGLE LOG"
           echo "======================================"
           LOG_FILE="final_output/gpu-session-${SESSION_ID}.log"
           kaggle kernels logs "$KERNEL" > "$LOG_FILE" 2>&1 || echo "Warning: log download failed"
+
           echo ""
           echo "Log saved to: $LOG_FILE"
           echo ""
@@ -175,6 +202,7 @@ jobs:
           echo "LAST 200 LOG LINES"
           echo "======================================"
           tail -n 200 "$LOG_FILE" 2>/dev/null || true
+
           echo ""
           echo "Kaggle worker finished."
       - name: Upload GPU results
