@@ -1,331 +1,485 @@
-name: Kaggle GPU Session
-
-on:
-  workflow_dispatch:
-    inputs:
-      session_id:
-        description: "GPU session ID"
-        required: true
-        type: string
+import os
+import sys
+import time
+import json
+import subprocess
+import traceback
 
-      api_url:
-        description: "Railway API URL"
-        required: true
-        type: string
+import requests
 
-      worker_token:
-        description: "Worker token"
-        required: true
-        type: string
 
-jobs:
-  gpu-session:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+SESSION_ID = "%%SESSION_ID%%"
+API_URL = "%%API_URL%%".rstrip("/")
+WORKER_TOKEN = "%%WORKER_TOKEN%%"
 
-    env:
-      SESSION_ID: ${{ inputs.session_id }}
-      API_URL: ${{ inputs.api_url }}
-      WORKER_TOKEN: ${{ inputs.worker_token }}
+HEARTBEAT_INTERVAL = 15
+COMMAND_INTERVAL = 3
 
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
 
-    steps:
+def get_headers():
+    return {
+        "Authorization": f"Bearer {WORKER_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
-      # ------------------------------------------------
-      # CHECKOUT
-      # ------------------------------------------------
 
-      - name: Checkout
-        uses: actions/checkout@v4
+def post_api(path, data=None):
+    url = f"{API_URL}{path}"
 
-      # ------------------------------------------------
-      # PYTHON
-      # ------------------------------------------------
+    try:
+        r = requests.post(
+            url,
+            json=data or {},
+            headers=get_headers(),
+            timeout=20,
+        )
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+        print(
+            f"[API] POST {path} → {r.status_code}",
+            flush=True,
+        )
 
-      # ------------------------------------------------
-      # INSTALL
-      # ------------------------------------------------
+        if r.text:
+            print(r.text[:2000], flush=True)
 
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -e
+        return r
 
-          python -m pip install --upgrade pip
+    except Exception as e:
+        print(
+            f"[API] POST {path} ERROR: {e}",
+            flush=True,
+        )
+        return None
 
-          python -m pip install \
-            kaggle \
-            requests
 
-          kaggle --version
+def get_api(path):
+    url = f"{API_URL}{path}"
 
-      # ------------------------------------------------
-      # VALIDATION
-      # ------------------------------------------------
+    try:
+        r = requests.get(
+            url,
+            headers=get_headers(),
+            timeout=20,
+        )
 
-      - name: Validate configuration
-        shell: bash
-        run: |
-          set -e
+        print(
+            f"[API] GET {path} → {r.status_code}",
+            flush=True,
+        )
 
-          echo "========================================"
-          echo "VALIDATION"
-          echo "========================================"
+        return r
 
-          echo "Session: ${SESSION_ID}"
-          echo "API: ${API_URL}"
-          echo "Token length: ${#WORKER_TOKEN}"
+    except Exception as e:
+        print(
+            f"[API] GET {path} ERROR: {e}",
+            flush=True,
+        )
+        return None
 
-          test -n "${SESSION_ID}"
-          test -n "${API_URL}"
-          test -n "${WORKER_TOKEN}"
 
-          test -n "${KAGGLE_USERNAME}"
-          test -n "${KAGGLE_API_TOKEN}"
+def gpu_test():
 
-          echo "Validation OK."
+    print("=" * 60, flush=True)
+    print("CUDA TEST", flush=True)
+    print("=" * 60, flush=True)
 
-      # ------------------------------------------------
-      # PREPARE KAGGLE SCRIPT
-      # ------------------------------------------------
+    import torch
 
-      - name: Prepare Kaggle worker
-        shell: bash
-        run: |
-          set -e
+    print(
+        f"PyTorch: {torch.__version__}",
+        flush=True,
+    )
 
-          echo "========================================"
-          echo "PREPARING KAGGLE WORKER"
-          echo "========================================"
+    cuda = torch.cuda.is_available()
 
-          mkdir -p kaggle_upload
+    print(
+        f"CUDA available: {cuda}",
+        flush=True,
+    )
 
-          cp kaggle_worker/script.py kaggle_upload/script.py
+    if not cuda:
+        return False
 
-          python - <<'PY'
-          from pathlib import Path
+    gpu = torch.cuda.get_device_name(0)
 
-          p = Path("kaggle_upload/script.py")
+    capability = torch.cuda.get_device_capability(0)
 
-          text = p.read_text()
+    print(
+        f"GPU: {gpu}",
+        flush=True,
+    )
 
-          replacements = {
-              "%%SESSION_ID%%": "${{ inputs.session_id }}",
-              "%%API_URL%%": "${{ inputs.api_url }}",
-              "%%WORKER_TOKEN%%": "${{ inputs.worker_token }}",
-          }
+    print(
+        f"Compute capability: {capability}",
+        flush=True,
+    )
 
-          for old, new in replacements.items():
-              text = text.replace(old, new)
+    x = torch.randn(
+        1024,
+        1024,
+        device="cuda",
+    )
 
-          p.write_text(text)
+    y = x @ x
 
-          if "%%SESSION_ID%%" in text:
-              raise SystemExit("SESSION_ID placeholder remains")
+    torch.cuda.synchronize()
 
-          if "%%API_URL%%" in text:
-              raise SystemExit("API_URL placeholder remains")
+    print(
+        f"GPU kernel OK: {y.numel()} elements",
+        flush=True,
+    )
 
-          if "%%WORKER_TOKEN%%" in text:
-              raise SystemExit("WORKER_TOKEN placeholder remains")
+    del x
+    del y
 
-          print("All placeholders replaced.")
-          PY
+    torch.cuda.empty_cache()
 
-          python -m py_compile kaggle_upload/script.py
+    return True
 
-          echo "Worker Python syntax OK."
 
-      # ------------------------------------------------
-      # KAGGLE METADATA
-      # ------------------------------------------------
+def notify_ready():
 
-      - name: Create Kaggle metadata
-        shell: bash
-        run: |
-          set -e
+    import torch
 
-          mkdir -p kaggle_upload
+    gpu = torch.cuda.get_device_name(0)
 
-          cat > kaggle_upload/kernel-metadata.json <<EOF
-          {
-            "id": "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}",
-            "title": "GPU Session ${SESSION_ID}",
-            "code_file": "script.py",
-            "language": "python",
-            "kernel_type": "script",
-            "is_private": true,
-            "enable_gpu": true,
-            "enable_tpu": false,
-            "enable_internet": true
-          }
-          EOF
+    capability = list(
+        torch.cuda.get_device_capability(0)
+    )
 
-          cat kaggle_upload/kernel-metadata.json
+    data = {
+        "gpu": gpu,
+        "cuda_available": True,
+        "compute_capability": capability,
+    }
 
-      # ------------------------------------------------
-      # PUSH KAGGLE
-      # ------------------------------------------------
+    for attempt in range(1, 11):
 
-      - name: Push Kaggle GPU worker
-        shell: bash
-        working-directory: kaggle_upload
-        run: |
-          set -e
+        print(
+            f"worker-ready attempt {attempt}/10",
+            flush=True,
+        )
 
-          echo "========================================"
-          echo "PUSHING KAGGLE"
-          echo "========================================"
+        r = post_api(
+            f"/gpu/session/{SESSION_ID}/worker-ready",
+            data,
+        )
 
-          kaggle kernels push
+        if r is not None and r.status_code == 200:
 
-          echo "Kaggle worker submitted."
+            print(
+                "WORKER READY accepted by Railway.",
+                flush=True,
+            )
 
-      # ------------------------------------------------
-      # WAIT FOR WORKER
-      # ------------------------------------------------
+            return True
 
-      - name: Wait for GPU worker
-        shell: bash
-        run: |
-          set +e
+        time.sleep(3)
 
-          echo "======================================"
-          echo "WAITING FOR GPU WORKER"
-          echo "======================================"
+    return False
 
-          READY=false
 
-          for i in $(seq 1 180); do
+def heartbeat():
 
-            echo ""
-            echo "CHECK $i / 180"
+    r = post_api(
+        f"/gpu/session/{SESSION_ID}/heartbeat",
+        {
+            "status": "alive",
+            "timestamp": time.time(),
+        },
+    )
 
-            RESPONSE=$(curl -sS \
-              --max-time 20 \
-              "${API_URL}/gpu/session/${SESSION_ID}" \
-              || true)
+    return (
+        r is not None
+        and r.status_code == 200
+    )
 
-            echo "$RESPONSE"
 
-            STATUS=$(echo "$RESPONSE" | python -c '
-          import sys,json
-          try:
-              print(json.load(sys.stdin).get("status",""))
-          except:
-              print("")
-          ')
+def get_session():
 
-            echo "Current status: $STATUS"
+    r = get_api(
+        f"/gpu/session/{SESSION_ID}"
+    )
 
-            if [ "$STATUS" = "active" ]; then
-              READY=true
+    if r is None:
+        return None
 
-              echo ""
-              echo "======================================"
-              echo "GPU WORKER IS READY"
-              echo "======================================"
+    if r.status_code != 200:
+        return None
 
-              break
-            fi
+    try:
+        return r.json()
+    except Exception:
+        return None
 
-            if [ "$STATUS" = "failed" ] ||
-               [ "$STATUS" = "error" ] ||
-               [ "$STATUS" = "expired" ] ||
-               [ "$STATUS" = "stopped" ]; then
 
-              echo "GPU worker failed: $STATUS"
-              exit 1
-            fi
+def get_command():
 
-            sleep 5
+    r = get_api(
+        f"/internal/session/{SESSION_ID}/command"
+    )
 
-          done
+    if r is None:
+        return None
 
-          if [ "$READY" != "true" ]; then
-            echo "GPU worker did not become ready."
-            exit 1
-          fi
+    if r.status_code != 200:
+        return None
 
-      # ------------------------------------------------
-      # GITHUB KEEP ALIVE
-      # ------------------------------------------------
+    try:
+        data = r.json()
+    except Exception:
+        return None
 
-      - name: Keep GitHub session alive
-        shell: bash
-        run: |
-          set +e
+    if not data:
+        return None
 
-          echo "======================================"
-          echo "GITHUB KEEP-ALIVE LOOP"
-          echo "======================================"
+    return data
 
-          for i in $(seq 1 240); do
 
-            echo ""
-            echo "KEEP-ALIVE CHECK $i / 240"
+def send_result(command_id, result):
 
-            RESPONSE=$(curl -sS \
-              --max-time 20 \
-              "${API_URL}/gpu/session/${SESSION_ID}" \
-              || true)
+    post_api(
+        f"/internal/session/{SESSION_ID}/result",
+        {
+            "command_id": command_id,
+            "result": result,
+        },
+    )
 
-            echo "$RESPONSE"
 
-            STATUS=$(echo "$RESPONSE" | python -c '
-          import sys,json
-          try:
-              print(json.load(sys.stdin).get("status",""))
-          except:
-              print("")
-          ')
+def execute_command(command):
 
-            echo "STATUS: $STATUS"
+    print("=" * 60, flush=True)
+    print("COMMAND RECEIVED", flush=True)
+    print("=" * 60, flush=True)
 
-            case "$STATUS" in
+    print(
+        json.dumps(
+            command,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
-              active)
-                echo "GPU worker is active."
-                ;;
+    command_id = command.get("command_id")
 
-              starting)
-                echo "Worker still starting."
-                ;;
+    cmd = command.get("command")
 
-              stopped|expired|completed|failed|error)
-                echo "Session ended: $STATUS"
-                exit 0
-                ;;
+    if not cmd:
 
-              *)
-                echo "Unknown status. Continuing."
-                ;;
+        result = {
+            "success": False,
+            "error": "No command supplied",
+        }
 
-            esac
+        if command_id:
+            send_result(
+                command_id,
+                result,
+            )
 
-            sleep 5
+        return
 
-          done
+    try:
 
-          echo "Keep-alive period finished."
+        print(
+            f"Executing: {cmd}",
+            flush=True,
+        )
 
-      # ------------------------------------------------
-      # ARTIFACT
-      # ------------------------------------------------
+        process = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
 
-      - name: Save worker files
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gpu-worker-${{ inputs.session_id }}
-          path: |
-            kaggle_upload/script.py
-            kaggle_upload/kernel-metadata.json
-          if-no-files-found: ignore
+        result = {
+            "success": process.returncode == 0,
+            "returncode": process.returncode,
+            "stdout": process.stdout[-10000:],
+            "stderr": process.stderr[-10000:],
+        }
+
+    except subprocess.TimeoutExpired:
+
+        result = {
+            "success": False,
+            "error": "Command timeout",
+        }
+
+    except Exception as e:
+
+        result = {
+            "success": False,
+            "error": str(e),
+        }
+
+    print(
+        json.dumps(
+            result,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+    if command_id:
+        send_result(
+            command_id,
+            result,
+        )
+
+
+def main():
+
+    print("=" * 60, flush=True)
+    print("KAGGLE GPU WORKER", flush=True)
+    print("=" * 60, flush=True)
+
+    print(
+        f"SESSION : {SESSION_ID}",
+        flush=True,
+    )
+
+    print(
+        f"API     : {API_URL}",
+        flush=True,
+    )
+
+    print(
+        f"TOKEN   : {len(WORKER_TOKEN)}",
+        flush=True,
+    )
+
+    print("=" * 60, flush=True)
+
+    # -------------------------------------------------
+    # GPU
+    # -------------------------------------------------
+
+    if not gpu_test():
+
+        raise RuntimeError(
+            "GPU/CUDA test failed"
+        )
+
+    # -------------------------------------------------
+    # READY
+    # -------------------------------------------------
+
+    if not notify_ready():
+
+        raise RuntimeError(
+            "Railway did not accept worker-ready"
+        )
+
+    # -------------------------------------------------
+    # KEEP ALIVE
+    # -------------------------------------------------
+
+    print("=" * 60, flush=True)
+    print("KEEP-ALIVE LOOP STARTED", flush=True)
+    print("=" * 60, flush=True)
+
+    last_heartbeat = 0
+    counter = 0
+
+    while True:
+
+        counter += 1
+
+        now = time.time()
+
+        print(
+            f"[LOOP {counter}] Worker alive",
+            flush=True,
+        )
+
+        # HEARTBEAT
+
+        if (
+            now - last_heartbeat
+            >= HEARTBEAT_INTERVAL
+        ):
+
+            heartbeat()
+
+            last_heartbeat = now
+
+        # SESSION STATUS
+
+        session = get_session()
+
+        if session:
+
+            status = session.get(
+                "status"
+            )
+
+            remaining = session.get(
+                "remaining_seconds"
+            )
+
+            print(
+                f"[SESSION] "
+                f"status={status} "
+                f"remaining={remaining}",
+                flush=True,
+            )
+
+            if status in (
+                "stopped",
+                "expired",
+                "completed",
+                "failed",
+                "error",
+            ):
+
+                print(
+                    "[SESSION] Session ended.",
+                    flush=True,
+                )
+
+                break
+
+        # COMMAND
+
+        command = get_command()
+
+        if command:
+
+            execute_command(command)
+
+        # WAIT
+
+        time.sleep(
+            COMMAND_INTERVAL
+        )
+
+
+if __name__ == "__main__":
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print(
+            "Worker stopped.",
+            flush=True,
+        )
+
+    except Exception as e:
+
+        print(
+            f"WORKER ERROR: {e}",
+            flush=True,
+        )
+
+        traceback.print_exc()
+
+        sys.exit(1)
