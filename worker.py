@@ -5,15 +5,18 @@ import time
 import traceback
 import subprocess
 
-try:
-    import requests
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "requests"])
-    import requests
+# Read config from file (created by GitHub Actions) or fallback to env vars
+config = {}
+for path in ['config.json', '/kaggle/working/config.json']:
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            config = json.load(f)
+        print(f"DEBUG: Loaded config from {path}")
+        break
 
-API_URL = os.environ.get("API_URL", "").rstrip("/")
-SESSION_ID = os.environ.get("SESSION_ID", "")
-WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
+API_URL = config.get('api_url', os.environ.get('API_URL', '')).rstrip('/')
+SESSION_ID = config.get('session_id', os.environ.get('SESSION_ID', ''))
+WORKER_TOKEN = config.get('worker_token', os.environ.get('WORKER_TOKEN', ''))
 
 print("DEBUG: API_URL =", repr(API_URL))
 print("DEBUG: SESSION_ID =", repr(SESSION_ID))
@@ -343,7 +346,7 @@ try:
 
     from numba import cuda
 
-@cuda.jit
+    @cuda.jit
     def add_kernel(a, b, c):
         i = cuda.grid(1)
         if i < a.size:
@@ -428,7 +431,6 @@ try:
         time.sleep(1)
         iteration += 1
 
-        # Keep stdout active so Kaggle doesn't kill us
         if iteration % 10 == 0:
             print(f"[{iteration}s] Worker alive, waiting for commands...", flush=True)
 
