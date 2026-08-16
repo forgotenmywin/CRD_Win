@@ -11,34 +11,35 @@ try:
     import requests
 except ImportError:
     subprocess.check_call([
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "-q",
-        "requests"
+        sys.executable, "-m", "pip", "install", "-q", "requests"
     ])
     import requests
 
 
-API_URL = "%%API_URL%%".rstrip("/")
-SESSION_ID = "%%SESSION_ID%%"
-WORKER_TOKEN = "%%WORKER_TOKEN%%"
+# ============================================================
+# CONFIG
+# These values are injected by GitHub Actions.
+# ============================================================
+
+API_URL = os.environ.get("GPU_API_URL", "")
+SESSION_ID = os.environ.get("GPU_SESSION_ID", "")
+WORKER_TOKEN = os.environ.get("GPU_WORKER_TOKEN", "")
+
+API_URL = API_URL.rstrip("/")
 
 
-# Make sure GitHub replaced the placeholders
-if "%%API_URL%%" in API_URL:
-    raise RuntimeError("API_URL placeholder was not replaced")
+# ============================================================
+# VALIDATION
+# ============================================================
 
-if "%%SESSION_ID%%" in SESSION_ID:
-    raise RuntimeError("SESSION_ID placeholder was not replaced")
+if not API_URL:
+    raise RuntimeError("GPU_API_URL is missing")
 
-if "%%WORKER_TOKEN%%" in WORKER_TOKEN:
-    raise RuntimeError("WORKER_TOKEN placeholder was not replaced")
+if not SESSION_ID:
+    raise RuntimeError("GPU_SESSION_ID is missing")
 
-
-if not API_URL.startswith(("http://", "https://")):
-    raise RuntimeError(f"Invalid API_URL: {API_URL}")
+if not WORKER_TOKEN:
+    raise RuntimeError("GPU_WORKER_TOKEN is missing")
 
 
 HEADERS = {
@@ -55,6 +56,10 @@ print("API     :", API_URL)
 print("TOKEN   :", len(WORKER_TOKEN))
 print("=" * 60)
 
+
+# ============================================================
+# API HELPER
+# ============================================================
 
 def api(method, path, body=None, timeout=30, retries=3):
 
@@ -89,7 +94,8 @@ def api(method, path, body=None, timeout=30, retries=3):
 
             print(
                 f"[API] {method} {path} "
-                f"attempt={attempt} error={e}"
+                f"attempt={attempt} "
+                f"error={e}"
             )
 
             if attempt < retries:
@@ -97,6 +103,10 @@ def api(method, path, body=None, timeout=30, retries=3):
 
     return None
 
+
+# ============================================================
+# RESULT OBJECT
+# ============================================================
 
 result = {
     "session_id": SESSION_ID,
@@ -109,13 +119,16 @@ result = {
 }
 
 
+# ============================================================
+# GPU INITIALIZATION
+# ============================================================
+
 try:
 
-    # ========================================================
-    # NVIDIA GPU
-    # ========================================================
-
-    print("\n=== NVIDIA-SMI ===")
+    print()
+    print("=" * 60)
+    print("NVIDIA SMI")
+    print("=" * 60)
 
     smi = subprocess.run(
         ["nvidia-smi"],
@@ -128,9 +141,13 @@ try:
 
     if smi.returncode != 0:
         raise RuntimeError(
-            "nvidia-smi failed"
+            "nvidia-smi failed - GPU unavailable"
         )
 
+
+    # --------------------------------------------------------
+    # GPU INFORMATION
+    # --------------------------------------------------------
 
     gpu_csv = subprocess.run(
         [
@@ -146,18 +163,22 @@ try:
     lines = gpu_csv.stdout.strip().splitlines()
 
     if lines:
-        result["gpu"] = lines[0].strip()
+        result["gpu"] = lines[0]
 
     print("GPU:", result["gpu"])
 
 
     # ========================================================
-    # NUMPY / NUMBA
+    # NUMBA / CUDA
     # ========================================================
 
-    print("\n=== CUDA ===")
+    print()
+    print("=" * 60)
+    print("CUDA TEST")
+    print("=" * 60)
 
     try:
+
         import numpy as np
         from numba import cuda
 
@@ -169,8 +190,8 @@ try:
             "pip",
             "install",
             "-q",
-            "numpy",
-            "numba"
+            "numba",
+            "numpy"
         ])
 
         import numpy as np
@@ -203,21 +224,19 @@ try:
 
     print(
         "Compute capability:",
-        result["compute_capability"]
+        cap
     )
 
 
     # ========================================================
-    # GPU TEST
+    # GPU KERNEL SMOKE TEST
     # ========================================================
-
-    print("\n=== GPU TEST ===")
 
     N = 1024 * 1024
 
 
     @cuda.jit
-    def add_kernel(a, b, c):
+    def gpu_add(a, b, c):
 
         i = cuda.grid(1)
 
@@ -248,7 +267,7 @@ try:
 
     t0 = time.perf_counter()
 
-    add_kernel[
+    gpu_add[
         (N + 255) // 256,
         256
     ](
@@ -261,10 +280,14 @@ try:
 
     elapsed = time.perf_counter() - t0
 
+
     out = dc.copy_to_host()
 
 
-    if abs(float(out.sum()) - N * 2) > 0.01:
+    if abs(
+        float(out.sum()) - N * 2
+    ) > 0.01:
+
         raise RuntimeError(
             "GPU result verification failed"
         )
@@ -279,7 +302,9 @@ try:
 
 
     print(
-        f"GPU TEST OK: {elapsed:.4f}s"
+        f"GPU kernel OK: "
+        f"{N} elements "
+        f"in {elapsed:.4f}s"
     )
 
 
@@ -287,14 +312,16 @@ try:
     # WORKER READY
     # ========================================================
 
-    print("\n=== WORKER READY ===")
+    print()
+    print("=" * 60)
+    print("NOTIFYING RAILWAY")
+    print("=" * 60)
+
 
     ready_payload = {
         "gpu": result["gpu"],
-        "compute_capability":
-            result["compute_capability"],
-        "cuda_available":
-            result["cuda_available"]
+        "compute_capability": result["compute_capability"],
+        "cuda_available": result["cuda_available"],
     }
 
 
@@ -310,26 +337,42 @@ try:
             retries=1
         )
 
-        if r and r.status_code == 200:
+        if r and r.status_code in (200, 202):
 
             print(
-                "Railway accepted worker-ready."
+                "WORKER READY accepted by Railway."
             )
 
             notified = True
             break
 
         print(
-            f"worker-ready retry "
-            f"{attempt}/10"
+            f"worker-ready retry {attempt}/10"
         )
 
         time.sleep(5)
 
 
     if not notified:
+
         raise RuntimeError(
-            "Railway did not acknowledge worker-ready"
+            "Railway did not accept worker-ready"
+        )
+
+
+    # ========================================================
+    # SAVE RESULT
+    # ========================================================
+
+    with open(
+        "/kaggle/working/session_result.json",
+        "w"
+    ) as f:
+
+        json.dump(
+            result,
+            f,
+            indent=2
         )
 
 
@@ -337,23 +380,35 @@ try:
     # COMMAND LOOP
     # ========================================================
 
-    print("\n=== COMMAND LOOP ===")
+    print()
+    print("=" * 60)
+    print("COMMAND LOOP")
+    print("=" * 60)
 
-    tick = 0
+
+    last_heartbeat = 0
+    started = time.time()
 
 
     while True:
 
-        time.sleep(1)
+        # ----------------------------------------------------
+        # Session maximum lifetime
+        # Worker can stay alive while Railway heartbeats
+        # ----------------------------------------------------
 
-        tick += 1
+        if time.time() - started > 1100:
+            print(
+                "Maximum worker runtime reached."
+            )
+            break
 
 
         # ----------------------------------------------------
         # HEARTBEAT
         # ----------------------------------------------------
 
-        if tick % 30 == 0:
+        if time.time() - last_heartbeat >= 30:
 
             hb = api(
                 "POST",
@@ -361,22 +416,20 @@ try:
                 retries=2
             )
 
+            last_heartbeat = time.time()
+
             if hb and hb.status_code == 410:
 
                 print(
-                    "Session expired."
+                    "Railway says session expired."
                 )
 
                 break
 
 
         # ----------------------------------------------------
-        # COMMAND POLL
+        # COMMAND
         # ----------------------------------------------------
-
-        if tick % 3 != 0:
-            continue
-
 
         try:
 
@@ -387,9 +440,13 @@ try:
             )
 
             if not cr:
+                time.sleep(2)
                 continue
 
+
             if cr.status_code != 200:
+
+                time.sleep(2)
                 continue
 
 
@@ -407,15 +464,19 @@ try:
 
             cmd = data.get("command")
 
+
             if not cmd:
+
+                time.sleep(2)
                 continue
 
 
-            command_id = cmd["command_id"]
+            command_id = cmd.get(
+                "command_id"
+            )
 
             operation = cmd.get(
-                "operation",
-                ""
+                "operation"
             )
 
             parameters = cmd.get(
@@ -424,13 +485,15 @@ try:
             )
 
 
-            print(
-                f">>> {command_id} "
-                f"operation={operation}"
-            )
+            print()
+            print("=" * 60)
+            print("COMMAND RECEIVED")
+            print("ID:", command_id)
+            print("OP:", operation)
+            print("=" * 60)
 
 
-            started = time.time()
+            start_time = time.time()
 
 
             # =================================================
@@ -446,12 +509,9 @@ try:
 
 
                 namespace = {
-                    "__builtins__":
-                        __builtins__,
-                    "np":
-                        np,
-                    "cuda":
-                        cuda
+                    "__builtins__": __builtins__,
+                    "np": np,
+                    "cuda": cuda,
                 }
 
 
@@ -461,7 +521,7 @@ try:
 
                     namespace["torch"] = torch
 
-                except ImportError:
+                except Exception:
 
                     pass
 
@@ -478,27 +538,31 @@ try:
                     )
 
 
-                    output = {
-                        k: str(v)
-                        for k, v
-                        in local_vars.items()
-                        if not k.startswith("_")
-                    }
+                    output = {}
+
+                    for key, value in local_vars.items():
+
+                        if not key.startswith("_"):
+
+                            try:
+                                output[key] = str(value)
+                            except Exception:
+                                output[key] = repr(value)
 
 
                     cmd_out = {
                         "status": "ok",
                         "output": output,
                         "execution_time":
-                            time.time() - started
+                            time.time() - start_time
                     }
 
 
-                except Exception as ex:
+                except Exception as e:
 
                     cmd_out = {
                         "status": "error",
-                        "error": str(ex),
+                        "error": str(e),
                         "traceback":
                             traceback.format_exc()
                     }
@@ -510,7 +574,7 @@ try:
 
             elif operation == "nvidia_smi":
 
-                p = subprocess.run(
+                s2 = subprocess.run(
                     ["nvidia-smi"],
                     capture_output=True,
                     text=True,
@@ -520,9 +584,9 @@ try:
 
                 cmd_out = {
                     "status": "ok",
-                    "stdout": p.stdout,
-                    "stderr": p.stderr,
-                    "returncode": p.returncode
+                    "stdout": s2.stdout,
+                    "stderr": s2.stderr,
+                    "returncode": s2.returncode,
                 }
 
 
@@ -538,32 +602,44 @@ try:
                 )
 
 
-                try:
-
-                    p = subprocess.run(
-                        command,
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=60
-                    )
-
-
-                    cmd_out = {
-                        "status": "ok",
-                        "stdout": p.stdout,
-                        "stderr": p.stderr,
-                        "returncode": p.returncode
-                    }
-
-
-                except subprocess.TimeoutExpired:
+                if not command:
 
                     cmd_out = {
                         "status": "error",
                         "error":
-                            "Command timed out"
+                            "command missing"
                     }
+
+                else:
+
+                    try:
+
+                        sh = subprocess.run(
+                            command,
+                            shell=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=120
+                        )
+
+
+                        cmd_out = {
+                            "status": "ok",
+                            "stdout": sh.stdout,
+                            "stderr": sh.stderr,
+                            "returncode":
+                                sh.returncode
+                        }
+
+
+                    except Exception as e:
+
+                        cmd_out = {
+                            "status": "error",
+                            "error": str(e),
+                            "traceback":
+                                traceback.format_exc()
+                        }
 
 
             # =================================================
@@ -572,15 +648,12 @@ try:
 
             elif operation == "info":
 
-                p = subprocess.run(
+                mem = subprocess.run(
                     [
                         "nvidia-smi",
                         "--query-gpu="
-                        "name,"
-                        "memory.total,"
-                        "memory.used,"
-                        "memory.free,"
-                        "temperature.gpu,"
+                        "name,memory.total,memory.used,"
+                        "memory.free,temperature.gpu,"
                         "utilization.gpu",
                         "--format=csv,noheader"
                     ],
@@ -598,13 +671,13 @@ try:
                     "cuda_available":
                         result["cuda_available"],
                     "gpu_details":
-                        p.stdout.strip(),
+                        mem.stdout.strip(),
                     "hostname":
                         socket.gethostname(),
                     "python":
                         sys.version,
                     "platform":
-                        platform.platform()
+                        platform.platform(),
                 }
 
 
@@ -621,32 +694,21 @@ try:
             # SEND RESULT
             # =================================================
 
-            payload = {
-                "command_id": command_id,
-                **cmd_out
-            }
-
-
-            rr = api(
+            api(
                 "POST",
                 f"/internal/session/{SESSION_ID}/result",
-                payload,
-                retries=5
+                {
+                    "command_id": command_id,
+                    **cmd_out
+                },
+                retries=3
             )
 
 
-            if rr and rr.status_code == 200:
-
-                print(
-                    f"<<< {command_id} result sent"
-                )
-
-            else:
-
-                print(
-                    f"<<< {command_id} "
-                    f"result send FAILED"
-                )
+            print(
+                "COMMAND FINISHED:",
+                command_id
+            )
 
 
         except Exception as e:
@@ -656,14 +718,34 @@ try:
                 e
             )
 
+            traceback.print_exc()
+
+
+        time.sleep(1)
+
+
+    print(
+        "Worker finished."
+    )
+
 
 except Exception as e:
 
-    result["status"] = "ERROR"
-    result["error"] = str(e)
-    result["traceback"] = traceback.format_exc()
+    result.update({
+        "status": "ERROR",
+        "error": str(e),
+        "exception": type(e).__name__,
+        "traceback": traceback.format_exc(),
+    })
+
+
+    print()
+    print("=" * 60)
+    print("WORKER ERROR")
+    print("=" * 60)
 
     traceback.print_exc()
+
 
     try:
 
@@ -679,6 +761,8 @@ except Exception as e:
             )
 
     except Exception:
+
         pass
+
 
     raise
