@@ -1,505 +1,337 @@
+#!/usr/bin/env python3
+"""
+Kaggle GPU Worker
+Connects to an external API and executes tasks on Kaggle's free GPU.
+"""
+
 import os
 import sys
 import json
 import time
+import signal
+import logging
 import traceback
-import subprocess
+from pathlib import Path
+from typing import Dict, Any, Optional
+import threading
+import requests
 
-# Read config from file (created by GitHub Actions) or fallback to env vars
-config = {}
-for path in ['config.json', '/kaggle/working/config.json']:
-    if os.path.exists(path):
-        with open(path, 'r') as f:
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("KaggleWorker")
+
+# Global flag for graceful shutdown
+running = True
+
+
+def load_config() -> Dict[str, Any]:
+    """Load configuration from config.json"""
+    config_path = Path(__file__).parent / "config.json"
+    try:
+        with open(config_path, 'r') as f:
             config = json.load(f)
-        print(f"DEBUG: Loaded config from {path}")
-        break
-
-API_URL = config.get('api_url', os.environ.get('API_URL', '')).rstrip('/')
-SESSION_ID = config.get('session_id', os.environ.get('SESSION_ID', ''))
-WORKER_TOKEN = config.get('worker_token', os.environ.get('WORKER_TOKEN', ''))
-
-print("DEBUG: API_URL =", repr(API_URL))
-print("DEBUG: SESSION_ID =", repr(SESSION_ID))
-print("DEBUG: WORKER_TOKEN length =", len(WORKER_TOKEN))
-
-if not API_URL:
-    print("ERROR: API_URL is empty!")
-if not WORKER_TOKEN:
-    print("ERROR: WORKER_TOKEN is empty!")
-if not SESSION_ID:
-    print("ERROR: SESSION_ID is empty!")
-
-HEADERS = {
-    "Content-Type": "application/json",
-    "X-Worker-Token": WORKER_TOKEN
-}
-
-def api_call(method, path, payload=None):
-    if not API_URL:
-        print(f"DEBUG: API_URL is empty, cannot make {method} request")
-        return None
-    url = f"{API_URL}{path}"
-    print(f"DEBUG: {method} {url}")
-    try:
-        if method == "GET":
-            resp = requests.get(url, headers=HEADERS, timeout=30)
-        else:
-            resp = requests.post(url, headers=HEADERS, json=payload or {}, timeout=30)
-        print(f"DEBUG: Response status: {resp.status_code}")
-        print(f"DEBUG: Response text: {resp.text[:500]}")
-        return resp
+        logger.info(f"Config loaded: {config.get('session_id', 'unknown')}")
+        return config
     except Exception as e:
-        print(f"API {method} {path} failed: {e}")
-        return None
+        logger.error(f"Failed to load config: {e}")
+        sys.exit(1)
 
-print("=" * 60)
-print("KAGGLE GPU WORKER")
-print("SESSION:", SESSION_ID)
-print("API:", API_URL)
-print("=" * 60)
 
-result = {
-    "session_id": SESSION_ID,
-    "status": "starting",
-    "gpu": None,
-    "compute_capability": None,
-    "cuda_available": False,
-    "test": None,
-    "error": None
-}
-
-def op_nvidia_smi(params):
-    smi = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30)
-    return {
-        "status": "ok",
-        "stdout": smi.stdout,
-        "stderr": smi.stderr,
-        "returncode": smi.returncode
-    }
-
-def op_shell(params):
-    shell_cmd = params.get("command", "")
-    timeout = params.get("timeout", 60)
-    sh = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-    return {
-        "status": "ok",
-        "stdout": sh.stdout,
-        "stderr": sh.stderr,
-        "returncode": sh.returncode
-    }
-
-def op_execute_python(params):
-    code = params.get("code", "")
-    exec_globals = {
-        "__builtins__": __builtins__,
-        "np": __import__("numpy"),
-        "cuda": __import__("numba.cuda", fromlist=["cuda"]),
-    }
+def verify_gpu() -> bool:
+    """Check if GPU is available"""
     try:
         import torch
-        exec_globals["torch"] = torch
+        if torch.cuda.is_available():
+            device_name = torch.cuda.get_device_name(0)
+            memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+            logger.info(f"✅ GPU Available: {device_name} ({memory:.1f} GB)")
+            return True
+        else:
+            logger.warning("⚠️ GPU not available, using CPU")
+            return False
     except ImportError:
-        pass
-    try:
-        import tensorflow as tf
-        exec_globals["tf"] = tf
-    except ImportError:
-        pass
-    exec_locals = {}
-    exec(code, exec_globals, exec_locals)
-    return {
-        "status": "ok",
-        "output": {k: str(v) for k, v in exec_locals.items() if not k.startswith("_")},
-    }
+        logger.warning("PyTorch not installed, cannot verify GPU")
+        return False
 
-def op_matrix(params):
-    size = params.get("size", 1024)
-    dtype_str = params.get("dtype", "float32")
-    try:
-        import torch
-        dtype_map = {
-            "float16": torch.float16,
-            "float32": torch.float32,
-            "float64": torch.float64,
-        }
-        dtype = dtype_map.get(dtype_str, torch.float32)
-        a = torch.rand(size, size, device="cuda", dtype=dtype)
-        b = torch.rand(size, size, device="cuda", dtype=dtype)
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        c = torch.matmul(a, b)
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
-        return {
-            "status": "ok",
-            "size": size,
-            "dtype": dtype_str,
-            "time_seconds": elapsed,
-            "device": str(c.device),
-            "mean": float(c.mean()),
-            "std": float(c.std()),
-            "backend": "pytorch-cuda"
-        }
-    except ImportError:
-        import numpy as np
-        dtype_map = {
-            "float16": np.float16,
-            "float32": np.float32,
-            "float64": np.float64,
-        }
-        dtype = dtype_map.get(dtype_str, np.float32)
-        a = np.random.rand(size, size).astype(dtype)
-        b = np.random.rand(size, size).astype(dtype)
-        start = time.perf_counter()
-        c = np.matmul(a, b)
-        elapsed = time.perf_counter() - start
-        return {
-            "status": "ok",
-            "size": size,
-            "dtype": dtype_str,
-            "time_seconds": elapsed,
-            "backend": "numpy-cpu",
-            "mean": float(c.mean()),
-            "std": float(c.std())
-        }
 
-def op_benchmark(params):
-    bench_type = params.get("type", "matmul")
-    size = params.get("size", 4096)
-    try:
-        import torch
-        results = {}
+class KaggleWorker:
+    def __init__(self, config: Dict[str, Any]):
+        self.api_url = config["api_url"].rstrip("/")
+        self.session_id = config["session_id"]
+        self.worker_token = config["worker_token"]
+        self.kernel_name = config.get("kernel_name", "unknown")
+        
+        self.headers = {
+            "Authorization": f"Bearer {self.worker_token}",
+            "Content-Type": "application/json",
+            "X-Session-ID": self.session_id,
+            "X-Worker-Type": "kaggle-gpu"
+        }
+        
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        
+        self.heartbeat_interval = 30  # seconds
+        self.reconnect_delay = 5
+        self.max_reconnect_delay = 60
+        
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._stop_heartbeat = threading.Event()
 
-        if bench_type in ("matmul", "all"):
-            a = torch.rand(size, size, device="cuda")
-            b = torch.rand(size, size, device="cuda")
+    def _get_url(self, endpoint: str) -> str:
+        return f"{self.api_url}{endpoint}"
+
+    def register(self) -> bool:
+        """Register worker with the API"""
+        try:
+            payload = {
+                "session_id": self.session_id,
+                "kernel_name": self.kernel_name,
+                "status": "ready",
+                "gpu_available": verify_gpu()
+            }
+            
+            response = self.session.post(
+                self._get_url(f"/gpu/worker/{self.session_id}/register"),
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                logger.info("✅ Worker registered successfully")
+                return True
+            else:
+                logger.error(f"Registration failed: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Registration error: {e}")
+            return False
+
+    def heartbeat(self):
+        """Send periodic heartbeats to keep session alive"""
+        while not self._stop_heartbeat.is_set() and running:
+            try:
+                payload = {
+                    "session_id": self.session_id,
+                    "timestamp": time.time(),
+                    "status": "alive"
+                }
+                
+                response = self.session.post(
+                    self._get_url(f"/gpu/worker/{self.session_id}/heartbeat"),
+                    json=payload,
+                    timeout=10
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"Heartbeat failed: {response.status_code}")
+                    
+            except Exception as e:
+                logger.warning(f"Heartbeat error: {e}")
+            
+            # Wait with interrupt support
+            self._stop_heartbeat.wait(self.heartbeat_interval)
+
+    def start_heartbeat(self):
+        """Start heartbeat in background thread"""
+        self._heartbeat_thread = threading.Thread(target=self.heartbeat, daemon=True)
+        self._heartbeat_thread.start()
+        logger.info("Heartbeat thread started")
+
+    def stop_heartbeat(self):
+        """Stop heartbeat thread"""
+        self._stop_heartbeat.set()
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=5)
+
+    def fetch_task(self) -> Optional[Dict[str, Any]]:
+        """Fetch next task from API"""
+        try:
+            response = self.session.get(
+                self._get_url(f"/gpu/worker/{self.session_id}/task"),
+                timeout=30
+            )
+            
+            if response.status_code == 204:
+                return None  # No task available
+            
+            if response.status_code == 200:
+                return response.json()
+                
+            logger.warning(f"Unexpected status fetching task: {response.status_code}")
+            return None
+            
+        except requests.exceptions.Timeout:
+            logger.warning("Task fetch timeout")
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching task: {e}")
+            return None
+
+    def submit_result(self, task_id: str, result: Dict[str, Any], error: Optional[str] = None):
+        """Submit task result back to API"""
+        try:
+            payload = {
+                "task_id": task_id,
+                "session_id": self.session_id,
+                "result": result,
+                "error": error,
+                "timestamp": time.time()
+            }
+            
+            response = self.session.post(
+                self._get_url(f"/gpu/worker/{self.session_id}/result"),
+                json=payload,
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"✅ Result submitted for task {task_id}")
+            else:
+                logger.error(f"Failed to submit result: {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"Error submitting result: {e}")
+
+    def execute_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a task (override this for custom logic)"""
+        task_type = task.get("type", "unknown")
+        task_id = task.get("id", "unknown")
+        
+        logger.info(f"Executing task {task_id} of type '{task_type}'")
+        
+        try:
+            # Example: Run Python code
+            if task_type == "execute":
+                code = task.get("code", "")
+                # WARNING: exec is dangerous - use only with trusted API
+                local_vars = {}
+                exec(code, {"__builtins__": __builtins__}, local_vars)
+                return {"status": "completed", "output": local_vars}
+            
+            # Example: GPU benchmark
+            elif task_type == "benchmark":
+                return self._run_benchmark()
+            
+            # Example: Health check
+            elif task_type == "health":
+                return {
+                    "status": "healthy",
+                    "gpu": verify_gpu(),
+                    "uptime": time.time() - start_time
+                }
+            
+            else:
+                return {"status": "unknown_task_type", "type": task_type}
+                
+        except Exception as e:
+            logger.error(f"Task execution failed: {e}")
+            raise
+
+    def _run_benchmark(self) -> Dict[str, Any]:
+        """Run a simple GPU benchmark"""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return {"error": "GPU not available"}
+            
+            # Simple matrix multiplication benchmark
+            size = 5000
+            a = torch.randn(size, size, device='cuda')
+            b = torch.randn(size, size, device='cuda')
+            
             torch.cuda.synchronize()
-            start = time.perf_counter()
+            start = time.time()
             c = torch.matmul(a, b)
             torch.cuda.synchronize()
-            results["matmul"] = {
+            elapsed = time.time() - start
+            
+            return {
+                "benchmark": "matmul",
                 "size": size,
-                "time_seconds": time.perf_counter() - start,
-                "device": "cuda",
-                "flops_estimated": 2 * (size ** 3)
+                "time_seconds": round(elapsed, 3),
+                "device": torch.cuda.get_device_name(0)
             }
-
-        if bench_type in ("bandwidth", "all"):
-            n = size * size * 4
-            x = torch.rand(n, device="cuda")
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            y = x * 2.0
-            torch.cuda.synchronize()
-            results["bandwidth"] = {
-                "elements": n,
-                "time_seconds": time.perf_counter() - start,
-                "device": "cuda"
-            }
-
-        if bench_type in ("conv2d", "all"):
-            import torch.nn.functional as F
-            batch = params.get("batch", 32)
-            channels = params.get("channels", 64)
-            kernel = params.get("kernel", 3)
-            x = torch.rand(batch, channels, size, size, device="cuda")
-            w = torch.rand(channels, channels, kernel, kernel, device="cuda")
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            out = F.conv2d(x, w, padding=kernel // 2)
-            torch.cuda.synchronize()
-            results["conv2d"] = {
-                "batch": batch,
-                "channels": channels,
-                "size": size,
-                "kernel": kernel,
-                "time_seconds": time.perf_counter() - start,
-                "device": "cuda"
-            }
-
-        return {"status": "ok", "benchmark": bench_type, "results": results}
-    except ImportError:
-        return {"status": "error", "error": "PyTorch not available for benchmark"}
-
-def op_info(params):
-    smi = subprocess.run(
-        ["nvidia-smi", "--query-gpu=name,memory.total,memory.free,memory.used,temperature.gpu,utilization.gpu,power.draw", "--format=csv,noheader"],
-        capture_output=True, text=True, timeout=30
-    )
-    try:
-        import torch
-        cuda_available = torch.cuda.is_available()
-        device_count = torch.cuda.device_count()
-        current_device = torch.cuda.current_device()
-        device_name = torch.cuda.get_device_name(current_device)
-        return {
-            "status": "ok",
-            "nvidia_smi": smi.stdout.strip(),
-            "torch_cuda_available": cuda_available,
-            "torch_device_count": device_count,
-            "torch_current_device": current_device,
-            "torch_device_name": device_name
-        }
-    except ImportError:
-        return {
-            "status": "ok",
-            "nvidia_smi": smi.stdout.strip(),
-            "torch_cuda_available": False,
-            "note": "PyTorch not installed"
-        }
-
-def op_install(params):
-    packages = params.get("packages", [])
-    if isinstance(packages, str):
-        packages = [packages]
-    results = []
-    for pkg in packages:
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pkg])
-            results.append({"package": pkg, "status": "installed"})
         except Exception as e:
-            results.append({"package": pkg, "status": "failed", "error": str(e)})
-    return {"status": "ok", "installations": results}
+            return {"error": str(e)}
 
-def op_file(params):
-    action = params.get("action", "read")
-    filepath = params.get("path", "")
-    content = params.get("content", "")
-    if action == "read":
-        try:
-            with open(filepath, "r") as f:
-                data = f.read()
-            return {"status": "ok", "path": filepath, "content": data}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
-    elif action == "write":
-        try:
-            with open(filepath, "w") as f:
-                f.write(content)
-            return {"status": "ok", "path": filepath, "action": "write"}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
-    elif action == "list":
-        try:
-            files = os.listdir(filepath or ".")
-            return {"status": "ok", "path": filepath or ".", "files": files}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
-    else:
-        return {"status": "error", "error": f"Unknown file action: {action}"}
-
-BUILTIN_OPS = {
-    "nvidia_smi": op_nvidia_smi,
-    "shell": op_shell,
-    "execute_python": op_execute_python,
-    "matrix": op_matrix,
-    "benchmark": op_benchmark,
-    "info": op_info,
-    "install": op_install,
-    "file": op_file,
-}
-
-try:
-    print("\n" + "=" * 60)
-    print("NVIDIA-SMI")
-    print("=" * 60)
-    smi = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30)
-    print(smi.stdout)
-    if smi.returncode != 0:
-        print(smi.stderr)
-        raise RuntimeError("nvidia-smi failed")
-
-    gpu_info = subprocess.run(
-        ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
-        capture_output=True, text=True, timeout=30
-    )
-    print("\nGPU INFO:")
-    print(gpu_info.stdout)
-    gpu_line = gpu_info.stdout.strip().splitlines()
-    if gpu_line:
-        result["gpu"] = gpu_line[0]
-
-    print("\n" + "=" * 60)
-    print("NUMBA CUDA TEST")
-    print("=" * 60)
-
-    try:
-        import numpy as np
-        from numba import cuda
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "numba", "numpy"])
-        import numpy as np
-        from numba import cuda
-
-    cuda_available = cuda.is_available()
-    print("CUDA available:", cuda_available)
-    result["cuda_available"] = bool(cuda_available)
-    if not cuda_available:
-        raise RuntimeError("CUDA is not available")
-
-    device = cuda.get_current_device()
-    capability = device.compute_capability
-    print("Compute capability:", capability)
-    result["compute_capability"] = [int(capability[0]), int(capability[1])]
-
-    N = 1024 * 1024
-
-    from numba import cuda
-
-    @cuda.jit
-    def add_kernel(a, b, c):
-        i = cuda.grid(1)
-        if i < a.size:
-            c[i] = a[i] + b[i]
-
-    print("\nCreating arrays...")
-    a = np.ones(N, dtype=np.float32)
-    b = np.ones(N, dtype=np.float32)
-    c = np.zeros(N, dtype=np.float32)
-
-    print("Copying data to GPU...")
-    d_a = cuda.to_device(a)
-    d_b = cuda.to_device(b)
-    d_c = cuda.to_device(c)
-
-    threads = 256
-    blocks = (N + threads - 1) // threads
-
-    print("Launching GPU kernel...")
-    start = time.perf_counter()
-    add_kernel[blocks, threads](d_a, d_b, d_c)
-    cuda.synchronize()
-    elapsed = time.perf_counter() - start
-
-    output = d_c.copy_to_host()
-    checksum = float(np.sum(output))
-    expected = float(N * 2)
-
-    print("\nGPU computation successful")
-    print("Elements:", N)
-    print("Kernel time:", elapsed)
-    print("Checksum:", checksum)
-
-    if abs(checksum - expected) > 0.01:
-        raise RuntimeError("GPU result verification failed")
-
-    result["status"] = "READY"
-    result["test"] = {
-        "elements": N,
-        "time_seconds": elapsed,
-        "checksum": checksum,
-        "expected": expected
-    }
-
-    print("\n" + "=" * 60)
-    print("GPU WORKER READY")
-    print("=" * 60)
-    print(json.dumps(result, indent=2))
-
-    with open("/kaggle/working/session_result.json", "w") as f:
-        json.dump(result, f, indent=2)
-
-    print("\nNotifying API that worker is ready...")
-    ready_payload = {
-        "gpu": result["gpu"],
-        "compute_capability": result["compute_capability"],
-        "cuda_available": result["cuda_available"]
-    }
-    print("DEBUG: Payload:", json.dumps(ready_payload))
-    print("DEBUG: Headers:", {k: v[:10] + "..." if k == "X-Worker-Token" and len(v) > 10 else v for k, v in HEADERS.items()})
-
-    resp = api_call("POST", f"/gpu/session/{SESSION_ID}/worker-ready", ready_payload)
-
-    if resp is None:
-        print("DEBUG: api_call returned None - connection failed or API_URL empty")
-    else:
-        print("DEBUG: Status code:", resp.status_code)
-        print("DEBUG: Response headers:", dict(resp.headers))
-        try:
-            print("DEBUG: Response JSON:", resp.json())
-        except Exception:
-            print("DEBUG: Response text:", resp.text[:1000])
-
-    if resp and resp.status_code in (200, 202):
-        print("API acknowledged worker-ready.")
-    else:
-        print("WARNING: API did not acknowledge worker-ready.")
-
-    print("\nKeeping GPU worker alive and polling for commands...")
-    iteration = 0
-    while True:
-        time.sleep(1)
-        iteration += 1
-
-        if iteration % 10 == 0:
-            print(f"[{iteration}s] Worker alive, waiting for commands...", flush=True)
-
-        if iteration % 60 == 0:
-            hb = api_call("POST", f"/gpu/session/{SESSION_ID}/heartbeat")
-            if hb and hb.status_code == 410:
-                print("Session expired according to API. Exiting.")
-                break
-
-        if iteration % 5 == 0:
+    def run(self):
+        """Main worker loop"""
+        logger.info("=" * 50)
+        logger.info("KAGGLE GPU WORKER STARTING")
+        logger.info(f"Session: {self.session_id}")
+        logger.info(f"API: {self.api_url}")
+        logger.info("=" * 50)
+        
+        # Register with API
+        if not self.register():
+            logger.error("Failed to register worker. Exiting.")
+            return
+        
+        # Start heartbeat
+        self.start_heartbeat()
+        
+        # Main loop
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
+        while running:
             try:
-                cmd_resp = api_call("GET", f"/internal/session/{SESSION_ID}/command")
-                if cmd_resp and cmd_resp.status_code == 200:
-                    data = cmd_resp.json()
-                    cmd = data.get("command")
-                    if cmd:
-                        print(f"\n>>> Received command: {cmd['command_id']} | op: {cmd.get('operation')}")
-                        op = cmd.get("operation", "")
-                        params = cmd.get("parameters", {})
-                        cmd_start = time.time()
+                task = self.fetch_task()
+                
+                if task is None:
+                    time.sleep(2)
+                    consecutive_errors = 0
+                    continue
+                
+                # Execute task
+                task_id = task.get("id", "unknown")
+                result = self.execute_task(task)
+                self.submit_result(task_id, result)
+                consecutive_errors = 0
+                
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"Main loop error ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error("Too many consecutive errors. Exiting.")
+                    break
+                    
+                time.sleep(self.reconnect_delay)
+        
+        # Cleanup
+        self.stop_heartbeat()
+        logger.info("Worker stopped gracefully")
 
-                        try:
-                            if op in BUILTIN_OPS:
-                                cmd_result = BUILTIN_OPS[op](params)
-                            elif op.endswith(".py") or op == "python":
-                                code = params.get("code", params.get("script", ""))
-                                cmd_result = op_execute_python({"code": code})
-                            elif op == "exec":
-                                shell_cmd = params.get("command", params.get("cmd", ""))
-                                cmd_result = op_shell({"command": shell_cmd})
-                            else:
-                                code = params.get("code", "")
-                                if code:
-                                    cmd_result = op_execute_python({"code": code})
-                                else:
-                                    cmd_result = {
-                                        "status": "error",
-                                        "error": f"Unknown operation: {op}",
-                                        "available_operations": list(BUILTIN_OPS.keys())
-                                    }
-                        except Exception as exec_err:
-                            cmd_result = {
-                                "status": "error",
-                                "error": str(exec_err),
-                                "traceback": traceback.format_exc()
-                            }
 
-                        api_call("POST", f"/internal/session/{SESSION_ID}/result", {
-                            "command_id": cmd["command_id"],
-                            **cmd_result
-                        })
-                        print(f"<<< Command {cmd['command_id']} result sent.")
-            except Exception as poll_err:
-                print(f"Command polling error: {poll_err}")
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    global running
+    logger.info(f"Received signal {signum}, shutting down gracefully...")
+    running = False
 
-    print("\nWorker keep-alive loop finished.")
 
-except Exception as e:
-    result["status"] = "ERROR"
-    result["error"] = str(e)
-    result["exception"] = type(e).__name__
-    result["traceback"] = traceback.format_exc()
-    print("\n" + "=" * 60)
-    print("GPU WORKER ERROR")
-    print("=" * 60)
-    traceback.print_exc()
-    try:
-        with open("/kaggle/working/session_result.json", "w") as f:
-            json.dump(result, f, indent=2)
-    except Exception:
-        pass
-    raise
+# Track start time
+start_time = time.time()
+
+if __name__ == "__main__":
+    # Setup signal handlers
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Load config
+    config = load_config()
+    
+    # Create and run worker
+    worker = KaggleWorker(config)
+    worker.run()
+    
+    logger.info("Worker process exiting")
