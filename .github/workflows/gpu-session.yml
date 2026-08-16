@@ -20,7 +20,7 @@ on:
 jobs:
   gpu-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
 
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
@@ -80,35 +80,68 @@ jobs:
 
           echo "--- kernel-metadata.json ---"
           cat kaggle_session/kernel-metadata.json
-          echo "--- script.py (head) ---"
-          head -8 kaggle_session/script.py
+          echo "--- script.py (first 5 lines) ---"
+          head -5 kaggle_session/script.py
 
       - name: Push Kaggle kernel
         run: |
           kaggle kernels push -p kaggle_session
-          echo "Submitted."
+          echo "Submitted to Kaggle."
 
-      - name: Wait and collect results
+      - name: Wait for Kaggle kernel
         run: |
           set +e
           KERNEL="${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
-          echo "Watching: $KERNEL"
+          echo "Kernel: $KERNEL"
 
+          # ── BUG FIX: after push, Kaggle may still show OLD "complete" status.
+          # Wait 30s for Kaggle to register the new run as "queued" or "running".
+          echo "Waiting 30s for Kaggle to register new kernel run..."
+          sleep 30
+
+          # ── We require seeing queued/running BEFORE accepting complete.
+          # This prevents false-positive "complete" from a previous kernel version.
+          SEEN_ACTIVE=false
           FINAL="UNKNOWN"
-          for i in $(seq 1 240); do
+
+          for i in $(seq 1 300); do
             STATUS="$(kaggle kernels status "$KERNEL" 2>&1)"
-            echo "[$i/240] $STATUS"
-            echo "$STATUS" | grep -qi "complete" && { FINAL="COMPLETE";  break; }
-            echo "$STATUS" | grep -qi "error"    && { FINAL="ERROR";     break; }
-            echo "$STATUS" | grep -qi "cancel"   && { FINAL="CANCELLED"; break; }
+            echo "[$i/300] $STATUS"
+
+            if echo "$STATUS" | grep -qiE "queued|running"; then
+              SEEN_ACTIVE=true
+            fi
+
+            if $SEEN_ACTIVE && echo "$STATUS" | grep -qi "complete"; then
+              FINAL="COMPLETE"
+              break
+            fi
+
+            if echo "$STATUS" | grep -qiE "error|fail"; then
+              FINAL="ERROR"
+              break
+            fi
+
+            if echo "$STATUS" | grep -qi "cancel"; then
+              FINAL="CANCELLED"
+              break
+            fi
+
             sleep 5
           done
+
+          if [ "$FINAL" = "UNKNOWN" ]; then
+            echo "Timed out waiting for Kaggle kernel."
+            FINAL="TIMEOUT"
+          fi
+
           echo "FINAL: $FINAL"
 
           mkdir -p final_output
           kaggle kernels output "$KERNEL" -p final_output -o || echo "output download failed"
 
           if [ -f final_output/session_result.json ]; then
+            echo "--- session_result.json ---"
             cat final_output/session_result.json
           else
             echo "session_result.json not found"
