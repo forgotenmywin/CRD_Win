@@ -33,52 +33,35 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Validate secrets and inputs
+      - name: Setup Python & Kaggle CLI
         shell: bash
         run: |
           set -e
-          echo "::group::Environment Setup"
           python -m pip install --upgrade pip
           python -m pip install --upgrade kaggle requests
-          echo "::endgroup::"
           
-          echo "::group::Validation"
-          python --version
-          kaggle --version
+          echo "Python: $(python --version)"
+          echo "Kaggle: $(kaggle --version)"
           
-          # Validate required variables
           for var in KAGGLE_USERNAME KAGGLE_API_TOKEN SESSION_ID API_URL WORKER_TOKEN; do
             if [ -z "${!var}" ]; then
               echo "::error::Required variable $var is missing"
               exit 1
             fi
           done
-          
-          echo "✓ KAGGLE_USERNAME: ${KAGGLE_USERNAME}"
-          echo "✓ SESSION_ID: ${SESSION_ID}"
-          echo "✓ API_URL: ${API_URL}"
-          echo "::endgroup::"
+          echo "✓ All variables validated"
 
-      - name: Cleanup existing kernel (if any)
+      - name: Cleanup existing kernel
         shell: bash
         continue-on-error: true
         run: |
           set +e
           KERNEL="${KAGGLE_USERNAME}/${KERNEL_NAME}"
           echo "Checking for existing kernel: $KERNEL"
-          
-          # Try to delete existing kernel to avoid conflicts
           kaggle kernels delete -y "$KERNEL" 2>/dev/null
           if [ $? -eq 0 ]; then
             echo "✓ Cleaned up existing kernel"
             sleep 3
-          else
-            echo "ℹ No existing kernel found (or cannot delete)"
           fi
 
       - name: Prepare Kaggle worker package
@@ -88,14 +71,12 @@ jobs:
           rm -rf kaggle_session
           mkdir -p kaggle_session
 
-          # Copy worker script
           if [ ! -f "worker.py" ]; then
             echo "::error::worker.py not found in repository root"
             exit 1
           fi
           cp worker.py kaggle_session/script.py
 
-          # Create config.json (sensitive data)
           cat > kaggle_session/config.json <<EOF
           {
             "api_url": "${API_URL}",
@@ -105,7 +86,6 @@ jobs:
           }
           EOF
 
-          # Create kernel metadata
           cat > kaggle_session/kernel-metadata.json <<EOF
           {
             "id": "${KAGGLE_USERNAME}/${KERNEL_NAME}",
@@ -123,22 +103,17 @@ jobs:
           }
           EOF
 
-          echo "::group::Package Contents"
           echo "--- config.json ---"
-          cat kaggle_session/config.json | python -m json.tool
+          cat kaggle_session/config.json
           echo "--- kernel-metadata.json ---"
-          cat kaggle_session/kernel-metadata.json | python -m json.tool
-          echo "::endgroup::"
+          cat kaggle_session/kernel-metadata.json
 
       - name: Push Kaggle GPU worker
         shell: bash
         run: |
           set -e
-          echo "::group::Pushing to Kaggle"
           kaggle kernels push -p kaggle_session
-          echo "::endgroup::"
-          
-          echo "✓ Kaggle worker submitted successfully"
+          echo "✓ Kaggle worker submitted"
 
       - name: Wait for kernel to start
         shell: bash
@@ -146,70 +121,50 @@ jobs:
           set +e
           KERNEL="${KAGGLE_USERNAME}/${KERNEL_NAME}"
           
-          echo "::group::Waiting for Kaggle Kernel"
-          echo "Kernel: $KERNEL"
+          echo "Waiting for Kaggle Kernel: $KERNEL"
           
           for i in $(seq 1 72); do
             STATUS_OUTPUT="$(kaggle kernels status "$KERNEL" 2>&1)"
             echo "[$i/72] $STATUS_OUTPUT"
             
-            # Extract status using Python for reliability
-            STATUS=$(echo "$STATUS_OUTPUT" | python3 -c "
-            import sys, re
-            line = sys.stdin.read()
-            match = re.search(r'has status \"([^\"]+)\"', line)
-            if match:
-                print(match.group(1))
-            else:
-                print('UNKNOWN')
-            ")
+            # Check for RUNNING (case insensitive)
+            if echo "$STATUS_OUTPUT" | grep -qi "RUNNING"; then
+              echo ""
+              echo "✅ KAGGLE KERNEL IS RUNNING!"
+              exit 0
+            fi
             
-            case "$STATUS" in
-              *"RUNNING"*)
-                echo ""
-                echo "✅ KAGGLE KERNEL IS RUNNING!"
-                echo "Worker is alive and connecting to API..."
-                echo "::endgroup::"
-                exit 0
-                ;;
-              *"ERROR"* | *"FAILED"*)
-                echo ""
-                echo "::error::KAGGLE KERNEL FAILED: $STATUS"
-                echo "::endgroup::"
-                exit 1
-                ;;
-              *"CANCEL"*)
-                echo ""
-                echo "::error::KAGGLE KERNEL CANCELLED: $STATUS"
-                echo "::endgroup::"
-                exit 1
-                ;;
-            esac
+            # Check for failure states
+            if echo "$STATUS_OUTPUT" | grep -qi "ERROR"; then
+              echo "::error::KAGGLE KERNEL ERROR"
+              exit 1
+            fi
             
+            if echo "$STATUS_OUTPUT" | grep -qi "FAILED"; then
+              echo "::error::KAGGLE KERNEL FAILED"
+              exit 1
+            fi
+            
+            if echo "$STATUS_OUTPUT" | grep -qi "CANCEL"; then
+              echo "::error::KAGGLE KERNEL CANCELLED"
+              exit 1
+            fi
+            
+            # 404 in early iterations is normal (kernel not yet created)
             sleep 5
           done
           
-          echo ""
           echo "::warning::Timeout waiting for kernel to start, but it may still be starting..."
-          echo "::endgroup::"
           exit 0
 
       - name: Final status
         if: always()
         shell: bash
         run: |
-          echo ""
           echo "======================================"
           echo "GPU SESSION STATUS"
           echo "======================================"
           echo "SESSION_ID: $SESSION_ID"
           echo "API_URL: $API_URL"
           echo "KERNEL: ${KAGGLE_USERNAME}/${KERNEL_NAME}"
-          echo ""
-          
-          if [ "${{ job.status }}" == "success" ]; then
-            echo "✅ The Kaggle worker is running independently."
-            echo "It will connect to the API and stay alive until the session expires."
-          else
-            echo "❌ Workflow failed. Check logs above."
-          fi
+          echo "STATUS: ${{ job.status }}"
