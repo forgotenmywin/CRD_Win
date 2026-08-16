@@ -343,7 +343,7 @@ try:
 
     from numba import cuda
 
-    @cuda.jit
+@cuda.jit
     def add_kernel(a, b, c):
         i = cuda.grid(1)
         if i < a.size:
@@ -428,6 +428,10 @@ try:
         time.sleep(1)
         iteration += 1
 
+        # Keep stdout active so Kaggle doesn't kill us
+        if iteration % 10 == 0:
+            print(f"[{iteration}s] Worker alive, waiting for commands...", flush=True)
+
         if iteration % 60 == 0:
             hb = api_call("POST", f"/gpu/session/{SESSION_ID}/heartbeat")
             if hb and hb.status_code == 410:
@@ -465,7 +469,6 @@ try:
                                         "error": f"Unknown operation: {op}",
                                         "available_operations": list(BUILTIN_OPS.keys())
                                     }
-
                         except Exception as exec_err:
                             cmd_result = {
                                 "status": "error",
