@@ -69,10 +69,8 @@ jobs:
           rm -rf kaggle_session
           mkdir -p kaggle_session
 
-          # Copy worker script
           cp worker.py kaggle_session/script.py
 
-          # Create config file (worker.py reads this instead of env vars)
           cat > kaggle_session/config.json <<EOF
           {"api_url":"${API_URL}","session_id":"${SESSION_ID}","worker_token":"${WORKER_TOKEN}"}
           EOF
@@ -113,7 +111,7 @@ jobs:
           kaggle kernels push -p kaggle_session
           echo ""
           echo "Kaggle worker submitted."
-      - name: Wait for Kaggle
+      - name: Wait for Kaggle to start
         shell: bash
         run: |
           set +e
@@ -121,110 +119,47 @@ jobs:
 
           echo ""
           echo "======================================"
-          echo "WAITING FOR KAGGLE"
+          echo "WAITING FOR KAGGLE TO START"
           echo "======================================"
           echo "Kernel: $KERNEL"
 
-          FINAL_STATUS="UNKNOWN"
-          for i in $(seq 1 240); do
-            echo ""
-            echo "======================================"
-            echo "CHECK $i/240"
-            echo "======================================"
-
+          for i in $(seq 1 60); do
             STATUS="$(kaggle kernels status "$KERNEL" 2>&1)"
-            echo "$STATUS"
+            echo "[$i/60] $STATUS"
 
-            if echo "$STATUS" | grep -qi "complete"; then
-              FINAL_STATUS="COMPLETE"
+            if echo "$STATUS" | grep -qi "running"; then
               echo ""
-              echo "KAGGLE WORKER COMPLETE"
-              break
+              echo "KAGGLE KERNEL IS RUNNING!"
+              echo "Worker is alive on Kaggle and connecting to API..."
+              exit 0
             fi
 
             if echo "$STATUS" | grep -qi "error"; then
-              FINAL_STATUS="ERROR"
-              echo ""
-              echo "KAGGLE WORKER ERROR"
-              break
+              echo "KAGGLE KERNEL ERROR"
+              exit 1
             fi
 
             if echo "$STATUS" | grep -qi "cancel"; then
-              FINAL_STATUS="CANCELLED"
-              echo ""
-              echo "KAGGLE WORKER CANCELLED"
-              break
+              echo "KAGGLE KERNEL CANCELLED"
+              exit 1
             fi
 
             sleep 5
           done
 
-          echo ""
-          echo "======================================"
-          echo "FINAL STATUS"
-          echo "======================================"
-          echo "$FINAL_STATUS"
-
-          rm -rf final_output
-          mkdir -p final_output
-
-          echo ""
-          echo "======================================"
-          echo "DOWNLOADING KAGGLE OUTPUT"
-          echo "======================================"
-          kaggle kernels output "$KERNEL" -p final_output -o || echo "Warning: output download failed"
-
-          echo ""
-          echo "======================================"
-          echo "FILES"
-          echo "======================================"
-          find final_output -type f -print 2>/dev/null || echo "No files found"
-
-          echo ""
-          echo "======================================"
-          echo "SESSION RESULT"
-          echo "======================================"
-          if [ -f "final_output/session_result.json" ]; then
-            cat final_output/session_result.json
-          else
-            echo "session_result.json not found"
-          fi
-
-          echo ""
-          echo "======================================"
-          echo "KAGGLE LOG"
-          echo "======================================"
-          LOG_FILE="final_output/gpu-session-${SESSION_ID}.log"
-          kaggle kernels logs "$KERNEL" > "$LOG_FILE" 2>&1 || echo "Warning: log download failed"
-
-          echo ""
-          echo "Log saved to: $LOG_FILE"
-          echo ""
-          echo "======================================"
-          echo "LAST 200 LOG LINES"
-          echo "======================================"
-          tail -n 200 "$LOG_FILE" 2>/dev/null || true
-
-          echo ""
-          echo "Kaggle worker finished."
-      - name: Upload GPU results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gpu-session-${{ inputs.session_id }}
-          path: final_output/
-          if-no-files-found: warn
+          echo "Timeout waiting for kernel to start, but it may still be starting..."
+          exit 0
       - name: Final
         if: always()
         shell: bash
         run: |
           echo ""
           echo "======================================"
-          echo "GPU SESSION FINISHED"
+          echo "GPU SESSION STARTED"
           echo "======================================"
           echo ""
           echo "SESSION_ID: $SESSION_ID"
-          echo ""
           echo "API_URL: $API_URL"
           echo ""
-          echo "WORKER: Kaggle GPU worker"
+          echo "The Kaggle worker is now running independently."
+          echo "It will connect to the API and stay alive until the session expires."
