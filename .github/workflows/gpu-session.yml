@@ -5,6 +5,7 @@ run-name: GPU-SESSION-${{ inputs.session_id }}
 on:
   workflow_dispatch:
     inputs:
+
       session_id:
         description: "GPU Session ID"
         required: true
@@ -30,7 +31,9 @@ jobs:
     timeout-minutes: 35
 
     env:
+
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
 
       SESSION_ID: ${{ inputs.session_id }}
@@ -61,15 +64,22 @@ jobs:
 
 
       # ======================================================
-      # DEPENDENCIES
+      # INSTALL
       # ======================================================
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install kaggle requests
 
+          python -m pip install --upgrade pip
+
+          python -m pip install \
+            kaggle \
+            requests
+
+          echo "Python:"
           python --version
+
+          echo "Kaggle:"
           kaggle --version
 
 
@@ -82,38 +92,23 @@ jobs:
 
           set -e
 
-          if [ -z "$KAGGLE_USERNAME" ]; then
-            echo "KAGGLE_USERNAME missing"
-            exit 1
-          fi
+          test -n "$KAGGLE_USERNAME"
+          test -n "$KAGGLE_API_TOKEN"
+          test -n "$SESSION_ID"
+          test -n "$API_URL"
+          test -n "$WORKER_TOKEN"
 
-          if [ -z "$KAGGLE_API_TOKEN" ]; then
-            echo "KAGGLE_API_TOKEN missing"
-            exit 1
-          fi
+          echo "All inputs exist."
 
-          if [ -z "$SESSION_ID" ]; then
-            echo "SESSION_ID missing"
-            exit 1
-          fi
+          echo "SESSION:"
+          echo "$SESSION_ID"
 
-          if [ -z "$API_URL" ]; then
-            echo "API_URL missing"
-            exit 1
-          fi
-
-          if [ -z "$WORKER_TOKEN" ]; then
-            echo "WORKER_TOKEN missing"
-            exit 1
-          fi
-
-          echo "Inputs OK"
-          echo "SESSION=$SESSION_ID"
-          echo "API=$API_URL"
+          echo "API:"
+          echo "$API_URL"
 
 
       # ======================================================
-      # BUILD KAGGLE KERNEL
+      # BUILD KERNEL
       # ======================================================
 
       - name: Build Kaggle kernel
@@ -121,93 +116,89 @@ jobs:
 
           set -e
 
+          rm -rf kaggle_session
+
           mkdir -p kaggle_session
 
-          cp worker.py kaggle_session/script.py
 
-
-          # --------------------------------------------------
-          # Inject API URL
-          # --------------------------------------------------
-
-          sed -i \
-            "s|%%API_URL%%|${API_URL}|g" \
+          cp worker.py \
             kaggle_session/script.py
 
 
           # --------------------------------------------------
-          # Inject session ID
+          # Inject values
           # --------------------------------------------------
 
-          sed -i \
-            "s|%%SESSION_ID%%|${SESSION_ID}|g" \
-            kaggle_session/script.py
+          python - <<'PY'
 
+          import os
+          from pathlib import Path
 
-          # --------------------------------------------------
-          # Inject worker token
-          # --------------------------------------------------
+          p = Path("kaggle_session/script.py")
 
-          sed -i \
-            "s|%%WORKER_TOKEN%%|${WORKER_TOKEN}|g" \
-            kaggle_session/script.py
+          text = p.read_text()
+
+          replacements = {
+              "%%API_URL%%": os.environ["API_URL"],
+              "%%SESSION_ID%%": os.environ["SESSION_ID"],
+              "%%WORKER_TOKEN%%": os.environ["WORKER_TOKEN"],
+          }
+
+          for old, new in replacements.items():
+              text = text.replace(old, new)
+
+          p.write_text(text)
+
+          PY
 
 
           # --------------------------------------------------
           # Metadata
           # --------------------------------------------------
 
-          jq -n \
-            --arg username "$KAGGLE_USERNAME" \
-            --arg session "$SESSION_ID" \
-            '{
-              id:
-                ($username
-                + "/gpu-session-"
-                + $session),
-
-              title:
-                ("GPU Session "
-                + $session),
-
-              code_file:
-                "script.py",
-
-              language:
-                "python",
-
-              kernel_type:
-                "script",
-
-              is_private:
-                true,
-
-              enable_gpu:
-                true,
-
-              enable_tpu:
-                false,
-
-              enable_internet:
-                true
-            }' \
-            > kaggle_session/kernel-metadata.json
+          cat > kaggle_session/kernel-metadata.json <<EOF
+          {
+            "id": "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}",
+            "title": "GPU Session ${SESSION_ID}",
+            "code_file": "script.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": true,
+            "enable_gpu": true,
+            "enable_tpu": false,
+            "enable_internet": true
+          }
+          EOF
 
 
-          echo "===== METADATA ====="
+          echo ""
+          echo "========================================"
+          echo "KERNEL METADATA"
+          echo "========================================"
 
-          cat \
-            kaggle_session/kernel-metadata.json
+          cat kaggle_session/kernel-metadata.json
 
 
-          echo "===== SCRIPT HEAD ====="
+          echo ""
+          echo "========================================"
+          echo "SCRIPT CHECK"
+          echo "========================================"
+
+          python -m py_compile \
+            kaggle_session/script.py
+
+          echo "Python syntax OK."
+
+
+          echo ""
+          echo "First lines:"
 
           head -20 \
             kaggle_session/script.py
 
 
       # ======================================================
-      # PUSH KERNEL
+      # PUSH
       # ======================================================
 
       - name: Push Kaggle kernel
@@ -215,51 +206,56 @@ jobs:
 
           set -e
 
+          echo "Pushing Kaggle kernel..."
+
           kaggle kernels push \
             -p kaggle_session
 
-          echo "Kaggle kernel submitted."
+          echo "Push command finished."
 
 
       # ======================================================
-      # WAIT FOR WORKER + KERNEL
+      # WAIT
       # ======================================================
 
-      - name: Wait for Kaggle worker
+      - name: Monitor Kaggle kernel
         run: |
 
           set +e
 
           KERNEL="${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
 
-          echo "Kernel: $KERNEL"
-          echo "API: $API_URL"
+          echo ""
+          echo "========================================"
+          echo "KERNEL"
+          echo "========================================"
 
+          echo "$KERNEL"
 
-          # --------------------------------------------------
-          # Give Kaggle time to register the run.
-          # --------------------------------------------------
 
           echo ""
-          echo "Waiting 30 seconds..."
-          sleep 30
+          echo "Waiting for Kaggle registration..."
+
+          sleep 20
 
 
-          SEEN_ACTIVE=false
+          SEEN_RUNNING=false
           WORKER_READY=false
+
           FINAL="UNKNOWN"
 
 
-          # --------------------------------------------------
-          # 300 * 5 sec = 25 minutes
-          # --------------------------------------------------
+          # ==================================================
+          # MONITOR 20 MINUTES
+          # ==================================================
 
-          for i in $(seq 1 300); do
+          for i in $(seq 1 240); do
 
             echo ""
-            echo "================================================"
-            echo "ITERATION $i / 300"
-            echo "================================================"
+            echo ""
+            echo "########################################"
+            echo "CHECK $i / 240"
+            echo "########################################"
 
 
             # =================================================
@@ -270,52 +266,51 @@ jobs:
               kaggle kernels status "$KERNEL" 2>&1
             )"
 
-            echo "--- KAGGLE STATUS ---"
+            STATUS_RC=$?
+
+
+            echo ""
+            echo "===== KAGGLE STATUS ====="
+
             echo "$STATUS_OUTPUT"
 
-
-            # -------------------------------------------------
-            # Detect active state.
-            # -------------------------------------------------
-
-            if echo "$STATUS_OUTPUT" | grep -qiE \
-              "queued|running"; then
-
-              SEEN_ACTIVE=true
-
-            fi
+            echo ""
+            echo "Kaggle status exit code: $STATUS_RC"
 
 
             # =================================================
             # RAILWAY STATUS
             # =================================================
 
-            API_STATUS="$(
-              curl -fsS \
+            echo ""
+            echo "===== RAILWAY ====="
+
+
+            RAILWAY_STATUS="$(
+              curl \
+                -sS \
                 --max-time 15 \
                 "${API_URL}/gpu/session/${SESSION_ID}" \
-                2>/dev/null
+                2>&1
             )"
 
 
-            echo "--- RAILWAY STATUS ---"
-            echo "$API_STATUS"
+            echo "$RAILWAY_STATUS"
 
 
-            # -------------------------------------------------
-            # Worker became active.
-            # -------------------------------------------------
+            # =================================================
+            # CHECK WORKER READY
+            # =================================================
 
-            if echo "$API_STATUS" | grep -q \
+            if echo "$RAILWAY_STATUS" | grep -q \
               '"status":"active"'; then
 
               if [ "$WORKER_READY" = false ]; then
 
                 echo ""
-                echo "****************************************"
-                echo "GPU WORKER IS READY"
-                echo "****************************************"
-                echo ""
+                echo "########################################"
+                echo "# GPU WORKER READY                     #"
+                echo "########################################"
 
               fi
 
@@ -324,53 +319,56 @@ jobs:
             fi
 
 
-            # -------------------------------------------------
-            # Worker error
-            # -------------------------------------------------
+            # =================================================
+            # CHECK RUNNING
+            # =================================================
 
-            if echo "$API_STATUS" | grep -q \
-              '"status":"error"'; then
+            if echo "$STATUS_OUTPUT" | grep -qi \
+              "running"; then
 
-              echo ""
-              echo "GPU worker reported an error."
+              SEEN_RUNNING=true
 
-              FINAL="WORKER_ERROR"
-
-              break
+              echo "Kaggle kernel is RUNNING."
 
             fi
 
 
-            # -------------------------------------------------
-            # Session expired
-            # -------------------------------------------------
+            if echo "$STATUS_OUTPUT" | grep -qi \
+              "queued"; then
 
-            if echo "$API_STATUS" | grep -q \
-              '"status":"expired"'; then
-
-              echo ""
-              echo "GPU session expired."
-
-              FINAL="SESSION_EXPIRED"
-
-              break
+              echo "Kaggle kernel is QUEUED."
 
             fi
 
 
             # =================================================
-            # KERNEL FINISHED
+            # IF WORKER READY
             # =================================================
 
-            if [ "$SEEN_ACTIVE" = true ]; then
+            if [ "$WORKER_READY" = true ]; then
+
+              echo ""
+              echo "Worker is alive."
+
+              # Do NOT stop monitoring.
+              # Worker needs this GitHub job alive.
+
+            fi
+
+
+            # =================================================
+            # EXPLICIT KERNEL COMPLETION
+            # =================================================
+
+            if [ "$SEEN_RUNNING" = true ]; then
 
               if echo "$STATUS_OUTPUT" | grep -qi \
                 "complete"; then
 
-                FINAL="COMPLETE"
-
                 echo ""
                 echo "Kaggle kernel completed."
+
+                FINAL="COMPLETE"
 
                 break
 
@@ -380,16 +378,29 @@ jobs:
 
 
             # =================================================
-            # KERNEL ERROR
+            # EXPLICIT ERROR
             # =================================================
 
-            if echo "$STATUS_OUTPUT" | grep -qiE \
-              "error|failed"; then
-
-              FINAL="ERROR"
+            if echo "$STATUS_OUTPUT" | grep -qi \
+              "error"; then
 
               echo ""
-              echo "Kaggle kernel failed."
+              echo "KAGGLE REPORTED ERROR."
+
+
+              echo ""
+              echo "========================================"
+              echo "KERNEL LOGS"
+              echo "========================================"
+
+
+              kaggle kernels logs \
+                "$KERNEL" \
+                2>&1 \
+                | tail -n 300
+
+
+              FINAL="ERROR"
 
               break
 
@@ -397,11 +408,14 @@ jobs:
 
 
             # =================================================
-            # CANCELLED
+            # EXPLICIT CANCEL
             # =================================================
 
             if echo "$STATUS_OUTPUT" | grep -qi \
               "cancel"; then
+
+              echo ""
+              echo "Kaggle kernel cancelled."
 
               FINAL="CANCELLED"
 
@@ -415,9 +429,9 @@ jobs:
           done
 
 
-          # ====================================================
-          # FINAL STATUS
-          # ====================================================
+          # ==================================================
+          # FINAL
+          # ==================================================
 
           if [ "$FINAL" = "UNKNOWN" ]; then
 
@@ -427,79 +441,102 @@ jobs:
 
 
           echo ""
-          echo "============================================"
-          echo "FINAL STATUS: $FINAL"
-          echo "WORKER READY: $WORKER_READY"
-          echo "============================================"
+          echo ""
+          echo "========================================"
+          echo "FINAL"
+          echo "========================================"
+
+          echo "FINAL=$FINAL"
+
+          echo "WORKER_READY=$WORKER_READY"
+
+          echo "SEEN_RUNNING=$SEEN_RUNNING"
 
 
-          # ====================================================
-          # DOWNLOAD OUTPUT
-          # ====================================================
+          # ==================================================
+          # ALWAYS TRY LOGS
+          # ==================================================
 
           mkdir -p final_output
+
+
+          echo ""
+          echo "========================================"
+          echo "FINAL KAGGLE LOG"
+          echo "========================================"
+
+
+          kaggle kernels logs \
+            "$KERNEL" \
+            > final_output/worker.log \
+            2>&1
+
+
+          LOG_RC=$?
+
+
+          echo "logs exit code: $LOG_RC"
+
+
+          tail -n 300 \
+            final_output/worker.log
+
+
+          # ==================================================
+          # OUTPUT
+          # ==================================================
+
+          echo ""
+          echo "========================================"
+          echo "KAGGLE OUTPUT"
+          echo "========================================"
 
 
           kaggle kernels output \
             "$KERNEL" \
             -p final_output \
             -o \
-            || echo "Output download failed."
+            2>&1
 
 
-          # ====================================================
-          # WORKER RESULT
-          # ====================================================
+          OUTPUT_RC=$?
+
+
+          echo ""
+          echo "output exit code: $OUTPUT_RC"
+
+
+          # ==================================================
+          # SESSION RESULT
+          # ==================================================
 
           if [ -f final_output/session_result.json ]; then
 
             echo ""
-            echo "===== session_result.json ====="
+            echo "========================================"
+            echo "SESSION RESULT"
+            echo "========================================"
 
-            cat \
-              final_output/session_result.json
+            cat final_output/session_result.json
 
           else
 
             echo ""
-            echo "session_result.json not found"
+            echo "No session_result.json."
 
           fi
 
 
-          # ====================================================
-          # KERNEL LOGS
-          # ====================================================
-
-          LOG="final_output/worker.log"
-
-          kaggle kernels logs \
-            "$KERNEL" \
-            > "$LOG" \
-            2>&1 \
-            || true
-
-
-          echo ""
-          echo "===== LAST 200 LOG LINES ====="
-
-          tail -n 200 "$LOG" \
-            || true
-
-
-          # ====================================================
-          # FAIL GITHUB IF NECESSARY
-          # ====================================================
+          # ==================================================
+          # FAIL ONLY AFTER LOGGING EVERYTHING
+          # ==================================================
 
           if [ "$FINAL" = "ERROR" ]; then
             exit 1
           fi
 
-          if [ "$FINAL" = "WORKER_ERROR" ]; then
-            exit 1
-          fi
 
-          if [ "$FINAL" = "SESSION_EXPIRED" ]; then
+          if [ "$FINAL" = "CANCELLED" ]; then
             exit 1
           fi
 
