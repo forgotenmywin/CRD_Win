@@ -423,10 +423,10 @@ try:
         print("WARNING: API did not acknowledge worker-ready.")
 
     print("\nKeeping GPU worker alive and polling for commands...")
-    for i in range(600):
+    for i in range(3600):  # 1 hour = 3600 seconds
         time.sleep(1)
 
-        if i % 30 == 0 and i > 0:
+        if i % 60 == 0 and i > 0:  # heartbeat every 60 seconds
             hb = api_call("POST", f"/gpu/session/{SESSION_ID}/heartbeat")
             if hb and hb.status_code == 410:
                 print("Session expired according to API. Exiting.")
