@@ -69,17 +69,19 @@ jobs:
           rm -rf kaggle_session
           mkdir -p kaggle_session
 
-          # Embed API_URL, SESSION_ID, WORKER_TOKEN into worker.py
-          sed -e 's|os.environ.get("API_URL", "").rstrip("/")|"'"${API_URL}"'".rstrip("/")|g' \
-              -e 's|os.environ.get("SESSION_ID", "")|"'"${SESSION_ID}"'"|g' \
-              -e 's|os.environ.get("WORKER_TOKEN", "")|"'"${WORKER_TOKEN}"'"|g' \
-              worker.py > kaggle_session/script.py
+          # Copy worker script
+          cp worker.py kaggle_session/script.py
+
+          # Create config file (worker.py reads this instead of env vars)
+          cat > kaggle_session/config.json <<EOF
+          {"api_url":"${API_URL}","session_id":"${SESSION_ID}","worker_token":"${WORKER_TOKEN}"}
+          EOF
 
           echo ""
           echo "======================================"
-          echo "GENERATED SCRIPT (first 30 lines)"
+          echo "CONFIG.JSON"
           echo "======================================"
-          head -30 kaggle_session/script.py
+          cat kaggle_session/config.json
 
           cat > kaggle_session/kernel-metadata.json <<EOF
           {
