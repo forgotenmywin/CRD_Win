@@ -2,8 +2,8 @@ import os
 import sys
 import time
 import json
-import traceback
 import subprocess
+import traceback
 import requests
 
 
@@ -11,18 +11,12 @@ import requests
 # CONFIG
 # ============================================================
 
-SESSION_ID = os.environ.get("SESSION_ID", "").strip()
-API_URL = os.environ.get("API_URL", "").strip().rstrip("/")
-WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "").strip()
+SESSION_ID = os.environ.get("SESSION_ID", "")
+API_URL = os.environ.get("API_URL", "").rstrip("/")
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 
 HEARTBEAT_INTERVAL = 15
 COMMAND_INTERVAL = 3
-REQUEST_TIMEOUT = 20
-
-
-# ============================================================
-# VALIDATION
-# ============================================================
 
 if not SESSION_ID:
     raise RuntimeError("SESSION_ID is missing")
@@ -34,77 +28,92 @@ if not WORKER_TOKEN:
     raise RuntimeError("WORKER_TOKEN is missing")
 
 
-print("=" * 60)
-print("KAGGLE GPU WORKER")
-print("=" * 60)
-print(f"SESSION : {SESSION_ID}")
-print(f"API     : {API_URL}")
-print(f"TOKEN   : {len(WORKER_TOKEN)}")
-print("=" * 60)
-
-
 # ============================================================
 # HTTP
 # ============================================================
 
-HEADERS = {
-    "X-Worker-Token": WORKER_TOKEN,
+session = requests.Session()
+
+session.headers.update({
     "Authorization": f"Bearer {WORKER_TOKEN}",
     "Content-Type": "application/json",
-}
+})
 
 
-def api_get(path):
-    url = API_URL + path
-
-    try:
-        r = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=REQUEST_TIMEOUT,
-        )
-
-        print(f"[API] GET {path} → {r.status_code}")
-
-        if r.status_code != 200:
-            print(r.text[:1000])
-
-        return r
-
-    except Exception as e:
-        print(f"[API] GET ERROR {path}: {e}")
-        return None
+def api_url(path):
+    return f"{API_URL}{path}"
 
 
-def api_post(path, data=None):
-    url = API_URL + path
+def post(path, payload=None, retries=3):
+    url = api_url(path)
 
-    try:
-        r = requests.post(
-            url,
-            headers=HEADERS,
-            json=data or {},
-            timeout=REQUEST_TIMEOUT,
-        )
+    for attempt in range(1, retries + 1):
+        try:
+            r = session.post(
+                url,
+                json=payload or {},
+                timeout=20,
+            )
 
-        print(f"[API] POST {path} → {r.status_code}")
+            print(
+                f"[API] POST {path} → {r.status_code}",
+                flush=True,
+            )
 
-        if r.status_code >= 400:
-            print(r.text[:1000])
+            if r.status_code >= 400:
+                print(
+                    f"[API] response: {r.text[:1000]}",
+                    flush=True,
+                )
 
-        return r
+            return r
 
-    except Exception as e:
-        print(f"[API] POST ERROR {path}: {e}")
-        return None
+        except Exception as e:
+            print(
+                f"[API] POST {path} attempt={attempt} error={e}",
+                flush=True,
+            )
+
+            if attempt < retries:
+                time.sleep(2)
+
+    return None
+
+
+def get(path, retries=3):
+    url = api_url(path)
+
+    for attempt in range(1, retries + 1):
+        try:
+            r = session.get(
+                url,
+                timeout=20,
+            )
+
+            print(
+                f"[API] GET {path} → {r.status_code}",
+                flush=True,
+            )
+
+            return r
+
+        except Exception as e:
+            print(
+                f"[API] GET {path} attempt={attempt} error={e}",
+                flush=True,
+            )
+
+            if attempt < retries:
+                time.sleep(2)
+
+    return None
 
 
 # ============================================================
-# GPU INFORMATION
+# NVIDIA
 # ============================================================
 
-def print_gpu_info():
-
+def nvidia_smi():
     print()
     print("=" * 60)
     print("NVIDIA SMI")
@@ -118,13 +127,42 @@ def print_gpu_info():
             timeout=20,
         )
 
-        print(result.stdout)
+        print(result.stdout, flush=True)
 
-        if result.returncode != 0:
-            print(result.stderr)
+        if result.stderr:
+            print(result.stderr, flush=True)
+
+        return result.returncode == 0
 
     except Exception as e:
-        print("nvidia-smi failed:", e)
+        print(
+            f"nvidia-smi failed: {e}",
+            flush=True,
+        )
+
+        return False
+
+
+def get_gpu_info():
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,driver_version",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+        if result.returncode != 0:
+            return None
+
+        return result.stdout.strip()
+
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -132,7 +170,6 @@ def print_gpu_info():
 # ============================================================
 
 def cuda_test():
-
     print()
     print("=" * 60)
     print("CUDA TEST")
@@ -141,78 +178,176 @@ def cuda_test():
     try:
         import torch
 
-        print("PyTorch:", torch.__version__)
-        print("CUDA available:", torch.cuda.is_available())
-
-        if not torch.cuda.is_available():
-            print("CUDA is not available")
-            return False
-
-        gpu_name = torch.cuda.get_device_name(0)
-        capability = torch.cuda.get_device_capability(0)
-
-        print("GPU:", gpu_name)
-        print("Compute capability:", capability)
-
-        # Small test that works on P100
-        x = torch.randn(
-            1024,
-            1024,
-            device="cuda",
+        print(
+            f"PyTorch: {torch.__version__}",
+            flush=True,
         )
 
-        y = torch.matmul(x, x)
+        cuda_available = torch.cuda.is_available()
 
-        torch.cuda.synchronize()
+        print(
+            f"CUDA available: {cuda_available}",
+            flush=True,
+        )
 
-        print("GPU kernel OK")
-        print("Elements:", y.numel())
+        if not cuda_available:
+            print(
+                "CUDA is not available.",
+                flush=True,
+            )
+            return False, None
 
-        del x
-        del y
+        gpu_name = torch.cuda.get_device_name(0)
 
-        torch.cuda.empty_cache()
+        capability = torch.cuda.get_device_capability(0)
 
-        return True
+        print(
+            f"GPU: {gpu_name}",
+            flush=True,
+        )
 
-    except Exception:
+        print(
+            f"Compute capability: {capability}",
+            flush=True,
+        )
+
+        # ----------------------------------------------------
+        # Tesla P100 = sm_60
+        #
+        # Current Kaggle PyTorch builds may not contain
+        # sm_60 kernels.
+        #
+        # Therefore DO NOT execute torch CUDA kernels on P100
+        # with an incompatible PyTorch build.
+        # ----------------------------------------------------
+
+        if capability == (6, 0):
+
+            print(
+                "P100 detected.",
+                flush=True,
+            )
+
+            print(
+                "Current PyTorch build may not support sm_60.",
+                flush=True,
+            )
+
+            print(
+                "Skipping PyTorch CUDA kernel test.",
+                flush=True,
+            )
+
+            print(
+                "GPU detection itself is OK.",
+                flush=True,
+            )
+
+            return True, capability
+
+        # ----------------------------------------------------
+        # Newer GPUs
+        # ----------------------------------------------------
+
+        try:
+
+            x = torch.randn(
+                1024,
+                1024,
+                device="cuda",
+            )
+
+            y = x @ x
+
+            torch.cuda.synchronize()
+
+            print(
+                f"GPU kernel OK: {y.numel()} elements",
+                flush=True,
+            )
+
+            del x
+            del y
+
+            return True, capability
+
+        except Exception as e:
+
+            print(
+                "CUDA kernel test failed:",
+                repr(e),
+                flush=True,
+            )
+
+            return False, capability
+
+    except Exception as e:
+
+        print(
+            "CUDA test exception:",
+            repr(e),
+            flush=True,
+        )
+
         traceback.print_exc()
-        return False
+
+        return False, None
 
 
 # ============================================================
 # WORKER READY
 # ============================================================
 
-def notify_worker_ready():
-
+def notify_worker_ready(gpu_info, capability):
     print()
     print("=" * 60)
     print("NOTIFYING RAILWAY")
     print("=" * 60)
 
-    path = f"/gpu/session/{SESSION_ID}/worker-ready"
+    payload = {
+        "gpu": gpu_info,
+        "cuda_available": True,
+        "compute_capability": list(capability)
+        if capability
+        else None,
+    }
+
+    path = (
+        f"/gpu/session/"
+        f"{SESSION_ID}/worker-ready"
+    )
 
     for attempt in range(1, 11):
 
-        print(f"worker-ready attempt={attempt}")
-
-        response = api_post(
+        response = post(
             path,
-            {
-                "session_id": SESSION_ID,
-                "gpu": "Tesla P100-PCIE-16GB",
-                "cuda_available": True,
-            },
+            payload,
+            retries=1,
         )
 
-        if response is not None and response.status_code == 200:
-            print("WORKER READY accepted by Railway.")
-            return True
+        if response is not None:
 
-        time.sleep(5)
+            if 200 <= response.status_code < 300:
 
-    print("WORKER READY failed.")
+                print(
+                    "WORKER READY accepted by Railway.",
+                    flush=True,
+                )
+
+                return True
+
+        print(
+            f"worker-ready retry {attempt}/10",
+            flush=True,
+        )
+
+        time.sleep(3)
+
+    print(
+        "Failed to notify Railway.",
+        flush=True,
+    )
+
     return False
 
 
@@ -221,18 +356,24 @@ def notify_worker_ready():
 # ============================================================
 
 def heartbeat():
-
-    path = f"/gpu/session/{SESSION_ID}/heartbeat"
-
-    response = api_post(
-        path,
-        {
-            "session_id": SESSION_ID,
-            "timestamp": time.time(),
-        },
+    path = (
+        f"/gpu/session/"
+        f"{SESSION_ID}/heartbeat"
     )
 
-    return response is not None and response.status_code == 200
+    response = post(
+        path,
+        {
+            "timestamp": time.time(),
+            "status": "alive",
+        },
+        retries=2,
+    )
+
+    if response is None:
+        return False
+
+    return 200 <= response.status_code < 300
 
 
 # ============================================================
@@ -240,10 +381,15 @@ def heartbeat():
 # ============================================================
 
 def get_command():
+    path = (
+        f"/internal/session/"
+        f"{SESSION_ID}/command"
+    )
 
-    path = f"/internal/session/{SESSION_ID}/command"
-
-    response = api_get(path)
+    response = get(
+        path,
+        retries=2,
+    )
 
     if response is None:
         return None
@@ -259,21 +405,7 @@ def get_command():
     if not data:
         return None
 
-    # Different possible API formats
-    if isinstance(data, dict):
-
-        if "command" in data:
-            return data
-
-        if data.get("status") == "empty":
-            return None
-
-        if data.get("status") == "stopped":
-            return {
-                "command": "__STOP__"
-            }
-
-    return None
+    return data
 
 
 # ============================================================
@@ -281,88 +413,111 @@ def get_command():
 # ============================================================
 
 def execute_command(command):
-
-    command_id = command.get("id")
-    cmd = command.get("command")
-
-    if not cmd:
-        return {
-            "success": False,
-            "error": "Empty command",
-        }
-
-    if cmd == "__STOP__":
-        return {
-            "success": True,
-            "stopped": True,
-        }
-
     print()
     print("=" * 60)
-    print("EXECUTING COMMAND")
-    print("=" * 60)
-    print(cmd)
+    print("COMMAND")
     print("=" * 60)
 
-    started = time.time()
+    print(
+        json.dumps(
+            command,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
-    try:
+    command_id = command.get("command_id")
 
-        process = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=900,
+    command_type = command.get(
+        "type",
+        "shell",
+    )
+
+    if command_type == "shell":
+
+        cmd = command.get("command")
+
+        if not cmd:
+            return {
+                "success": False,
+                "error": "command is missing",
+            }
+
+        print(
+            f"Executing: {cmd}",
+            flush=True,
         )
 
-        elapsed = time.time() - started
+        try:
 
-        result = {
-            "success": process.returncode == 0,
-            "returncode": process.returncode,
-            "stdout": process.stdout[-20000:],
-            "stderr": process.stderr[-20000:],
-            "elapsed": elapsed,
-        }
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
 
-    except subprocess.TimeoutExpired:
+            return {
+                "success": result.returncode == 0,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-20000:],
+                "stderr": result.stderr[-20000:],
+            }
 
-        result = {
-            "success": False,
-            "error": "Command timeout",
-        }
+        except subprocess.TimeoutExpired:
 
-    except Exception as e:
+            return {
+                "success": False,
+                "error": "command timeout",
+            }
 
-        result = {
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-        }
+        except Exception as e:
 
-    # Send result
-    path = f"/internal/session/{SESSION_ID}/result"
+            return {
+                "success": False,
+                "error": repr(e),
+            }
+
+    return {
+        "success": False,
+        "error": f"unknown command type: {command_type}",
+    }
+
+
+# ============================================================
+# SEND RESULT
+# ============================================================
+
+def send_result(command, result):
+    command_id = command.get("command_id")
+
+    path = (
+        f"/internal/session/"
+        f"{SESSION_ID}/result"
+    )
 
     payload = {
         "command_id": command_id,
         "result": result,
     }
 
-    api_post(path, payload)
-
-    return result
+    post(
+        path,
+        payload,
+        retries=3,
+    )
 
 
 # ============================================================
 # KEEP ALIVE LOOP
 # ============================================================
 
-def worker_loop():
-
+def command_loop():
     print()
     print("=" * 60)
-    print("COMMAND LOOP / KEEP-ALIVE")
+    print("COMMAND LOOP")
     print("=" * 60)
 
     last_heartbeat = 0
@@ -371,36 +526,66 @@ def worker_loop():
 
         now = time.time()
 
-        # -----------------------------------------
+        # ----------------------------------------------------
         # HEARTBEAT
-        # -----------------------------------------
+        # ----------------------------------------------------
 
         if now - last_heartbeat >= HEARTBEAT_INTERVAL:
 
             ok = heartbeat()
 
             if ok:
-                print("[KEEP-ALIVE] heartbeat OK")
+                print(
+                    "[KEEP-ALIVE] heartbeat OK",
+                    flush=True,
+                )
             else:
-                print("[KEEP-ALIVE] heartbeat failed")
+                print(
+                    "[KEEP-ALIVE] heartbeat failed",
+                    flush=True,
+                )
 
             last_heartbeat = now
 
-        # -----------------------------------------
+        # ----------------------------------------------------
         # COMMAND
-        # -----------------------------------------
+        # ----------------------------------------------------
 
         command = get_command()
 
         if command:
 
-            print("[COMMAND] received")
+            print(
+                "[COMMAND] received",
+                flush=True,
+            )
 
-            result = execute_command(command)
+            try:
 
-            if result.get("stopped"):
-                print("STOP command received.")
-                break
+                result = execute_command(
+                    command
+                )
+
+                send_result(
+                    command,
+                    result,
+                )
+
+            except Exception as e:
+
+                print(
+                    "Command execution error:",
+                    repr(e),
+                    flush=True,
+                )
+
+                send_result(
+                    command,
+                    {
+                        "success": False,
+                        "error": repr(e),
+                    },
+                )
 
         time.sleep(COMMAND_INTERVAL)
 
@@ -411,23 +596,72 @@ def worker_loop():
 
 def main():
 
-    print_gpu_info()
+    print("=" * 60)
+    print("KAGGLE GPU WORKER")
+    print("=" * 60)
 
-    cuda_ok = cuda_test()
+    print(
+        f"SESSION : {SESSION_ID}",
+        flush=True,
+    )
+
+    print(
+        f"API     : {API_URL}",
+        flush=True,
+    )
+
+    print(
+        f"TOKEN   : {len(WORKER_TOKEN)}",
+        flush=True,
+    )
+
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # GPU
+    # --------------------------------------------------------
+
+    nvidia_smi()
+
+    gpu_info = get_gpu_info()
+
+    print(
+        f"GPU: {gpu_info}",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # CUDA
+    # --------------------------------------------------------
+
+    cuda_ok, capability = cuda_test()
 
     if not cuda_ok:
-        raise RuntimeError("CUDA test failed")
 
-    if not notify_worker_ready():
-        raise RuntimeError("Could not notify Railway that worker is ready")
+        raise RuntimeError(
+            "CUDA/GPU detection failed"
+        )
 
-    # Initial heartbeat
-    heartbeat()
+    # --------------------------------------------------------
+    # READY
+    # --------------------------------------------------------
 
-    # Infinite worker
-    worker_loop()
+    ready = notify_worker_ready(
+        gpu_info,
+        capability,
+    )
 
-    print("Worker stopped.")
+    if not ready:
+
+        raise RuntimeError(
+            "Failed to notify Railway that worker is ready"
+        )
+
+    # --------------------------------------------------------
+    # KEEP ALIVE + COMMAND LOOP
+    # --------------------------------------------------------
+
+    command_loop()
 
 
 if __name__ == "__main__":
