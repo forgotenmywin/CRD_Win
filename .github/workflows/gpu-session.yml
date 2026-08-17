@@ -4,285 +4,121 @@ on:
   workflow_dispatch:
     inputs:
       session_id:
-        description: "GPU Session ID"
+        description: "GPU session ID"
         required: true
         type: string
-
       api_url:
         description: "Railway API URL"
         required: true
         type: string
-
       worker_token:
-        description: "Worker authentication token"
+        description: "Worker token"
         required: true
         type: string
 
-
 jobs:
-
   gpu-session:
-
     runs-on: ubuntu-latest
-
-    timeout-minutes: 25
+    timeout-minutes: 10
 
     env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+
       SESSION_ID: ${{ inputs.session_id }}
       API_URL: ${{ inputs.api_url }}
       WORKER_TOKEN: ${{ inputs.worker_token }}
 
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-
-
     steps:
-
-      # ======================================================
-      # CHECKOUT
-      # ======================================================
-
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-
-      # ======================================================
-      # PYTHON
-      # ======================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-
-      # ======================================================
-      # INSTALL
-      # ======================================================
-
       - name: Install dependencies
-        shell: bash
         run: |
-          set -e
-
           python -m pip install --upgrade pip
+          pip install kaggle requests
 
-          python -m pip install \
-            kaggle \
-            requests
-
-
-      # ======================================================
-      # VALIDATE
-      # ======================================================
-
-      - name: Validate
+      - name: Check configuration
         shell: bash
         run: |
           set -e
 
           echo "========================================"
-          echo "VALIDATION"
+          echo "CHECKING CONFIGURATION"
           echo "========================================"
 
-          if [ -z "${SESSION_ID}" ]; then
-            echo "ERROR: SESSION_ID missing"
-            exit 1
-          fi
+          echo "SESSION_ID=$SESSION_ID"
+          echo "API_URL=$API_URL"
+          echo "WORKER_TOKEN length=${#WORKER_TOKEN}"
 
-          if [ -z "${API_URL}" ]; then
-            echo "ERROR: API_URL missing"
-            exit 1
-          fi
+          test -n "$SESSION_ID"
+          test -n "$API_URL"
+          test -n "$WORKER_TOKEN"
 
-          if [ -z "${WORKER_TOKEN}" ]; then
-            echo "ERROR: WORKER_TOKEN missing"
-            exit 1
-          fi
-
-          if [ -z "${KAGGLE_USERNAME}" ]; then
-            echo "ERROR: KAGGLE_USERNAME missing"
-            exit 1
-          fi
-
-          if [ -z "${KAGGLE_API_TOKEN}" ]; then
-            echo "ERROR: KAGGLE_API_TOKEN missing"
-            exit 1
-          fi
-
-          if [ ! -f "kaggle_worker.py" ]; then
-            echo "ERROR: kaggle_worker.py missing"
-            exit 1
-          fi
-
-          echo "SESSION_ID: ${SESSION_ID}"
-          echo "API_URL: ${API_URL}"
-          echo "WORKER_TOKEN: SET"
-          echo "KAGGLE_USERNAME: ${KAGGLE_USERNAME}"
-
-          echo "Validation OK."
-
-
-      # ======================================================
-      # BUILD FINAL KAGGLE SCRIPT
-      # ======================================================
-
-      - name: Build final Kaggle script
+      - name: Build Kaggle worker
         shell: bash
         run: |
           set -e
 
           echo "========================================"
-          echo "BUILDING FINAL KAGGLE SCRIPT"
+          echo "BUILDING KAGGLE WORKER"
           echo "========================================"
 
-          rm -rf kaggle_upload
+          mkdir -p kaggle_build
 
-          mkdir -p kaggle_upload
-
+          cp kaggle_worker.py kaggle_build/script.py
 
           python - <<'PY'
           from pathlib import Path
           import os
 
-          session_id = os.environ["SESSION_ID"]
-          api_url = os.environ["API_URL"].rstrip("/")
-          worker_token = os.environ["WORKER_TOKEN"]
+          path = Path("kaggle_build/script.py")
+          text = path.read_text()
 
-          source = Path(
-              "kaggle_worker.py"
-          ).read_text(
-              encoding="utf-8"
-          )
+          replacements = {
+              "__SESSION_ID__": os.environ["SESSION_ID"],
+              "__API_URL__": os.environ["API_URL"],
+              "__WORKER_TOKEN__": os.environ["WORKER_TOKEN"],
+          }
 
+          for old, new in replacements.items():
+              text = text.replace(old, new)
 
-          # --------------------------------------------------
-          # REAL Python literals.
-          #
-          # No ${SESSION_ID}
-          # No shell interpolation
-          # No config.py
-          # --------------------------------------------------
+          path.write_text(text)
 
-          header = (
-              "# GENERATED RUNTIME CONFIG\n"
-              f"SESSION_ID = {session_id!r}\n"
-              f"API_URL = {api_url!r}\n"
-              f"WORKER_TOKEN = {worker_token!r}\n\n"
-              "# GENERATED WORKER SOURCE\n\n"
-          )
-
-
-          final_script = (
-              header
-              + source
-          )
-
-
-          output = Path(
-              "kaggle_upload/script.py"
-          )
-
-
-          output.write_text(
-              final_script,
-              encoding="utf-8"
-          )
-
-
-          # --------------------------------------------------
-          # Verify the REAL values.
-          # --------------------------------------------------
-
-          if session_id not in final_script:
-              raise RuntimeError(
-                  "Session ID was not written"
-              )
-
-
-          if api_url not in final_script:
-              raise RuntimeError(
-                  "API URL was not written"
-              )
-
-
-          if worker_token not in final_script:
-              raise RuntimeError(
-                  "Worker token was not written"
-              )
-
-
-          if "${SESSION_ID}" in final_script:
-              raise RuntimeError(
-                  "Shell SESSION_ID placeholder remains"
-              )
-
-
-          if "${API_URL}" in final_script:
-              raise RuntimeError(
-                  "Shell API_URL placeholder remains"
-              )
-
-
-          if "${WORKER_TOKEN}" in final_script:
-              raise RuntimeError(
-                  "Shell WORKER_TOKEN placeholder remains"
-              )
-
-
-          print(
-              "Final script generated."
-          )
-
-          print(
-              "SESSION_ID injected: YES"
-          )
-
-          print(
-              "API_URL injected: YES"
-          )
-
-          print(
-              "WORKER_TOKEN injected: YES"
-          )
-
+          print("Worker generated.")
+          print("SESSION_ID injected:", "__SESSION_ID__" not in text)
+          print("API_URL injected:", "__API_URL__" not in text)
+          print("TOKEN injected:", "__WORKER_TOKEN__" not in text)
           PY
 
+          echo
+          echo "========================================"
+          echo "VALIDATING INJECTION"
+          echo "========================================"
 
-          # --------------------------------------------------
-          # Syntax check
-          # --------------------------------------------------
+          if grep -qE '__SESSION_ID__|__API_URL__|__WORKER_TOKEN__' kaggle_build/script.py; then
+            echo "ERROR: Placeholder remains!"
+            exit 1
+          fi
 
-          python -m py_compile \
-            kaggle_upload/script.py
-
-
-          echo "Python syntax OK."
-
-
-          # --------------------------------------------------
-          # Show first lines WITHOUT token.
-          # --------------------------------------------------
+          echo "All placeholders replaced."
 
           echo
-          echo "Generated worker:"
-
-          sed -n '1,8p' \
-            kaggle_upload/script.py \
-            | sed \
-              's/^WORKER_TOKEN = .*/WORKER_TOKEN = "***"/'
-
-
-      # ======================================================
-      # KAGGLE METADATA
-      # ======================================================
+          echo "FIRST 20 LINES:"
+          sed -n '1,20p' kaggle_build/script.py
 
       - name: Create Kaggle metadata
         shell: bash
         run: |
           set -e
 
-          cat > kaggle_upload/kernel-metadata.json <<EOF
+          cat > kaggle_build/kernel-metadata.json <<EOF
           {
             "id": "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}",
             "title": "GPU Session ${SESSION_ID}",
@@ -291,19 +127,11 @@ jobs:
             "kernel_type": "script",
             "is_private": true,
             "enable_gpu": true,
-            "enable_tpu": false,
             "enable_internet": true
           }
           EOF
 
-
-          echo "Kaggle metadata:"
-          cat kaggle_upload/kernel-metadata.json
-
-
-      # ======================================================
-      # PUSH KAGGLE
-      # ======================================================
+          cat kaggle_build/kernel-metadata.json
 
       - name: Push Kaggle GPU worker
         shell: bash
@@ -311,226 +139,49 @@ jobs:
           set -e
 
           echo "========================================"
-          echo "PUSHING KAGGLE GPU WORKER"
+          echo "STARTING KAGGLE GPU"
           echo "========================================"
-
-          export KAGGLE_API_TOKEN="${KAGGLE_API_TOKEN}"
 
           kaggle kernels push \
-            -p kaggle_upload
+            -p kaggle_build
 
           echo
-          echo "Kaggle worker submitted."
+          echo "KAGGLE WORKER STARTED"
 
-
-      # ======================================================
-      # WAIT FOR READY
-      # ======================================================
-
-      - name: Wait for worker
+      - name: Monitor Railway session
         shell: bash
         run: |
           set +e
 
           echo "========================================"
-          echo "WAITING FOR WORKER"
+          echo "MONITORING WORKER"
           echo "========================================"
 
-          STATUS_URL="${API_URL}/gpu/session/${SESSION_ID}"
+          for i in $(seq 1 150); do
 
-          echo "${STATUS_URL}"
+            RESPONSE=$(curl -sS \
+              --max-time 10 \
+              "${API_URL}/gpu/session/${SESSION_ID}" 2>/dev/null)
 
+            echo "[$((i * 2))s]"
+            echo "$RESPONSE"
 
-          for i in $(seq 1 240); do
-
-            echo
-            echo "CHECK ${i} / 240"
-
-            RESPONSE=$(curl \
-              -sS \
-              --max-time 15 \
-              "${STATUS_URL}")
-
-
-            if [ $? -ne 0 ]; then
-
-              echo "Railway request failed."
-
-              sleep 5
-
-              continue
-
-            fi
-
-
-            echo "${RESPONSE}"
-
-
-            STATUS=$(echo "${RESPONSE}" | \
-              python -c '
-          import json
-          import sys
-
+            STATUS=$(echo "$RESPONSE" | python -c '
+          import sys,json
           try:
-              print(
-                  json.load(sys.stdin).get(
-                      "status",
-                      ""
-                  )
-              )
-          except Exception:
-              print("")
+              print(json.load(sys.stdin).get("status","unknown"))
+          except:
+              print("unknown")
           ')
 
+            echo "STATUS=$STATUS"
 
-            echo "STATUS=${STATUS}"
-
-
-            if [ "${STATUS}" = "active" ]; then
-
-              echo
-              echo "========================================"
-              echo "GPU WORKER IS ACTIVE"
-              echo "========================================"
-
-              exit 0
-
-            fi
-
-
-            if [ "${STATUS}" = "error" ]; then
-
-              echo "Session error."
-
-              exit 1
-
-            fi
-
-
-            if [ "${STATUS}" = "stopped" ]; then
-
-              echo "Session stopped."
-
-              exit 1
-
-            fi
-
-
-            if [ "${STATUS}" = "expired" ]; then
-
-              echo "Session expired."
-
-              exit 1
-
-            fi
-
-
-            sleep 5
-
-          done
-
-
-          echo "Worker ready timeout."
-
-          exit 1
-
-
-      # ======================================================
-      # MONITOR
-      # ======================================================
-
-      - name: Monitor GPU session
-        if: success()
-        shell: bash
-        run: |
-          set +e
-
-          echo "========================================"
-          echo "MONITORING GPU SESSION"
-          echo "========================================"
-
-          STATUS_URL="${API_URL}/gpu/session/${SESSION_ID}"
-
-
-          while true; do
-
-            RESPONSE=$(curl \
-              -sS \
-              --max-time 15 \
-              "${STATUS_URL}")
-
-
-            echo
-            echo "${RESPONSE}"
-
-
-            STATUS=$(echo "${RESPONSE}" | \
-              python -c '
-          import json
-          import sys
-
-          try:
-              print(
-                  json.load(sys.stdin).get(
-                      "status",
-                      ""
-                  )
-              )
-          except Exception:
-              print("")
-          ')
-
-
-            echo "STATUS=${STATUS}"
-
-
-            case "${STATUS}" in
-
-              active)
-                sleep 15
+            case "$STATUS" in
+              completed|stopped|expired|error)
+                echo "Session finished."
+                break
                 ;;
-
-              starting)
-                sleep 10
-                ;;
-
-              stopped)
-                echo "Session stopped."
-                exit 0
-                ;;
-
-              expired)
-                echo "Session expired."
-                exit 0
-                ;;
-
-              error)
-                echo "Session error."
-                exit 1
-                ;;
-
-              *)
-                sleep 10
-                ;;
-
             esac
 
+            sleep 2
           done
-
-
-      # ======================================================
-      # ARTIFACT
-      # ======================================================
-
-      - name: Upload worker artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-
-        with:
-          name: gpu-worker-${{ inputs.session_id }}
-
-          path: |
-            kaggle_upload/script.py
-            kaggle_upload/kernel-metadata.json
-
-          if-no-files-found: warn
