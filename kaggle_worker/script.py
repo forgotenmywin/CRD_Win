@@ -13,8 +13,9 @@ import requests
 
 # ============================================================
 # RUNTIME CONFIG
-# These 3 variables are prepended by GitHub Actions.
-# DO NOT define them again in this file.
+#
+# GitHub Actions prepends these three variables to the final
+# Kaggle script. Do not redefine them later.
 # ============================================================
 
 # SESSION_ID
@@ -46,7 +47,7 @@ def log(message=""):
 
 
 # ============================================================
-# CONFIG VALIDATION
+# VALIDATION
 # ============================================================
 
 def validate_config():
@@ -57,34 +58,29 @@ def validate_config():
         "WORKER_TOKEN",
     ]
 
-    missing = []
-
-    for name in required:
-
-        if name not in globals():
-            missing.append(name)
+    missing = [
+        name
+        for name in required
+        if name not in globals()
+    ]
 
     if missing:
-
         raise RuntimeError(
             "Runtime config missing: "
             + ", ".join(missing)
         )
 
     if not SESSION_ID:
-
         raise RuntimeError(
             "SESSION_ID is empty"
         )
 
     if not API_URL:
-
         raise RuntimeError(
             "API_URL is empty"
         )
 
     if not WORKER_TOKEN:
-
         raise RuntimeError(
             "WORKER_TOKEN is empty"
         )
@@ -92,20 +88,27 @@ def validate_config():
     if not API_URL.startswith(
         ("http://", "https://")
     ):
-
         raise RuntimeError(
             f"Invalid API_URL: {API_URL}"
         )
 
 
 # ============================================================
-# HTTP HEADERS
+# AUTH HEADERS
 # ============================================================
 
 def headers():
 
+    # IMPORTANT:
+    # Current Railway API authenticates worker endpoints with:
+    #
+    # Authorization: Bearer <WORKER_TOKEN>
+    #
+    # X-Worker-Token is included too for compatibility.
+
     return {
         "Content-Type": "application/json",
+        "Authorization": f"Bearer {WORKER_TOKEN}",
         "X-Worker-Token": WORKER_TOKEN,
     }
 
@@ -134,13 +137,17 @@ def api_get(path):
             f"-> {response.status_code}"
         )
 
+        if response.status_code >= 400:
+            log(
+                response.text[:2000]
+            )
+
         return response
 
     except Exception as exc:
 
         log(
-            f"[API] GET {path} ERROR: "
-            f"{exc}"
+            f"[API] GET {path} ERROR: {exc}"
         )
 
         return None
@@ -172,7 +179,6 @@ def api_post(path, payload=None):
         )
 
         if response.status_code >= 400:
-
             log(
                 response.text[:2000]
             )
@@ -182,15 +188,14 @@ def api_post(path, payload=None):
     except Exception as exc:
 
         log(
-            f"[API] POST {path} ERROR: "
-            f"{exc}"
+            f"[API] POST {path} ERROR: {exc}"
         )
 
         return None
 
 
 # ============================================================
-# NVIDIA SMI
+# NVIDIA
 # ============================================================
 
 def show_nvidia_smi():
@@ -210,11 +215,9 @@ def show_nvidia_smi():
     log(process.stdout)
 
     if process.stderr:
-
         log(process.stderr)
 
     if process.returncode != 0:
-
         raise RuntimeError(
             "nvidia-smi failed"
         )
@@ -225,32 +228,25 @@ def get_gpu_info():
     process = subprocess.run(
         [
             "nvidia-smi",
-
             "--query-gpu="
             "name,memory.total,driver_version",
-
             "--format=csv,noheader",
         ],
-
         capture_output=True,
-
         text=True,
-
         timeout=30,
     )
 
     if process.returncode != 0:
-
         return None
 
     return process.stdout.strip()
 
 
 # ============================================================
-# CUDA TEST
-# Uses Numba, NOT PyTorch.
-# This is required because current Kaggle PyTorch does not
-# support Tesla P100 / compute capability 6.0.
+# CUDA / NUMBA TEST
+#
+# Do NOT use PyTorch for the P100 smoke test.
 # ============================================================
 
 def cuda_test():
@@ -268,7 +264,7 @@ def cuda_test():
     except ImportError:
 
         log(
-            "Installing numpy and numba..."
+            "Installing numpy + numba..."
         )
 
         subprocess.check_call(
@@ -286,7 +282,6 @@ def cuda_test():
         import numpy as np
         from numba import cuda
 
-
     available = cuda.is_available()
 
     log(
@@ -301,12 +296,9 @@ def cuda_test():
             "compute_capability": None,
         }
 
-
     device = cuda.get_current_device()
 
-    capability = (
-        device.compute_capability
-    )
+    capability = device.compute_capability
 
     log(
         f"GPU: {device.name}"
@@ -316,120 +308,111 @@ def cuda_test():
         f"Compute capability: {capability}"
     )
 
+    try:
 
-    # --------------------------------------------------------
-    # Actual CUDA kernel
-    # --------------------------------------------------------
+        n = 1024 * 1024
 
-    n = 1024 * 1024
+        a = np.ones(
+            n,
+            dtype=np.float32,
+        )
 
+        b = np.ones(
+            n,
+            dtype=np.float32,
+        )
 
-    a = np.ones(
-        n,
-        dtype=np.float32,
-    )
-
-    b = np.ones(
-        n,
-        dtype=np.float32,
-    )
-
-    c = np.zeros(
-        n,
-        dtype=np.float32,
-    )
+        c = np.zeros(
+            n,
+            dtype=np.float32,
+        )
 
 
-    @cuda.jit
-    def add_kernel(a, b, c):
+        @cuda.jit
+        def add_kernel(a, b, c):
 
-        i = cuda.grid(1)
+            i = cuda.grid(1)
 
-        if i < c.size:
+            if i < c.size:
+                c[i] = a[i] + b[i]
 
-            c[i] = (
-                a[i]
-                + b[i]
+
+        threads = 256
+
+        blocks = (
+            n + threads - 1
+        ) // threads
+
+
+        da = cuda.to_device(a)
+        db = cuda.to_device(b)
+        dc = cuda.to_device(c)
+
+
+        started = time.perf_counter()
+
+
+        add_kernel[
+            blocks,
+            threads
+        ](
+            da,
+            db,
+            dc,
+        )
+
+
+        cuda.synchronize()
+
+
+        elapsed = (
+            time.perf_counter()
+            - started
+        )
+
+
+        result = dc.copy_to_host()
+
+
+        if not np.allclose(
+            result,
+            2.0,
+        ):
+            raise RuntimeError(
+                "CUDA verification failed"
             )
 
 
-    threads = 256
-
-    blocks = (
-        n + threads - 1
-    ) // threads
-
-
-    device_a = cuda.to_device(a)
-
-    device_b = cuda.to_device(b)
-
-    device_c = cuda.to_device(c)
+        log(
+            f"GPU kernel OK: "
+            f"{n} elements "
+            f"in {elapsed:.4f}s"
+        )
 
 
-    start = time.perf_counter()
+        return {
+            "ok": True,
+            "compute_capability": [
+                int(capability[0]),
+                int(capability[1]),
+            ],
+            "elements": n,
+            "time_seconds": elapsed,
+        }
 
+    except Exception as exc:
 
-    add_kernel[
-        blocks,
-        threads
-    ](
-        device_a,
-        device_b,
-        device_c,
-    )
-
-
-    cuda.synchronize()
-
-
-    elapsed = (
-        time.perf_counter()
-        - start
-    )
-
-
-    result = (
-        device_c.copy_to_host()
-    )
-
-
-    if not np.allclose(
-        result,
-        2.0
-    ):
+        traceback.print_exc()
 
         return {
             "ok": False,
-            "error":
-                "CUDA result verification failed",
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
             "compute_capability": [
                 int(capability[0]),
                 int(capability[1]),
             ],
         }
-
-
-    log(
-        f"GPU kernel OK: "
-        f"{n} elements "
-        f"in {elapsed:.4f}s"
-    )
-
-
-    return {
-
-        "ok": True,
-
-        "compute_capability": [
-            int(capability[0]),
-            int(capability[1]),
-        ],
-
-        "elements": n,
-
-        "time_seconds": elapsed,
-    }
 
 
 # ============================================================
@@ -441,35 +424,27 @@ def worker_ready(
     cuda_result,
 ):
 
-    payload = {
-
-        "gpu": gpu_info,
-
-        "compute_capability":
-            cuda_result.get(
-                "compute_capability"
-            ),
-
-        "cuda_available":
-            bool(
-                cuda_result.get(
-                    "ok"
-                )
-            ),
-    }
-
-
-    path = (
-        f"/gpu/session/"
-        f"{SESSION_ID}/worker-ready"
-    )
-
-
     log()
     log("=" * 60)
     log("NOTIFYING RAILWAY")
     log("=" * 60)
 
+    payload = {
+        "gpu": gpu_info,
+        "compute_capability":
+            cuda_result.get(
+                "compute_capability"
+            ),
+        "cuda_available":
+            bool(
+                cuda_result.get("ok")
+            ),
+    }
+
+    path = (
+        f"/gpu/session/"
+        f"{SESSION_ID}/worker-ready"
+    )
 
     for attempt in range(1, 11):
 
@@ -478,12 +453,10 @@ def worker_ready(
             f"{attempt}/10"
         )
 
-
         response = api_post(
             path,
             payload,
         )
-
 
         if response is not None:
 
@@ -499,9 +472,14 @@ def worker_ready(
 
                 return True
 
+            if response.status_code == 401:
+
+                log(
+                    "AUTHENTICATION FAILED "
+                    "- Railway rejected WORKER_TOKEN"
+                )
 
         time.sleep(3)
-
 
     return False
 
@@ -520,20 +498,16 @@ def heartbeat():
         },
     )
 
-
     if response is None:
-
         return False
-
 
     if response.status_code == 410:
 
         log(
-            "Railway says session expired."
+            "Session expired."
         )
 
         return False
-
 
     return response.status_code in (
         200,
@@ -542,7 +516,7 @@ def heartbeat():
 
 
 # ============================================================
-# COMMAND FETCH
+# COMMAND
 # ============================================================
 
 def get_command():
@@ -552,52 +526,31 @@ def get_command():
         f"{SESSION_ID}/command"
     )
 
-
     if response is None:
-
         return None
-
 
     if response.status_code != 200:
-
         return None
-
 
     try:
-
         data = response.json()
-
     except Exception:
-
         return None
 
-
-    if not isinstance(
-        data,
-        dict
-    ):
-
+    if not isinstance(data, dict):
         return None
 
-
-    if data.get(
-        "expired"
-    ):
-
+    if data.get("expired"):
         return {
             "_expired": True
         }
-
 
     command = data.get(
         "command"
     )
 
-
     if not command:
-
         return None
-
 
     return command
 
@@ -615,18 +568,13 @@ def send_result(
         f"/internal/session/"
         f"{SESSION_ID}/result",
         {
-            "command_id":
-                command_id,
-
+            "command_id": command_id,
             **result,
         },
     )
 
-
     if response is None:
-
         return False
-
 
     return response.status_code in (
         200,
@@ -636,7 +584,7 @@ def send_result(
 
 
 # ============================================================
-# LIMIT OUTPUT
+# OUTPUT LIMIT
 # ============================================================
 
 def limit_output(
@@ -647,7 +595,6 @@ def limit_output(
     value = str(value)
 
     if len(value) <= maximum:
-
         return value
 
     return (
@@ -661,7 +608,7 @@ def limit_output(
 # ============================================================
 
 def execute_python(
-    parameters
+    parameters,
 ):
 
     code = parameters.get(
@@ -669,64 +616,41 @@ def execute_python(
         "",
     )
 
-
     if not code:
 
         return {
             "status": "error",
-            "error":
-                "Python code is empty",
+            "error": "Python code is empty",
         }
 
-
     namespace = {
-        "__builtins__":
-            __builtins__,
+        "__builtins__": __builtins__,
     }
 
-
     try:
-
         import numpy as np
-
         namespace["np"] = np
-
     except Exception:
-
         pass
 
-
     try:
-
         from numba import cuda
-
         namespace["cuda"] = cuda
-
     except Exception:
-
         pass
-
 
     try:
-
         import torch
-
         namespace["torch"] = torch
-
     except Exception:
-
         pass
-
 
     local_vars = {}
 
     stdout = io.StringIO()
-
     stderr = io.StringIO()
 
-
     started = time.perf_counter()
-
 
     try:
 
@@ -742,37 +666,24 @@ def execute_python(
                 local_vars,
             )
 
-
         variables = {}
-
 
         for key, value in local_vars.items():
 
-            if key.startswith(
-                "_"
-            ):
-
+            if key.startswith("_"):
                 continue
 
-
             try:
-
-                variables[key] = (
-                    limit_output(
-                        repr(value),
-                        10000,
-                    )
+                variables[key] = limit_output(
+                    repr(value),
+                    10000,
                 )
-
             except Exception:
-
                 variables[key] = (
                     "<unprintable>"
                 )
 
-
         return {
-
             "status": "ok",
 
             "stdout":
@@ -785,19 +696,16 @@ def execute_python(
                     stderr.getvalue()
                 ),
 
-            "variables":
-                variables,
+            "variables": variables,
 
             "execution_time":
                 time.perf_counter()
                 - started,
         }
 
-
     except Exception as exc:
 
         return {
-
             "status": "error",
 
             "stdout":
@@ -810,8 +718,7 @@ def execute_python(
                     stderr.getvalue()
                 ),
 
-            "error":
-                str(exc),
+            "error": str(exc),
 
             "traceback":
                 traceback.format_exc(),
@@ -823,7 +730,7 @@ def execute_python(
 
 
 # ============================================================
-# NVIDIA-SMI COMMAND
+# NVIDIA SMI OPERATION
 # ============================================================
 
 def execute_nvidia_smi():
@@ -837,43 +744,34 @@ def execute_nvidia_smi():
             timeout=60,
         )
 
-
         return {
-
             "status": "ok",
-
             "stdout":
                 limit_output(
                     process.stdout
                 ),
-
             "stderr":
                 limit_output(
                     process.stderr
                 ),
-
             "returncode":
                 process.returncode,
         }
 
-
     except Exception as exc:
 
         return {
-
             "status": "error",
-
-            "error":
-                str(exc),
+            "error": str(exc),
         }
 
 
 # ============================================================
-# SHELL COMMAND
+# SHELL
 # ============================================================
 
 def execute_shell(
-    parameters
+    parameters,
 ):
 
     command = parameters.get(
@@ -881,17 +779,12 @@ def execute_shell(
         "",
     )
 
-
     if not command:
 
         return {
-
             "status": "error",
-
-            "error":
-                "Shell command is empty",
+            "error": "Shell command is empty",
         }
-
 
     try:
 
@@ -903,45 +796,32 @@ def execute_shell(
             timeout=COMMAND_TIMEOUT,
         )
 
-
         return {
-
             "status": "ok",
-
             "stdout":
                 limit_output(
                     process.stdout
                 ),
-
             "stderr":
                 limit_output(
                     process.stderr
                 ),
-
             "returncode":
                 process.returncode,
         }
 
-
     except subprocess.TimeoutExpired:
 
         return {
-
             "status": "error",
-
-            "error":
-                "Shell command timed out",
+            "error": "Command timed out",
         }
-
 
     except Exception as exc:
 
         return {
-
             "status": "error",
-
-            "error":
-                str(exc),
+            "error": str(exc),
         }
 
 
@@ -972,9 +852,7 @@ def execute_info():
             timeout=30,
         )
 
-
         capability = None
-
 
         try:
 
@@ -994,54 +872,40 @@ def execute_info():
                 ]
 
         except Exception:
-
             pass
 
-
         return {
-
             "status": "ok",
-
             "gpu_details":
                 process.stdout.strip(),
-
             "compute_capability":
                 capability,
-
             "cuda_available":
                 capability is not None,
-
             "hostname":
                 socket.gethostname(),
-
             "python":
                 sys.version,
-
             "platform":
                 platform.platform(),
         }
 
-
     except Exception as exc:
 
         return {
-
             "status": "error",
-
-            "error":
-                str(exc),
-
+            "error": str(exc),
             "traceback":
                 traceback.format_exc(),
         }
 
 
 # ============================================================
-# EXECUTE OPERATION
+# COMMAND EXECUTION
 # ============================================================
 
 def execute_command(
-    command
+    command,
 ):
 
     command_id = command.get(
@@ -1058,7 +922,6 @@ def execute_command(
         {},
     )
 
-
     log()
     log("=" * 60)
     log("COMMAND RECEIVED")
@@ -1072,7 +935,6 @@ def execute_command(
         f"OPERATION: {operation}"
     )
 
-
     try:
 
         if operation == "execute_python":
@@ -1081,11 +943,9 @@ def execute_command(
                 parameters
             )
 
-
         elif operation == "nvidia_smi":
 
             result = execute_nvidia_smi()
-
 
         elif operation == "shell":
 
@@ -1093,112 +953,84 @@ def execute_command(
                 parameters
             )
 
-
         elif operation == "info":
 
             result = execute_info()
 
-
         else:
 
             result = {
-
                 "status": "error",
-
                 "error":
                     f"Unknown operation: "
                     f"{operation}",
             }
 
-
     except Exception as exc:
 
         result = {
-
             "status": "error",
-
-            "error":
-                str(exc),
-
+            "error": str(exc),
             "traceback":
                 traceback.format_exc(),
         }
 
-
-    send_result(
+    sent = send_result(
         command_id,
-        result
+        result,
     )
 
+    if sent:
 
-# ============================================================
-# 120-SECOND TEST LOOP
-# ============================================================
+        log(
+            f"Result sent: {command_id}"
+        )
 
-def run_test_loop():
+    else:
 
-    log()
-    log("=" * 60)
-    log(
-        f"RUNNING FOR "
-        f"{WORKER_RUNTIME_SECONDS} SECONDS"
-    )
-    log("=" * 60)
-
-
-    started = time.monotonic()
-
-    last_heartbeat = 0
-
-    loop_number = 0
-
-
-    while True:
-
-        elapsed = (
-            time.monotonic()
-            - started
+        log(
+            f"Result send failed: {command_id}"
         )
 
 
-        # ----------------------------------------------------
-        # End after exactly ~120 seconds
-        # ----------------------------------------------------
+# ============================================================
+# 120 SECOND TEST LOOP
+# ============================================================
 
-        if (
-            elapsed
-            >= WORKER_RUNTIME_SECONDS
-        ):
+def test_loop():
+
+    log()
+    log("=" * 60)
+    log("120 SECOND WORKER TEST")
+    log("=" * 60)
+
+    started = time.monotonic()
+
+    next_heartbeat = 0
+
+    while True:
+
+        now = time.monotonic()
+
+        elapsed = (
+            now - started
+        )
+
+        if elapsed >= WORKER_RUNTIME_SECONDS:
 
             log()
             log("=" * 60)
-            log(
-                "120-SECOND TEST FINISHED"
-            )
+            log("120 SECOND TEST COMPLETE")
             log("=" * 60)
 
-            break
-
-
-        loop_number += 1
+            return
 
 
         # ----------------------------------------------------
         # HEARTBEAT
         # ----------------------------------------------------
 
-        if (
-            time.monotonic()
-            - last_heartbeat
-            >= HEARTBEAT_INTERVAL
-        ):
-
-            ok = heartbeat()
-
-            last_heartbeat = (
-                time.monotonic()
-            )
-
+        if now >= next_heartbeat:
 
             remaining = max(
                 0,
@@ -1208,65 +1040,50 @@ def run_test_loop():
                 )
             )
 
+            ok = heartbeat()
 
             if ok:
 
                 log(
-                    f"[KEEP-ALIVE] "
-                    f"OK | "
+                    f"[KEEP-ALIVE] OK "
                     f"remaining={remaining}s"
                 )
 
             else:
 
                 log(
-                    f"[KEEP-ALIVE] "
-                    f"FAILED | "
+                    f"[KEEP-ALIVE] FAILED "
                     f"remaining={remaining}s"
                 )
+
+            next_heartbeat = (
+                now
+                + HEARTBEAT_INTERVAL
+            )
 
 
         # ----------------------------------------------------
         # COMMAND
         # ----------------------------------------------------
 
-        try:
+        command = get_command()
 
-            command = get_command()
+        if command:
 
+            if command.get(
+                "_expired"
+            ):
 
-            if command:
-
-                if command.get(
-                    "_expired"
-                ):
-
-                    log(
-                        "Railway says "
-                        "session expired."
-                    )
-
-                    break
-
-
-                execute_command(
-                    command
+                log(
+                    "Session expired."
                 )
 
+                return
 
-        except Exception as exc:
-
-            log(
-                f"[COMMAND LOOP ERROR] "
-                f"{exc}"
+            execute_command(
+                command
             )
 
-            traceback.print_exc()
-
-
-        # ----------------------------------------------------
-        # Sleep only up to 3 seconds
-        # ----------------------------------------------------
 
         time.sleep(
             COMMAND_INTERVAL
@@ -1283,9 +1100,7 @@ def main():
     log("KAGGLE GPU WORKER - 120 SECOND TEST")
     log("=" * 60)
 
-
     validate_config()
-
 
     log(
         f"SESSION : {SESSION_ID}"
@@ -1295,7 +1110,7 @@ def main():
         f"API     : {API_URL}"
     )
 
-    # Never print actual token.
+    # Never print the actual token.
     log(
         f"TOKEN   : {len(WORKER_TOKEN)} chars"
     )
@@ -1307,16 +1122,13 @@ def main():
 
     show_nvidia_smi()
 
-
     gpu_info = get_gpu_info()
-
 
     if not gpu_info:
 
         raise RuntimeError(
-            "Could not read GPU info"
+            "GPU information unavailable"
         )
-
 
     log(
         f"GPU: {gpu_info}"
@@ -1329,10 +1141,7 @@ def main():
 
     cuda_result = cuda_test()
 
-
-    if not cuda_result.get(
-        "ok"
-    ):
+    if not cuda_result.get("ok"):
 
         raise RuntimeError(
             "CUDA test failed: "
@@ -1345,7 +1154,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # READY
+    # WORKER READY
     # --------------------------------------------------------
 
     if not worker_ready(
@@ -1359,16 +1168,19 @@ def main():
 
 
     # --------------------------------------------------------
-    # 120 SECOND LOOP
+    # 120 SECOND TEST
     # --------------------------------------------------------
 
-    run_test_loop()
-
+    test_loop()
 
     log(
         "Worker exiting normally."
     )
 
+
+# ============================================================
+# ENTRY
+# ============================================================
 
 if __name__ == "__main__":
 
