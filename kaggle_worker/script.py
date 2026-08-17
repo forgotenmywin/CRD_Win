@@ -12,20 +12,17 @@ import requests
 
 
 # ============================================================
-# RUNTIME CONFIG
+# IMPORTANT
 #
-# GitHub Actions prepends the REAL values before pushing
-# this file to Kaggle.
+# SESSION_ID
+# API_URL
+# WORKER_TOKEN
+#
+# are NOT defined in this source file.
+#
+# GitHub Actions prepends them to the final Kaggle script.
 # ============================================================
 
-SESSION_ID = "__SESSION_ID__"
-API_URL = "__API_URL__"
-WORKER_TOKEN = "__WORKER_TOKEN__"
-
-
-# ============================================================
-# CONFIG
-# ============================================================
 
 HEARTBEAT_INTERVAL = 15
 COMMAND_INTERVAL = 3
@@ -34,28 +31,42 @@ MAX_OUTPUT = 50000
 
 
 # ============================================================
-# VALIDATION
+# BASIC VALIDATION
 # ============================================================
 
 def validate_config():
 
-    if not SESSION_ID:
-        raise RuntimeError("SESSION_ID is empty")
+    missing = []
 
-    if SESSION_ID == "__SESSION_ID__":
-        raise RuntimeError("SESSION_ID was not injected")
+    if "SESSION_ID" not in globals():
+        missing.append("SESSION_ID")
+
+    if "API_URL" not in globals():
+        missing.append("API_URL")
+
+    if "WORKER_TOKEN" not in globals():
+        missing.append("WORKER_TOKEN")
+
+    if missing:
+        raise RuntimeError(
+            "Runtime config missing: "
+            + ", ".join(missing)
+        )
+
+    if not SESSION_ID:
+        raise RuntimeError(
+            "SESSION_ID is empty"
+        )
 
     if not API_URL:
-        raise RuntimeError("API_URL is empty")
-
-    if API_URL == "__API_URL__":
-        raise RuntimeError("API_URL was not injected")
+        raise RuntimeError(
+            "API_URL is empty"
+        )
 
     if not WORKER_TOKEN:
-        raise RuntimeError("WORKER_TOKEN is empty")
-
-    if WORKER_TOKEN == "__WORKER_TOKEN__":
-        raise RuntimeError("WORKER_TOKEN was not injected")
+        raise RuntimeError(
+            "WORKER_TOKEN is empty"
+        )
 
     if not API_URL.startswith(
         ("http://", "https://")
@@ -74,14 +85,21 @@ def log(message=""):
 
 
 # ============================================================
-# HTTP
+# HTTP HEADERS
 # ============================================================
 
-HEADERS = {
-    "Content-Type": "application/json",
-    "X-Worker-Token": WORKER_TOKEN,
-}
+def get_headers():
 
+    return {
+        "Content-Type": "application/json",
+        "X-Worker-Token": WORKER_TOKEN,
+        "Authorization": f"Bearer {WORKER_TOKEN}",
+    }
+
+
+# ============================================================
+# HTTP GET
+# ============================================================
 
 def api_get(path, retries=3):
 
@@ -93,7 +111,7 @@ def api_get(path, retries=3):
 
             response = requests.get(
                 url,
-                headers=HEADERS,
+                headers=get_headers(),
                 timeout=REQUEST_TIMEOUT,
             )
 
@@ -118,6 +136,10 @@ def api_get(path, retries=3):
     return None
 
 
+# ============================================================
+# HTTP POST
+# ============================================================
+
 def api_post(path, payload=None, retries=3):
 
     url = f"{API_URL}{path}"
@@ -128,7 +150,7 @@ def api_post(path, payload=None, retries=3):
 
             response = requests.post(
                 url,
-                headers=HEADERS,
+                headers=get_headers(),
                 json=payload or {},
                 timeout=REQUEST_TIMEOUT,
             )
@@ -139,8 +161,10 @@ def api_post(path, payload=None, retries=3):
             )
 
             if response.status_code >= 400:
+
                 log(
-                    response.text[:2000]
+                    f"[API] response: "
+                    f"{response.text[:2000]}"
                 )
 
             return response
@@ -177,7 +201,7 @@ def limit_output(value, limit=MAX_OUTPUT):
 
 
 # ============================================================
-# NVIDIA SMI
+# NVIDIA-SMI
 # ============================================================
 
 def run_nvidia_smi():
@@ -201,6 +225,11 @@ def run_nvidia_smi():
         if process.stderr:
             log(process.stderr)
 
+        if process.returncode != 0:
+            raise RuntimeError(
+                "nvidia-smi returned non-zero"
+            )
+
         return process
 
     except Exception as exc:
@@ -211,6 +240,10 @@ def run_nvidia_smi():
 
         return None
 
+
+# ============================================================
+# GPU INFORMATION
+# ============================================================
 
 def get_gpu_info():
 
@@ -234,17 +267,15 @@ def get_gpu_info():
         return process.stdout.strip()
 
     except Exception:
+
         return None
 
 
 # ============================================================
-# CUDA / NUMBA TEST
+# CUDA TEST
 #
-# IMPORTANT:
-# No PyTorch CUDA test.
-#
-# Kaggle currently provides a PyTorch build that does not
-# support Tesla P100 / compute capability 6.0.
+# Numba is used instead of PyTorch because the current
+# Kaggle PyTorch image does not support P100 / sm_60.
 # ============================================================
 
 def cuda_test():
@@ -262,7 +293,7 @@ def cuda_test():
     except ImportError:
 
         log(
-            "Numba/Numpy missing. Installing..."
+            "Installing numpy + numba..."
         )
 
         subprocess.check_call(
@@ -317,9 +348,9 @@ def cuda_test():
         }
 
 
-    # ========================================================
-    # REAL CUDA KERNEL TEST
-    # ========================================================
+    # --------------------------------------------------------
+    # Real CUDA kernel
+    # --------------------------------------------------------
 
     try:
 
@@ -347,6 +378,7 @@ def cuda_test():
             i = cuda.grid(1)
 
             if i < c.size:
+
                 c[i] = (
                     a[i]
                     + b[i]
@@ -365,7 +397,7 @@ def cuda_test():
         device_c = cuda.to_device(c)
 
 
-        start = time.perf_counter()
+        started = time.perf_counter()
 
 
         add_kernel[
@@ -383,7 +415,7 @@ def cuda_test():
 
         elapsed = (
             time.perf_counter()
-            - start
+            - started
         )
 
 
@@ -398,7 +430,7 @@ def cuda_test():
         ):
 
             raise RuntimeError(
-                "CUDA result verification failed"
+                "CUDA verification failed"
             )
 
 
@@ -411,11 +443,14 @@ def cuda_test():
 
         return {
             "ok": True,
+
             "compute_capability": [
                 int(capability[0]),
                 int(capability[1]),
             ],
+
             "elements": n,
+
             "time_seconds": elapsed,
         }
 
@@ -430,8 +465,12 @@ def cuda_test():
 
         return {
             "ok": False,
+
             "error": str(exc),
-            "traceback": traceback.format_exc(),
+
+            "traceback":
+                traceback.format_exc(),
+
             "compute_capability": [
                 int(capability[0]),
                 int(capability[1]),
@@ -465,7 +504,9 @@ def notify_worker_ready(
 
         "cuda_available":
             bool(
-                cuda_result.get("ok")
+                cuda_result.get(
+                    "ok"
+                )
             ),
     }
 
@@ -521,7 +562,7 @@ def heartbeat():
         f"/gpu/session/"
         f"{SESSION_ID}/heartbeat",
         {
-            "timestamp": time.time()
+            "timestamp": time.time(),
         },
         retries=2,
     )
@@ -534,7 +575,7 @@ def heartbeat():
     if response.status_code == 410:
 
         log(
-            "Railway says session expired."
+            "Session expired."
         )
 
         return False
@@ -608,30 +649,26 @@ def send_result(
     result,
 ):
 
-    payload = {
-        "command_id": command_id,
-        **result,
-    }
-
-
     response = api_post(
         f"/internal/session/"
         f"{SESSION_ID}/result",
-        payload,
+        {
+            "command_id": command_id,
+            **result,
+        },
         retries=4,
     )
 
 
-    if response is not None:
-
-        return response.status_code in (
-            200,
-            201,
-            202,
-        )
+    if response is None:
+        return False
 
 
-    return False
+    return response.status_code in (
+        200,
+        201,
+        202,
+    )
 
 
 # ============================================================
@@ -659,13 +696,21 @@ def execute_python(parameters):
     }
 
 
-    # Numpy / Numba
     try:
 
         import numpy as np
-        from numba import cuda
 
         namespace["np"] = np
+
+    except Exception:
+
+        pass
+
+
+    try:
+
+        from numba import cuda
+
         namespace["cuda"] = cuda
 
     except Exception:
@@ -673,9 +718,6 @@ def execute_python(parameters):
         pass
 
 
-    # PyTorch is available for CPU-side code,
-    # but do NOT use CUDA tensors with this Kaggle build
-    # on the P100.
     try:
 
         import torch
@@ -784,7 +826,7 @@ def execute_python(parameters):
 
 
 # ============================================================
-# NVIDIA SMI COMMAND
+# NVIDIA SMI OPERATION
 # ============================================================
 
 def execute_nvidia_smi():
@@ -830,7 +872,7 @@ def execute_nvidia_smi():
 
 
 # ============================================================
-# SHELL COMMAND
+# SHELL
 # ============================================================
 
 def execute_shell(parameters):
@@ -844,11 +886,8 @@ def execute_shell(parameters):
     if not command:
 
         return {
-
             "status": "error",
-
-            "error":
-                "Shell command is empty",
+            "error": "Shell command is empty",
         }
 
 
@@ -889,7 +928,7 @@ def execute_shell(parameters):
             "status": "error",
 
             "error":
-                "Command timed out",
+                "Command timeout",
         }
 
 
@@ -905,7 +944,7 @@ def execute_shell(parameters):
 
 
 # ============================================================
-# INFO COMMAND
+# INFO
 # ============================================================
 
 def execute_info():
@@ -915,6 +954,7 @@ def execute_info():
         process = subprocess.run(
             [
                 "nvidia-smi",
+
                 "--query-gpu="
                 "name,"
                 "memory.total,"
@@ -922,6 +962,7 @@ def execute_info():
                 "memory.free,"
                 "temperature.gpu,"
                 "utilization.gpu",
+
                 "--format=csv,noheader",
             ],
             capture_output=True,
@@ -1003,12 +1044,10 @@ def execute_command(command):
         "command_id"
     )
 
-
     operation = command.get(
         "operation",
         "",
     )
-
 
     parameters = command.get(
         "parameters",
@@ -1059,9 +1098,7 @@ def execute_command(command):
         else:
 
             result = {
-
                 "status": "error",
-
                 "error":
                     f"Unknown operation: "
                     f"{operation}",
@@ -1082,10 +1119,23 @@ def execute_command(command):
         }
 
 
-    send_result(
+    sent = send_result(
         command_id,
         result,
     )
+
+
+    if sent:
+
+        log(
+            f"Result sent: {command_id}"
+        )
+
+    else:
+
+        log(
+            f"Result FAILED: {command_id}"
+        )
 
 
 # ============================================================
@@ -1101,6 +1151,7 @@ def command_loop():
 
 
     last_heartbeat = 0
+
     counter = 0
 
 
@@ -1111,18 +1162,14 @@ def command_loop():
         now = time.time()
 
 
-        # ----------------------------------------------------
-        # HEARTBEAT
-        # ----------------------------------------------------
-
         if (
             now - last_heartbeat
             >= HEARTBEAT_INTERVAL
         ):
 
             log(
-                f"[KEEP-ALIVE] "
-                f"heartbeat #{counter}"
+                f"[KEEP-ALIVE] heartbeat "
+                f"#{counter}"
             )
 
 
@@ -1135,21 +1182,15 @@ def command_loop():
             if ok:
 
                 log(
-                    "[KEEP-ALIVE] "
-                    "heartbeat OK"
+                    "[KEEP-ALIVE] heartbeat OK"
                 )
 
             else:
 
                 log(
-                    "[KEEP-ALIVE] "
-                    "heartbeat failed"
+                    "[KEEP-ALIVE] heartbeat failed"
                 )
 
-
-        # ----------------------------------------------------
-        # COMMAND
-        # ----------------------------------------------------
 
         try:
 
@@ -1166,7 +1207,7 @@ def command_loop():
                         "Session expired."
                     )
 
-                    break
+                    return
 
 
                 execute_command(
@@ -1202,7 +1243,6 @@ def main():
     validate_config()
 
 
-    log()
     log(
         f"SESSION : {SESSION_ID}"
     )
@@ -1211,30 +1251,23 @@ def main():
         f"API     : {API_URL}"
     )
 
-    # Never print the actual token.
+    # Never print the worker token itself.
     log(
         f"TOKEN   : {len(WORKER_TOKEN)} chars"
     )
 
 
     # --------------------------------------------------------
-    # GPU
+    # NVIDIA
     # --------------------------------------------------------
 
-    gpu_test_process = run_nvidia_smi()
+    process = run_nvidia_smi()
 
 
-    if gpu_test_process is None:
-
-        raise RuntimeError(
-            "Unable to run nvidia-smi"
-        )
-
-
-    if gpu_test_process.returncode != 0:
+    if process is None:
 
         raise RuntimeError(
-            "nvidia-smi failed"
+            "nvidia-smi unavailable"
         )
 
 
@@ -1244,7 +1277,7 @@ def main():
     if not gpu_info:
 
         raise RuntimeError(
-            "Could not read GPU information"
+            "GPU information unavailable"
         )
 
 
@@ -1273,7 +1306,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # WORKER READY
+    # READY
     # --------------------------------------------------------
 
     if not notify_worker_ready(
