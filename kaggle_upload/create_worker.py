@@ -2,80 +2,11 @@ import os
 import sys
 import time
 import json
-import shutil
-import subprocess
-from pathlib import Path
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-SESSION_ID = os.environ.get("SESSION_ID", "")
-API_URL = os.environ.get("API_URL", "").rstrip("/")
-WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
-
-KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
-
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
-def fail(message):
-    print("")
-    print("=" * 60)
-    print("ERROR")
-    print("=" * 60)
-    print(message)
-    sys.exit(1)
-
-
-if not SESSION_ID:
-    fail("SESSION_ID is missing")
-
-if not API_URL:
-    fail("API_URL is missing")
-
-if not WORKER_TOKEN:
-    fail("WORKER_TOKEN is missing")
-
-if not KAGGLE_USERNAME:
-    fail("KAGGLE_USERNAME is missing")
-
-
-print("=" * 60)
-print("BUILDING KAGGLE GPU WORKER")
-print("=" * 60)
-
-print(f"Session injected: {SESSION_ID}")
-print(f"API injected: {API_URL}")
-print("Token injected: YES")
-
-
-# ============================================================
-# DIRECTORIES
-# ============================================================
-
-BASE = Path("kaggle_upload")
-
-if BASE.exists():
-    shutil.rmtree(BASE)
-
-BASE.mkdir(parents=True)
-
-
-# ============================================================
-# WORKER SCRIPT
-# ============================================================
-
-worker_code = r'''
-import os
-import sys
-import time
-import json
-import subprocess
+import signal
 import traceback
+import subprocess
+import threading
+
 import requests
 
 
@@ -83,106 +14,116 @@ import requests
 # RUNTIME CONFIG
 # ============================================================
 
-SESSION_ID = os.environ.get("SESSION_ID", "")
-API_URL = os.environ.get("API_URL", "").rstrip("/")
-WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
-
-TEST_DURATION = 120
+SESSION_ID = "__SESSION_ID__"
+API_URL = "__API_URL__".rstrip("/")
+WORKER_TOKEN = "__WORKER_TOKEN__"
 
 
 # ============================================================
-# LOGGING
+# SETTINGS
 # ============================================================
 
-def log(message=""):
-    print(message, flush=True)
+HEARTBEAT_INTERVAL = 5
+COMMAND_INTERVAL = 3
 
+# Workload size.
+# P100 16GB can handle this comfortably.
+MATRIX_SIZE = 4096
 
-def section(title):
-    log("")
-    log("=" * 60)
-    log(title)
-    log("=" * 60)
+STOP_EVENT = threading.Event()
 
 
 # ============================================================
-# VALIDATE
+# VALIDATION
 # ============================================================
 
-if not SESSION_ID:
-    raise RuntimeError("SESSION_ID was not injected")
+def validate_config():
 
-if not API_URL:
-    raise RuntimeError("API_URL was not injected")
+    if not SESSION_ID or SESSION_ID.startswith("__"):
+        raise RuntimeError("SESSION_ID was not injected")
 
-if not WORKER_TOKEN:
-    raise RuntimeError("WORKER_TOKEN was not injected")
+    if not API_URL or API_URL.startswith("__"):
+        raise RuntimeError("API_URL was not injected")
 
-
-section("KAGGLE GPU WORKER - 120 SECOND TEST")
-
-log(f"SESSION : {SESSION_ID}")
-log(f"API     : {API_URL}")
-log(f"TOKEN   : {len(WORKER_TOKEN)} chars")
+    if not WORKER_TOKEN or WORKER_TOKEN.startswith("__"):
+        raise RuntimeError("WORKER_TOKEN was not injected")
 
 
 # ============================================================
 # API
 # ============================================================
 
-def api_headers():
+def headers():
+
     return {
         "Authorization": f"Bearer {WORKER_TOKEN}",
-        "X-Worker-Token": WORKER_TOKEN,
         "Content-Type": "application/json",
+        "User-Agent": "kaggle-gpu-worker/1.0",
     }
 
 
-def post(path, data=None, timeout=10):
+def api_post(path, payload=None):
 
     url = API_URL + path
 
     try:
-        r = requests.post(
+
+        response = requests.post(
             url,
-            headers=api_headers(),
-            json=data or {},
-            timeout=timeout
+            headers=headers(),
+            json=payload or {},
+            timeout=15,
         )
 
-        log(
-            f"[API] POST {path} -> {r.status_code}"
+        print(
+            f"[API] POST {path} -> {response.status_code}",
+            flush=True,
         )
 
-        if r.text:
-            log(r.text[:1000])
+        if response.text:
+            print(response.text[:2000], flush=True)
 
-        return r
+        return response
 
     except Exception as e:
-        log(f"[API ERROR] {e}")
+
+        print(
+            f"[API] POST ERROR {path}: {e}",
+            flush=True,
+        )
+
         return None
 
 
-def get(path, timeout=10):
+def api_get(path):
 
     url = API_URL + path
 
     try:
-        r = requests.get(
+
+        response = requests.get(
             url,
-            headers=api_headers(),
-            timeout=timeout
+            headers=headers(),
+            timeout=15,
         )
 
-        log(
-            f"[API] GET {path} -> {r.status_code}"
+        print(
+            f"[API] GET {path} -> {response.status_code}",
+            flush=True,
         )
 
-        return r
+        if response.text:
+            print(response.text[:2000], flush=True)
+
+        return response
 
     except Exception as e:
-        log(f"[API ERROR] {e}")
+
+        print(
+            f"[API] GET ERROR {path}: {e}",
+            flush=True,
+        )
+
         return None
 
 
@@ -190,444 +131,558 @@ def get(path, timeout=10):
 # NVIDIA
 # ============================================================
 
-section("NVIDIA-SMI")
+def nvidia_smi():
 
-try:
+    print()
+    print("=" * 60)
+    print("NVIDIA-SMI")
+    print("=" * 60)
 
-    result = subprocess.run(
-        ["nvidia-smi"],
-        capture_output=True,
-        text=True,
-        timeout=15
-    )
+    try:
 
-    log(result.stdout)
-
-except Exception as e:
-    log(f"nvidia-smi failed: {e}")
-
-
-# ============================================================
-# GPU INFORMATION
-# ============================================================
-
-gpu_name = "Unknown"
-gpu_memory = 0
-
-try:
-
-    result = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=name,memory.total",
-            "--format=csv,noheader"
-        ],
-        capture_output=True,
-        text=True,
-        timeout=10
-    )
-
-    line = result.stdout.strip()
-
-    if line:
-        parts = line.split(",")
-
-        gpu_name = parts[0].strip()
-
-        if len(parts) > 1:
-            gpu_memory = parts[1].strip()
-
-except Exception as e:
-    log(f"GPU query failed: {e}")
-
-
-log(f"GPU: {gpu_name}, {gpu_memory}")
-
-
-# ============================================================
-# CUDA / NUMBA TEST
-# ============================================================
-
-section("CUDA / NUMBA TEST")
-
-cuda_ok = False
-compute_capability = None
-
-try:
-
-    import numba
-    from numba import cuda
-
-    cuda_ok = cuda.is_available()
-
-    log(f"CUDA available: {cuda_ok}")
-
-    if cuda_ok:
-
-        device = cuda.get_current_device()
-
-        compute_capability = (
-            device.compute_capability
+        result = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
 
-        log(f"GPU: {device.name}")
-        log(
-            f"Compute capability: "
-            f"{compute_capability}"
+        print(result.stdout, flush=True)
+
+        if result.stderr:
+            print(result.stderr, flush=True)
+
+    except Exception as e:
+
+        print(f"nvidia-smi error: {e}", flush=True)
+
+
+# ============================================================
+# CUDA TEST
+# ============================================================
+
+def cuda_test():
+
+    print()
+    print("=" * 60)
+    print("CUDA TEST")
+    print("=" * 60)
+
+    try:
+
+        import numba
+        from numba import cuda
+
+        print(
+            "CUDA available:",
+            cuda.is_available(),
+            flush=True,
+        )
+
+        if not cuda.is_available():
+            raise RuntimeError("CUDA is not available")
+
+        gpu = cuda.get_current_device()
+
+        print(
+            "GPU:",
+            gpu.name,
+            flush=True,
+        )
+
+        print(
+            "Compute capability:",
+            gpu.compute_capability,
+            flush=True,
         )
 
         @cuda.jit
-        def test_kernel(a):
+        def kernel(a, b, c):
 
             i = cuda.grid(1)
 
-            if i < a.size:
-                a[i] += 1
-
-        import numpy as np
+            if i < c.size:
+                c[i] = a[i] + b[i]
 
         n = 1024 * 1024
 
-        data = np.zeros(n, dtype=np.float32)
+        import numpy as np
 
-        d_data = cuda.to_device(data)
+        a = np.ones(n, dtype=np.float32)
+        b = np.ones(n, dtype=np.float32)
+        c = np.zeros(n, dtype=np.float32)
+
+        da = cuda.to_device(a)
+        db = cuda.to_device(b)
+        dc = cuda.to_device(c)
 
         threads = 256
         blocks = (n + threads - 1) // threads
 
         start = time.time()
 
-        test_kernel[blocks, threads](d_data)
+        kernel[blocks, threads](da, db, dc)
 
         cuda.synchronize()
 
         elapsed = time.time() - start
 
-        log(
-            f"GPU kernel OK: "
-            f"{n} elements in "
-            f"{elapsed:.4f}s"
+        print(
+            f"GPU test OK: {n} elements in {elapsed:.4f}s",
+            flush=True,
         )
 
-except Exception as e:
+        return True
 
-    log("CUDA TEST FAILED")
-    traceback.print_exc()
+    except Exception:
+
+        traceback.print_exc()
+
+        return False
+
+
+# ============================================================
+# CONTINUOUS GPU WORKLOAD
+# ============================================================
+
+def gpu_worker():
+
+    """
+    Keeps the P100 actively performing GPU computation.
+
+    This is NOT just a one-time test.
+    It continuously performs matrix multiplication until
+    STOP_EVENT is set or the process is terminated.
+    """
+
+    print()
+    print("=" * 60)
+    print("CONTINUOUS GPU WORKLOAD")
+    print("=" * 60)
+
+    try:
+
+        import torch
+
+        print(
+            "PyTorch:",
+            torch.__version__,
+            flush=True,
+        )
+
+        print(
+            "CUDA:",
+            torch.version.cuda,
+            flush=True,
+        )
+
+        if not torch.cuda.is_available():
+
+            raise RuntimeError(
+                "PyTorch CUDA is unavailable"
+            )
+
+        device = torch.device("cuda")
+
+        print(
+            "GPU:",
+            torch.cuda.get_device_name(0),
+            flush=True,
+        )
+
+        print(
+            "Matrix size:",
+            MATRIX_SIZE,
+            flush=True,
+        )
+
+        print(
+            "Starting continuous GPU workload...",
+            flush=True,
+        )
+
+        # Allocate tensors ON GPU.
+
+        a = torch.randn(
+            MATRIX_SIZE,
+            MATRIX_SIZE,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        b = torch.randn(
+            MATRIX_SIZE,
+            MATRIX_SIZE,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        c = torch.empty_like(a)
+
+        iteration = 0
+
+        last_print = time.time()
+
+        while not STOP_EVENT.is_set():
+
+            # GPU computation.
+
+            torch.mm(a, b, out=c)
+
+            # Another operation keeps the GPU pipeline busy.
+
+            torch.relu_(c)
+
+            iteration += 1
+
+            # Synchronize periodically so exceptions aren't hidden.
+
+            if iteration % 10 == 0:
+
+                torch.cuda.synchronize()
+
+            now = time.time()
+
+            if now - last_print >= 5:
+
+                torch.cuda.synchronize()
+
+                allocated = (
+                    torch.cuda.memory_allocated()
+                    / 1024
+                    / 1024
+                )
+
+                reserved = (
+                    torch.cuda.memory_reserved()
+                    / 1024
+                    / 1024
+                )
+
+                print(
+                    f"[GPU] iteration={iteration} "
+                    f"memory={allocated:.0f}MB "
+                    f"reserved={reserved:.0f}MB",
+                    flush=True,
+                )
+
+                last_print = now
+
+        print(
+            "GPU workload stopping...",
+            flush=True,
+        )
+
+    except Exception as e:
+
+        print(
+            "GPU WORKLOAD ERROR:",
+            repr(e),
+            flush=True,
+        )
+
+        traceback.print_exc()
+
+        STOP_EVENT.set()
+
+
+# ============================================================
+# HEARTBEAT
+# ============================================================
+
+def heartbeat_loop():
+
+    count = 0
+
+    while not STOP_EVENT.is_set():
+
+        count += 1
+
+        print(
+            f"[HEARTBEAT] #{count}",
+            flush=True,
+        )
+
+        response = api_post(
+            f"/gpu/session/{SESSION_ID}/heartbeat"
+        )
+
+        if response is not None:
+
+            try:
+
+                data = response.json()
+
+                status = data.get("status")
+
+                print(
+                    f"[HEARTBEAT] status={status}",
+                    flush=True,
+                )
+
+                if status in (
+                    "expired",
+                    "stopped",
+                    "error",
+                ):
+
+                    print(
+                        "Session is no longer active.",
+                        flush=True,
+                    )
+
+                    STOP_EVENT.set()
+                    return
+
+            except Exception:
+                pass
+
+        STOP_EVENT.wait(HEARTBEAT_INTERVAL)
+
+
+# ============================================================
+# COMMAND LOOP
+# ============================================================
+
+def command_loop():
+
+    while not STOP_EVENT.is_set():
+
+        response = api_get(
+            f"/internal/session/{SESSION_ID}/command"
+        )
+
+        if response is not None:
+
+            try:
+
+                if response.status_code == 200:
+
+                    data = response.json()
+
+                    command = data.get("command")
+
+                    if command:
+
+                        print(
+                            "[COMMAND]",
+                            command,
+                            flush=True,
+                        )
+
+                        if command in (
+                            "stop",
+                            "shutdown",
+                            "terminate",
+                        ):
+
+                            STOP_EVENT.set()
+                            return
+
+            except Exception as e:
+
+                print(
+                    "[COMMAND] parse error:",
+                    e,
+                    flush=True,
+                )
+
+        STOP_EVENT.wait(COMMAND_INTERVAL)
+
+
+# ============================================================
+# SIGNALS
+# ============================================================
+
+def signal_handler(signum, frame):
+
+    print(
+        f"Received signal {signum}",
+        flush=True,
+    )
+
+    STOP_EVENT.set()
+
+
+signal.signal(
+    signal.SIGTERM,
+    signal_handler,
+)
+
+signal.signal(
+    signal.SIGINT,
+    signal_handler,
+)
 
 
 # ============================================================
 # WORKER READY
 # ============================================================
 
-section("NOTIFYING RAILWAY")
+def notify_ready():
 
-ready = False
+    print()
+    print("=" * 60)
+    print("NOTIFYING RAILWAY")
+    print("=" * 60)
 
-for attempt in range(1, 11):
+    for attempt in range(1, 11):
 
-    log(
-        f"worker-ready attempt "
-        f"{attempt}/10"
-    )
+        print(
+            f"worker-ready attempt {attempt}/10",
+            flush=True,
+        )
 
-    response = post(
-        f"/gpu/session/{SESSION_ID}/worker-ready",
-        {
-            "gpu": f"{gpu_name}, {gpu_memory}",
-            "cuda_available": cuda_ok,
-            "compute_capability": (
-                list(compute_capability)
-                if compute_capability
-                else None
-            )
-        }
-    )
+        response = api_post(
+            f"/gpu/session/{SESSION_ID}/worker-ready"
+        )
 
-    if response is not None:
+        if response is not None:
 
-        if response.status_code == 200:
+            if response.status_code == 200:
 
-            log(
-                "WORKER READY accepted by Railway."
-            )
-
-            ready = True
-            break
-
-        elif response.status_code == 401:
-
-            log(
-                "ERROR: Worker authentication failed."
-            )
-
-    time.sleep(3)
-
-
-if not ready:
-
-    raise RuntimeError(
-        "Railway did not accept worker-ready"
-    )
-
-
-# ============================================================
-# 120 SECOND WORKER
-# ============================================================
-
-section("120 SECOND WORKER TEST")
-
-start_time = time.time()
-
-heartbeat_count = 0
-
-while True:
-
-    elapsed = time.time() - start_time
-
-    if elapsed >= TEST_DURATION:
-        break
-
-    remaining = int(
-        TEST_DURATION - elapsed
-    )
-
-    # --------------------------------------------------------
-    # HEARTBEAT
-    # --------------------------------------------------------
-
-    heartbeat_count += 1
-
-    response = post(
-        f"/gpu/session/{SESSION_ID}/heartbeat",
-        {
-            "remaining_seconds": remaining,
-            "worker_alive": True
-        }
-    )
-
-    if response is not None:
-
-        if response.status_code == 200:
-            log(
-                f"[KEEP-ALIVE] OK "
-                f"remaining={remaining}s"
-            )
-
-        elif response.status_code == 401:
-
-            log(
-                "[KEEP-ALIVE] Unauthorized"
-            )
-
-    # --------------------------------------------------------
-    # COMMAND
-    # --------------------------------------------------------
-
-    response = get(
-        f"/internal/session/"
-        f"{SESSION_ID}/command"
-    )
-
-    if response is not None:
-
-        if response.status_code == 200:
-
-            try:
-
-                command_data = response.json()
-
-                command = command_data.get(
-                    "command"
+                print(
+                    "WORKER READY accepted by Railway.",
+                    flush=True,
                 )
 
-                if command:
+                return True
 
-                    log(
-                        f"COMMAND RECEIVED: "
-                        f"{command}"
-                    )
+        time.sleep(3)
 
-                    if command == "stop":
+    return False
 
-                        log(
-                            "STOP command received."
-                        )
 
-                        break
+# ============================================================
+# MAIN
+# ============================================================
 
-            except Exception:
-                pass
+def main():
+
+    print("=" * 60)
+    print("KAGGLE GPU WORKER")
+    print("=" * 60)
+
+    validate_config()
+
+    print(
+        f"SESSION : {SESSION_ID}",
+        flush=True,
+    )
+
+    print(
+        f"API     : {API_URL}",
+        flush=True,
+    )
+
+    print(
+        f"TOKEN   : {len(WORKER_TOKEN)} chars",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # GPU INFORMATION
+    # --------------------------------------------------------
+
+    nvidia_smi()
+
+    # --------------------------------------------------------
+    # CUDA TEST
+    # --------------------------------------------------------
+
+    if not cuda_test():
+
+        raise RuntimeError(
+            "CUDA test failed"
+        )
+
+    # --------------------------------------------------------
+    # TELL RAILWAY WE ARE READY
+    # --------------------------------------------------------
+
+    if not notify_ready():
+
+        raise RuntimeError(
+            "Could not notify Railway"
+        )
+
+    # --------------------------------------------------------
+    # START HEARTBEAT
+    # --------------------------------------------------------
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        daemon=True,
+    )
+
+    heartbeat_thread.start()
+
+    # --------------------------------------------------------
+    # START COMMAND LOOP
+    # --------------------------------------------------------
+
+    command_thread = threading.Thread(
+        target=command_loop,
+        daemon=True,
+    )
+
+    command_thread.start()
+
+    # --------------------------------------------------------
+    # START REAL CONTINUOUS GPU WORK
+    # --------------------------------------------------------
+
+    gpu_thread = threading.Thread(
+        target=gpu_worker,
+        daemon=True,
+    )
+
+    gpu_thread.start()
+
+    print()
+    print("=" * 60)
+    print("WORKER IS NOW RUNNING")
+    print("CONTINUOUS GPU WORKLOAD ACTIVE")
+    print("=" * 60)
 
     # --------------------------------------------------------
     # WAIT
     # --------------------------------------------------------
 
-    time.sleep(3)
+    while not STOP_EVENT.is_set():
+
+        time.sleep(1)
+
+    print()
+    print("=" * 60)
+    print("WORKER STOPPING")
+    print("=" * 60)
 
 
 # ============================================================
-# COMPLETE
+# ENTRY
 # ============================================================
 
-section("WORKER TEST FINISHED")
+if __name__ == "__main__":
 
-post(
-    f"/gpu/session/{SESSION_ID}/heartbeat",
-    {
-        "worker_alive": False,
-        "completed": True
-    }
-)
+    try:
 
-log("120 second GPU worker test completed.")
-'''
+        main()
 
+    except Exception as e:
 
-# ============================================================
-# INJECT RUNTIME CONFIG
-# ============================================================
+        print()
+        print("=" * 60)
+        print("WORKER ERROR")
+        print("=" * 60)
 
-worker_code = worker_code.replace(
-    'SESSION_ID = os.environ.get("SESSION_ID", "")',
-    f'SESSION_ID = {SESSION_ID!r}',
-    1
-)
+        print(
+            repr(e),
+            flush=True,
+        )
 
-worker_code = worker_code.replace(
-    'API_URL = os.environ.get("API_URL", "").rstrip("/")',
-    f'API_URL = {API_URL!r}',
-    1
-)
+        traceback.print_exc()
 
-worker_code = worker_code.replace(
-    'WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")',
-    f'WORKER_TOKEN = {WORKER_TOKEN!r}',
-    1
-)
+        # Do not silently report success.
 
-
-# ============================================================
-# SAFETY CHECK
-# ============================================================
-
-if "__SESSION_ID__" in worker_code:
-    fail("__SESSION_ID__ remains")
-
-if "__API_URL__" in worker_code:
-    fail("__API_URL__ remains")
-
-if "__WORKER_TOKEN__" in worker_code:
-    fail("__WORKER_TOKEN__ remains")
-
-
-# ============================================================
-# WRITE SCRIPT
-# ============================================================
-
-script_path = BASE / "script.py"
-
-script_path.write_text(
-    worker_code,
-    encoding="utf-8"
-)
-
-
-# ============================================================
-# METADATA
-# ============================================================
-
-metadata = {
-    "id": f"{KAGGLE_USERNAME}/gpu-session-{SESSION_ID}",
-    "title": f"GPU Session {SESSION_ID}",
-    "code_file": "script.py",
-    "language": "python",
-    "kernel_type": "script",
-    "is_private": True,
-    "enable_gpu": True,
-    "enable_internet": True
-}
-
-metadata_path = BASE / "kernel-metadata.json"
-
-metadata_path.write_text(
-    json.dumps(
-        metadata,
-        indent=2
-    ),
-    encoding="utf-8"
-)
-
-
-# ============================================================
-# SHOW FILES
-# ============================================================
-
-print("")
-print("=" * 60)
-print("KAGGLE FILES")
-print("=" * 60)
-
-for p in BASE.iterdir():
-    print(p)
-
-
-print("")
-print("=" * 60)
-print("KAGGLE METADATA")
-print("=" * 60)
-
-print(
-    metadata_path.read_text(
-        encoding="utf-8"
-    )
-)
-
-
-# ============================================================
-# PUSH TO KAGGLE
-# ============================================================
-
-print("")
-print("=" * 60)
-print("PUSHING KAGGLE GPU WORKER")
-print("=" * 60)
-
-command = [
-    "kaggle",
-    "kernels",
-    "push",
-    "-p",
-    str(BASE)
-]
-
-print(
-    "Running:",
-    " ".join(command)
-)
-
-result = subprocess.run(
-    command,
-    text=True
-)
-
-if result.returncode != 0:
-
-    fail(
-        f"Kaggle push failed "
-        f"with exit code "
-        f"{result.returncode}"
-    )
-
-
-print("")
-print("=" * 60)
-print("KAGGLE GPU WORKER STARTED")
-print("=" * 60)
-
-print(
-    f"Session: {SESSION_ID}"
-)
-
-print(
-    "The Kaggle GPU worker should now start."
-)
+        sys.exit(1)
