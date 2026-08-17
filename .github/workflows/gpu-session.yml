@@ -4,23 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       session_id:
-        description: "GPU session ID"
         required: true
         type: string
 
       api_url:
-        description: "Railway API URL"
         required: true
         type: string
 
       worker_token:
-        description: "Worker token"
         required: true
         type: string
 
 jobs:
   gpu-session:
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 25
 
     env:
@@ -33,84 +32,34 @@ jobs:
 
     steps:
 
-      # ============================================================
-      # CHECKOUT
-      # ============================================================
-
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-      # ============================================================
-      # PYTHON
-      # ============================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # ============================================================
-      # INSTALL
-      # ============================================================
-
-      - name: Install dependencies
+      - name: Install
         run: |
           python -m pip install --upgrade pip
           pip install kaggle requests
 
-      # ============================================================
-      # CHECK CONFIG
-      # ============================================================
-
-      - name: Check configuration
-        shell: bash
+      - name: Validate
         run: |
           set -e
 
-          echo "========================================"
-          echo "CONFIGURATION"
-          echo "========================================"
+          test -n "$SESSION_ID"
+          test -n "$API_URL"
+          test -n "$WORKER_TOKEN"
 
-          echo "SESSION_ID:"
-          echo "$SESSION_ID"
+          echo "SESSION_ID=$SESSION_ID"
+          echo "API_URL=$API_URL"
+          echo "TOKEN_LENGTH=${#WORKER_TOKEN}"
 
-          echo
-          echo "API_URL:"
-          echo "$API_URL"
-
-          echo
-          echo "WORKER_TOKEN:"
-          echo "${#WORKER_TOKEN} characters"
-
-          echo
-
-          if [ -z "$SESSION_ID" ]; then
-            echo "ERROR: SESSION_ID is empty"
-            exit 1
-          fi
-
-          if [ -z "$API_URL" ]; then
-            echo "ERROR: API_URL is empty"
-            exit 1
-          fi
-
-          if [ -z "$WORKER_TOKEN" ]; then
-            echo "ERROR: WORKER_TOKEN is empty"
-            exit 1
-          fi
-
-      # ============================================================
-      # CREATE KAGGLE WORKER
-      # ============================================================
-
-      - name: Prepare Kaggle worker
-        shell: bash
+      - name: Prepare Worker
         run: |
           set -e
-
-          echo "========================================"
-          echo "PREPARING KAGGLE WORKER"
-          echo "========================================"
 
           mkdir -p kaggle_submit
 
@@ -119,19 +68,20 @@ jobs:
           from pathlib import Path
 
           session_id = os.environ["SESSION_ID"]
-          api_url = os.environ["API_URL"]
+          api_url = os.environ["API_URL"].rstrip("/")
           worker_token = os.environ["WORKER_TOKEN"]
 
-          source = Path("kaggle_worker.py")
+          src = Path("kaggle_worker.py")
 
-          if not source.exists():
+          if not src.exists():
               raise SystemExit(
-                  "ERROR: kaggle_worker.py was not found in repository root"
+                  "kaggle_worker.py not found"
               )
 
-          code = source.read_text(encoding="utf-8")
+          code = src.read_text(
+              encoding="utf-8"
+          )
 
-          # Replace placeholders in the worker.
           code = code.replace(
               "__SESSION_ID__",
               session_id
@@ -139,7 +89,7 @@ jobs:
 
           code = code.replace(
               "__API_URL__",
-              api_url.rstrip("/")
+              api_url
           )
 
           code = code.replace(
@@ -147,59 +97,46 @@ jobs:
               worker_token
           )
 
-          # Also replace shell-style placeholders in case they exist.
-          code = code.replace(
-              "${SESSION_ID}",
-              session_id
-          )
-
-          code = code.replace(
-              "${API_URL}",
-              api_url.rstrip("/")
-          )
-
-          code = code.replace(
-              "${WORKER_TOKEN}",
-              worker_token
-          )
-
-          output = Path("kaggle_submit/kaggle_worker.py")
-          output.write_text(code, encoding="utf-8")
-
-          print("Kaggle worker prepared.")
-          print("SESSION_ID injected:", session_id)
-          print("API_URL injected:", api_url.rstrip("/"))
-          print("WORKER_TOKEN injected:", len(worker_token), "chars")
-
-          # Safety checks.
+          # Safety check
           if "__SESSION_ID__" in code:
-              raise SystemExit("ERROR: SESSION_ID placeholder still exists")
+              raise SystemExit(
+                  "SESSION_ID injection failed"
+              )
 
           if "__API_URL__" in code:
-              raise SystemExit("ERROR: API_URL placeholder still exists")
+              raise SystemExit(
+                  "API_URL injection failed"
+              )
 
           if "__WORKER_TOKEN__" in code:
-              raise SystemExit("ERROR: WORKER_TOKEN placeholder still exists")
+              raise SystemExit(
+                  "WORKER_TOKEN injection failed"
+              )
 
           if "${SESSION_ID}" in code:
-              raise SystemExit("ERROR: ${SESSION_ID} still exists")
+              raise SystemExit(
+                  "Found ${SESSION_ID}"
+              )
 
           if "${API_URL}" in code:
-              raise SystemExit("ERROR: ${API_URL} still exists")
+              raise SystemExit(
+                  "Found ${API_URL}"
+              )
 
-          if "${WORKER_TOKEN}" in code:
-              raise SystemExit("ERROR: ${WORKER_TOKEN} still exists")
+          Path(
+              "kaggle_submit/kaggle_worker.py"
+          ).write_text(
+              code,
+              encoding="utf-8"
+          )
+
+          print(
+              "Worker successfully prepared."
+          )
           PY
 
-      # ============================================================
-      # KAGGLE METADATA
-      # ============================================================
-
       - name: Create Kaggle metadata
-        shell: bash
         run: |
-          set -e
-
           cat > kaggle_submit/kernel-metadata.json <<EOF
           {
             "id": "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}",
@@ -213,96 +150,34 @@ jobs:
           }
           EOF
 
-          echo "========================================"
-          echo "KAGGLE METADATA"
-          echo "========================================"
-
           cat kaggle_submit/kernel-metadata.json
 
-      # ============================================================
-      # PUSH / RUN KAGGLE
-      # ============================================================
-
-      - name: Push Kaggle GPU worker
-        shell: bash
+      - name: Start Kaggle GPU
         run: |
           set -e
 
           cd kaggle_submit
 
-          echo "========================================"
-          echo "STARTING KAGGLE GPU WORKER"
-          echo "========================================"
-
           kaggle kernels push -p .
 
-      # ============================================================
-      # WAIT FOR KAGGLE
-      # ============================================================
-
-      - name: Monitor Kaggle worker
-        shell: bash
+      - name: Monitor
         run: |
-          set +e
 
-          echo "========================================"
-          echo "WAITING FOR WORKER"
-          echo "========================================"
+          set +e
 
           KERNEL="${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
 
-          echo "Kernel:"
-          echo "$KERNEL"
+          echo "========================================"
+          echo "MONITORING KAGGLE"
+          echo "========================================"
 
-          echo
+          for i in $(seq 1 180); do
 
-          for i in $(seq 1 120); do
+            echo
+            echo "CHECK $i / 180"
 
-            echo "----------------------------------------"
-            echo "CHECK $i / 120"
-            echo "----------------------------------------"
-
-            STATUS="$(kaggle kernels status "$KERNEL" 2>&1)"
-
-            echo "$STATUS"
-
-            if echo "$STATUS" | grep -qi "complete"; then
-              echo
-              echo "KAGGLE WORKER COMPLETED"
-              break
-            fi
-
-            if echo "$STATUS" | grep -qi "error"; then
-              echo
-              echo "KAGGLE WORKER ERROR"
-              break
-            fi
-
-            if echo "$STATUS" | grep -qi "failed"; then
-              echo
-              echo "KAGGLE WORKER FAILED"
-              break
-            fi
+            kaggle kernels status "$KERNEL"
 
             sleep 5
 
           done
-
-      # ============================================================
-      # FINAL
-      # ============================================================
-
-      - name: Final status
-        if: always()
-        shell: bash
-        run: |
-          echo "========================================"
-          echo "GPU SESSION WORKFLOW FINISHED"
-          echo "========================================"
-
-          echo "SESSION_ID:"
-          echo "$SESSION_ID"
-
-          echo
-          echo "KAGGLE KERNEL:"
-          echo "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
