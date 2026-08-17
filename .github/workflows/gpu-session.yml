@@ -37,9 +37,8 @@ jobs:
       # CHECKOUT
       # ============================================================
 
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-
 
       # ============================================================
       # PYTHON
@@ -50,9 +49,8 @@ jobs:
         with:
           python-version: "3.12"
 
-
       # ============================================================
-      # INSTALL KAGGLE
+      # INSTALL
       # ============================================================
 
       - name: Install dependencies
@@ -60,1064 +58,251 @@ jobs:
           python -m pip install --upgrade pip
           pip install kaggle requests
 
-
       # ============================================================
-      # SHOW CONFIG
+      # CHECK CONFIG
       # ============================================================
 
-      - name: Show session configuration
+      - name: Check configuration
+        shell: bash
         run: |
+          set -e
+
           echo "========================================"
-          echo "GPU SESSION CONFIG"
+          echo "CONFIGURATION"
           echo "========================================"
 
-          echo "SESSION_ID=$SESSION_ID"
-          echo "API_URL=$API_URL"
+          echo "SESSION_ID:"
+          echo "$SESSION_ID"
 
-          if [ -n "$WORKER_TOKEN" ]; then
-            echo "WORKER_TOKEN=SET"
-          else
-            echo "WORKER_TOKEN=MISSING"
-            exit 1
-          fi
+          echo
+          echo "API_URL:"
+          echo "$API_URL"
+
+          echo
+          echo "WORKER_TOKEN:"
+          echo "${#WORKER_TOKEN} characters"
+
+          echo
 
           if [ -z "$SESSION_ID" ]; then
-            echo "SESSION_ID MISSING"
+            echo "ERROR: SESSION_ID is empty"
             exit 1
           fi
 
           if [ -z "$API_URL" ]; then
-            echo "API_URL MISSING"
+            echo "ERROR: API_URL is empty"
             exit 1
           fi
 
+          if [ -z "$WORKER_TOKEN" ]; then
+            echo "ERROR: WORKER_TOKEN is empty"
+            exit 1
+          fi
 
       # ============================================================
-      # CREATE KAGGLE DIRECTORY
+      # CREATE KAGGLE WORKER
       # ============================================================
 
       - name: Prepare Kaggle worker
+        shell: bash
         run: |
-          rm -rf kaggle-worker
-          mkdir -p kaggle-worker
+          set -e
 
-          echo "Kaggle worker directory created."
+          echo "========================================"
+          echo "PREPARING KAGGLE WORKER"
+          echo "========================================"
 
-
-      # ============================================================
-      # CREATE WORKER
-      #
-      # IMPORTANT:
-      # Values are injected by Python.
-      # No ${SESSION_ID} is used inside the generated worker.
-      # ============================================================
-
-      - name: Build worker.py
-        env:
-          REAL_SESSION_ID: ${{ inputs.session_id }}
-          REAL_API_URL: ${{ inputs.api_url }}
-          REAL_WORKER_TOKEN: ${{ inputs.worker_token }}
-        run: |
+          mkdir -p kaggle_submit
 
           python - <<'PY'
-
           import os
           from pathlib import Path
 
-          session_id = os.environ["REAL_SESSION_ID"]
-          api_url = os.environ["REAL_API_URL"].rstrip("/")
-          worker_token = os.environ["REAL_WORKER_TOKEN"]
-
-          if not session_id:
-              raise RuntimeError("REAL_SESSION_ID is empty")
-
-          if not api_url:
-              raise RuntimeError("REAL_API_URL is empty")
-
-          if not worker_token:
-              raise RuntimeError("REAL_WORKER_TOKEN is empty")
-
-          worker = r'''
-          import time
-          import json
-          import traceback
-          import subprocess
-          import requests
-
-
-          # ============================================================
-          # RUNTIME CONFIG
-          # ============================================================
-
-          SESSION_ID = __SESSION_ID_VALUE__
-          API_URL = __API_URL_VALUE__
-          WORKER_TOKEN = __WORKER_TOKEN_VALUE__
-
-          TEST_SECONDS = 120
-
-          HEARTBEAT_INTERVAL = 3
-          COMMAND_INTERVAL = 3
-
-
-          # ============================================================
-          # OUTPUT
-          # ============================================================
-
-          def log(message):
-              print(message, flush=True)
-
-
-          def separator():
-              log("=" * 60)
-
-
-          # ============================================================
-          # HTTP
-          # ============================================================
-
-          def headers():
-
-              return {
-                  "Authorization": f"Bearer {WORKER_TOKEN}",
-                  "X-Worker-Token": WORKER_TOKEN,
-                  "Content-Type": "application/json",
-              }
-
-
-          def api_get(path):
-
-              url = API_URL + path
-
-              try:
-
-                  r = requests.get(
-                      url,
-                      headers=headers(),
-                      timeout=15
-                  )
-
-                  log(
-                      f"[API] GET {path} -> {r.status_code}"
-                  )
-
-                  return r
-
-              except Exception as e:
-
-                  log(
-                      f"[API] GET ERROR {path}: {e}"
-                  )
-
-                  return None
-
-
-          def api_post(path, payload=None):
-
-              url = API_URL + path
-
-              try:
-
-                  r = requests.post(
-                      url,
-                      headers=headers(),
-                      json=payload or {},
-                      timeout=15
-                  )
-
-                  log(
-                      f"[API] POST {path} -> {r.status_code}"
-                  )
-
-                  if r.text:
-                      log(r.text[:1000])
-
-                  return r
-
-              except Exception as e:
-
-                  log(
-                      f"[API] POST ERROR {path}: {e}"
-                  )
-
-                  return None
-
-
-          # ============================================================
-          # GPU INFORMATION
-          # ============================================================
-
-          def show_gpu():
-
-              separator()
-              log("NVIDIA-SMI")
-              separator()
-
-              try:
-
-                  result = subprocess.run(
-                      ["nvidia-smi"],
-                      capture_output=True,
-                      text=True,
-                      timeout=20
-                  )
-
-                  log(result.stdout)
-
-              except Exception as e:
-
-                  log(f"nvidia-smi error: {e}")
-
-
-          # ============================================================
-          # CUDA TEST
-          # ============================================================
-
-          def cuda_test():
-
-              separator()
-              log("CUDA TEST")
-              separator()
-
-              try:
-
-                  import numba
-                  from numba import cuda
-
-                  log(
-                      f"CUDA available: {cuda.is_available()}"
-                  )
-
-                  if not cuda.is_available():
-                      raise RuntimeError(
-                          "CUDA is not available"
-                      )
-
-                  device = cuda.get_current_device()
-
-                  log(
-                      f"GPU: {device.name}"
-                  )
-
-                  log(
-                      f"Compute capability: "
-                      f"{device.compute_capability}"
-                  )
-
-
-                  @cuda.jit
-                  def kernel(a):
-
-                      i = cuda.grid(1)
-
-                      if i < a.size:
-                          a[i] += 1
-
-
-                  import numpy as np
-
-                  n = 1024 * 1024
-
-                  arr = np.zeros(
-                      n,
-                      dtype=np.float32
-                  )
-
-                  d_arr = cuda.to_device(arr)
-
-                  threads = 256
-
-                  blocks = (
-                      n + threads - 1
-                  ) // threads
-
-                  start = time.time()
-
-                  kernel[
-                      blocks,
-                      threads
-                  ](d_arr)
-
-                  cuda.synchronize()
-
-                  elapsed = time.time() - start
-
-                  result = d_arr.copy_to_host()
-
-                  if not np.all(result == 1):
-
-                      raise RuntimeError(
-                          "GPU result verification failed"
-                      )
-
-                  log(
-                      f"GPU JOB SUCCESS: "
-                      f"{n} elements"
-                  )
-
-                  log(
-                      f"GPU kernel time: "
-                      f"{elapsed:.4f}s"
-                  )
-
-                  return True
-
-              except Exception:
-
-                  log(
-                      "CUDA TEST FAILED"
-                  )
-
-                  traceback.print_exc()
-
-                  return False
-
-
-          # ============================================================
-          # WORKER READY
-          # ============================================================
-
-          def notify_ready():
-
-              separator()
-              log("NOTIFYING RAILWAY")
-              separator()
-
-              path = (
-                  f"/gpu/session/"
-                  f"{SESSION_ID}/worker-ready"
+          session_id = os.environ["SESSION_ID"]
+          api_url = os.environ["API_URL"]
+          worker_token = os.environ["WORKER_TOKEN"]
+
+          source = Path("kaggle_worker.py")
+
+          if not source.exists():
+              raise SystemExit(
+                  "ERROR: kaggle_worker.py was not found in repository root"
               )
 
-              for attempt in range(1, 11):
-
-                  log(
-                      f"worker-ready attempt "
-                      f"{attempt}/10"
-                  )
-
-                  response = api_post(path)
-
-                  if response is not None:
-
-                      if response.status_code == 200:
-
-                          try:
-
-                              data = response.json()
-
-                          except Exception:
-
-                              data = {}
-
-                          log(
-                              "WORKER READY accepted "
-                              "by Railway."
-                          )
-
-                          log(
-                              json.dumps(
-                                  data,
-                                  indent=2
-                              )
-                          )
-
-                          return True
-
-                      if response.status_code == 401:
-
-                          log(
-                              "AUTHORIZATION FAILED"
-                          )
-
-                  time.sleep(3)
-
-              return False
-
-
-          # ============================================================
-          # HEARTBEAT
-          # ============================================================
-
-          def heartbeat():
-
-              path = (
-                  f"/gpu/session/"
-                  f"{SESSION_ID}/heartbeat"
-              )
-
-              response = api_post(path)
-
-              if response is None:
-                  return False
-
-              return response.status_code == 200
-
-
-          # ============================================================
-          # COMMAND
-          # ============================================================
-
-          def get_command():
-
-              path = (
-                  f"/internal/session/"
-                  f"{SESSION_ID}/command"
-              )
-
-              response = api_get(path)
-
-              if response is None:
-                  return None
-
-              if response.status_code != 200:
-                  return None
-
-              try:
-
-                  return response.json()
-
-              except Exception:
-
-                  return None
-
-
-          # ============================================================
-          # RESULT
-          # ============================================================
-
-          def send_result(result):
-
-              path = (
-                  f"/internal/session/"
-                  f"{SESSION_ID}/result"
-              )
-
-              api_post(
-                  path,
-                  result
-              )
-
-
-          # ============================================================
-          # 120 SECOND REAL GPU WORKER
-          # ============================================================
-
-          def worker_loop():
-
-              separator()
-              log("120 SECOND GPU WORKER")
-              separator()
-
-              started = time.time()
-
-              last_heartbeat = 0
-
-              last_command = 0
-
-              job_count = 0
-
-
-              while True:
-
-                  elapsed = (
-                      time.time() - started
-                  )
-
-                  if elapsed >= TEST_SECONDS:
-
-                      break
-
-
-                  # ----------------------------------------------------
-                  # HEARTBEAT
-                  # ----------------------------------------------------
-
-                  if (
-                      time.time()
-                      - last_heartbeat
-                      >= HEARTBEAT_INTERVAL
-                  ):
-
-                      ok = heartbeat()
-
-                      if ok:
-
-                          remaining = max(
-                              0,
-                              int(
-                                  TEST_SECONDS
-                                  - elapsed
-                              )
-                          )
-
-                          log(
-                              "[KEEP-ALIVE] OK "
-                              f"remaining={remaining}s"
-                          )
-
-                      else:
-
-                          log(
-                              "[KEEP-ALIVE] FAILED"
-                          )
-
-                      last_heartbeat = time.time()
-
-
-                  # ----------------------------------------------------
-                  # COMMAND
-                  # ----------------------------------------------------
-
-                  if (
-                      time.time()
-                      - last_command
-                      >= COMMAND_INTERVAL
-                  ):
-
-                      command = get_command()
-
-                      if command:
-
-                          log(
-                              "[COMMAND]"
-                          )
-
-                          log(
-                              json.dumps(
-                                  command,
-                                  indent=2
-                              )
-                          )
-
-                          # --------------------------------------------
-                          # Optional command execution
-                          # --------------------------------------------
-
-                          if isinstance(
-                              command,
-                              dict
-                          ):
-
-                              cmd = command.get(
-                                  "command"
-                              )
-
-                              if cmd:
-
-                                  log(
-                                      f"Executing: {cmd}"
-                                  )
-
-                                  try:
-
-                                      p = subprocess.run(
-                                          cmd,
-                                          shell=True,
-                                          capture_output=True,
-                                          text=True,
-                                          timeout=300
-                                      )
-
-                                      send_result({
-                                          "success":
-                                              p.returncode == 0,
-
-                                          "returncode":
-                                              p.returncode,
-
-                                          "stdout":
-                                              p.stdout[-10000:],
-
-                                          "stderr":
-                                              p.stderr[-10000:]
-                                      })
-
-                                  except Exception as e:
-
-                                      send_result({
-                                          "success": False,
-                                          "error": str(e)
-                                      })
-
-                      last_command = time.time()
-
-
-                  # ----------------------------------------------------
-                  # REAL GPU JOB
-                  #
-                  # This actually occupies/uses the GPU.
-                  # ----------------------------------------------------
-
-                  try:
-
-                      import numpy as np
-                      from numba import cuda
-
-                      @cuda.jit
-                      def gpu_work(a, b):
-
-                          i = cuda.grid(1)
-
-                          if i < a.size:
-
-                              b[i] = (
-                                  a[i] * 2.0
-                                  + 1.0
-                              )
-
-
-                      n = 1024 * 1024
-
-                      a = np.ones(
-                          n,
-                          dtype=np.float32
-                      )
-
-                      b = np.zeros(
-                          n,
-                          dtype=np.float32
-                      )
-
-                      d_a = cuda.to_device(a)
-
-                      d_b = cuda.to_device(b)
-
-                      threads = 256
-
-                      blocks = (
-                          n + threads - 1
-                      ) // threads
-
-                      gpu_work[
-                          blocks,
-                          threads
-                      ](
-                          d_a,
-                          d_b
-                      )
-
-                      cuda.synchronize()
-
-                      result = d_b.copy_to_host()
-
-                      if np.all(result == 3.0):
-
-                          job_count += 1
-
-                      del d_a
-                      del d_b
-
-                  except Exception:
-
-                      log(
-                          "GPU JOB ERROR"
-                      )
-
-                      traceback.print_exc()
-
-
-                  time.sleep(0.1)
-
-
-              separator()
-
-              log(
-                  "GPU WORKER TEST FINISHED"
-              )
-
-              log(
-                  f"GPU jobs completed: "
-                  f"{job_count}"
-              )
-
-              log(
-                  f"Runtime: "
-                  f"{time.time() - started:.1f}s"
-              )
-
-              separator()
-
-
-          # ============================================================
-          # MAIN
-          # ============================================================
-
-          def main():
-
-              separator()
-              log("KAGGLE GPU WORKER")
-              separator()
-
-              log(
-                  f"SESSION : {SESSION_ID}"
-              )
-
-              log(
-                  f"API     : {API_URL}"
-              )
-
-              log(
-                  f"TOKEN   : {len(WORKER_TOKEN)} chars"
-              )
-
-              separator()
-
-
-              # --------------------------------------------------------
-              # CONFIG VALIDATION
-              # --------------------------------------------------------
-
-              if not SESSION_ID:
-
-                  raise RuntimeError(
-                      "SESSION_ID is empty"
-                  )
-
-              if not API_URL.startswith(
-                  "http://"
-              ) and not API_URL.startswith(
-                  "https://"
-              ):
-
-                  raise RuntimeError(
-                      f"Invalid API_URL: {API_URL}"
-                  )
-
-              if not WORKER_TOKEN:
-
-                  raise RuntimeError(
-                      "WORKER_TOKEN is empty"
-                  )
-
-
-              # --------------------------------------------------------
-              # GPU
-              # --------------------------------------------------------
-
-              show_gpu()
-
-              if not cuda_test():
-
-                  raise RuntimeError(
-                      "GPU test failed"
-                  )
-
-
-              # --------------------------------------------------------
-              # READY
-              # --------------------------------------------------------
-
-              if not notify_ready():
-
-                  raise RuntimeError(
-                      "Could not notify Railway"
-                  )
-
-
-              # --------------------------------------------------------
-              # REAL WORKER
-              # --------------------------------------------------------
-
-              worker_loop()
-
-
-              # --------------------------------------------------------
-              # FINAL HEARTBEAT
-              # --------------------------------------------------------
-
-              heartbeat()
-
-              separator()
-
-              log("WORKER FINISHED CLEANLY")
-
-              separator()
-
-
-          if __name__ == "__main__":
-
-              try:
-
-                  main()
-
-              except Exception as e:
-
-                  separator()
-
-                  log("WORKER ERROR")
-
-                  separator()
-
-                  log(repr(e))
-
-                  traceback.print_exc()
-
-                  raise
-
-          '''
-
-          # ------------------------------------------------------------
-          # EXACT VALUE INJECTION
-          #
-          # repr() makes values valid Python strings.
-          # ------------------------------------------------------------
-
-          worker = worker.replace(
-              "__SESSION_ID_VALUE__",
-              repr(session_id)
-          )
-
-          worker = worker.replace(
-              "__API_URL_VALUE__",
-              repr(api_url)
-          )
-
-          worker = worker.replace(
-              "__WORKER_TOKEN_VALUE__",
-              repr(worker_token)
-          )
-
-          # ------------------------------------------------------------
-          # FINAL VALIDATION
-          # ------------------------------------------------------------
-
-          forbidden = [
-              "__SESSION_ID_VALUE__",
-              "__API_URL_VALUE__",
-              "__WORKER_TOKEN_VALUE__",
-              "${SESSION_ID}",
-              "${API_URL}",
-              "${WORKER_TOKEN}",
-          ]
-
-          for item in forbidden:
-
-              if item in worker:
-
-                  raise RuntimeError(
-                      f"PLACEHOLDER REMAINS: {item}"
-                  )
-
-          path = Path(
-              "kaggle-worker/worker.py"
-          )
-
-          path.write_text(
-              worker,
-              encoding="utf-8"
-          )
-
-          print("=" * 40)
-          print("FINAL WORKER GENERATED")
-          print("=" * 40)
-
-          print(
-              "SESSION_ID:",
+          code = source.read_text(encoding="utf-8")
+
+          # Replace placeholders in the worker.
+          code = code.replace(
+              "__SESSION_ID__",
               session_id
           )
 
-          print(
-              "API_URL:",
-              api_url
+          code = code.replace(
+              "__API_URL__",
+              api_url.rstrip("/")
           )
 
-          print(
-              "TOKEN: SET"
+          code = code.replace(
+              "__WORKER_TOKEN__",
+              worker_token
           )
 
-          print()
-          print(
-              "FIRST 15 LINES:"
+          # Also replace shell-style placeholders in case they exist.
+          code = code.replace(
+              "${SESSION_ID}",
+              session_id
           )
 
-          lines = worker.splitlines()
-
-          for line in lines[:15]:
-
-              print(line)
-
-          print()
-          print(
-              "Checking placeholders..."
+          code = code.replace(
+              "${API_URL}",
+              api_url.rstrip("/")
           )
 
-          print(
-              "OK - no unresolved placeholders"
+          code = code.replace(
+              "${WORKER_TOKEN}",
+              worker_token
           )
 
+          output = Path("kaggle_submit/kaggle_worker.py")
+          output.write_text(code, encoding="utf-8")
+
+          print("Kaggle worker prepared.")
+          print("SESSION_ID injected:", session_id)
+          print("API_URL injected:", api_url.rstrip("/"))
+          print("WORKER_TOKEN injected:", len(worker_token), "chars")
+
+          # Safety checks.
+          if "__SESSION_ID__" in code:
+              raise SystemExit("ERROR: SESSION_ID placeholder still exists")
+
+          if "__API_URL__" in code:
+              raise SystemExit("ERROR: API_URL placeholder still exists")
+
+          if "__WORKER_TOKEN__" in code:
+              raise SystemExit("ERROR: WORKER_TOKEN placeholder still exists")
+
+          if "${SESSION_ID}" in code:
+              raise SystemExit("ERROR: ${SESSION_ID} still exists")
+
+          if "${API_URL}" in code:
+              raise SystemExit("ERROR: ${API_URL} still exists")
+
+          if "${WORKER_TOKEN}" in code:
+              raise SystemExit("ERROR: ${WORKER_TOKEN} still exists")
+          PY
 
       # ============================================================
       # KAGGLE METADATA
       # ============================================================
 
       - name: Create Kaggle metadata
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        shell: bash
         run: |
+          set -e
 
-          python - <<'PY'
-
-          import os
-          import json
-          from pathlib import Path
-
-          username = os.environ["KAGGLE_USERNAME"]
-
-          metadata = {
-
-              "id":
-                  f"{username}/gpu-session-worker",
-
-              "title":
-                  "GPU Session Worker",
-
-              "code_file":
-                  "worker.py",
-
-              "language":
-                  "python",
-
-              "kernel_type":
-                  "script",
-
-              "is_private":
-                  True,
-
-              "enable_gpu":
-                  True,
-
-              "enable_internet":
-                  True
-
+          cat > kaggle_submit/kernel-metadata.json <<EOF
+          {
+            "id": "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}",
+            "title": "GPU Session ${SESSION_ID}",
+            "code_file": "kaggle_worker.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": true,
+            "enable_gpu": true,
+            "enable_internet": true
           }
+          EOF
 
-          Path(
-              "kaggle-worker/kernel-metadata.json"
-          ).write_text(
-              json.dumps(
-                  metadata,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
+          echo "========================================"
+          echo "KAGGLE METADATA"
+          echo "========================================"
 
-          print(
-              json.dumps(
-                  metadata,
-                  indent=2
-              )
-          )
-
-          PY
-
+          cat kaggle_submit/kernel-metadata.json
 
       # ============================================================
-      # VERIFY FILE
+      # PUSH / RUN KAGGLE
       # ============================================================
 
-      - name: Verify generated worker
+      - name: Push Kaggle GPU worker
+        shell: bash
         run: |
+          set -e
+
+          cd kaggle_submit
 
           echo "========================================"
-          echo "VERIFYING WORKER"
-          echo "========================================"
-
-          test -f kaggle-worker/worker.py
-          test -f kaggle-worker/kernel-metadata.json
-
-          if grep -n '\${SESSION_ID}' kaggle-worker/worker.py; then
-            echo "ERROR: SESSION_ID placeholder found"
-            exit 1
-          fi
-
-          if grep -n '\${API_URL}' kaggle-worker/worker.py; then
-            echo "ERROR: API_URL placeholder found"
-            exit 1
-          fi
-
-          if grep -n '\${WORKER_TOKEN}' kaggle-worker/worker.py; then
-            echo "ERROR: WORKER_TOKEN placeholder found"
-            exit 1
-          fi
-
-          if grep -n '__SESSION_ID_VALUE__' kaggle-worker/worker.py; then
-            echo "ERROR: SESSION placeholder found"
-            exit 1
-          fi
-
-          echo "WORKER FILE OK"
-          echo "METADATA FILE OK"
-
-
-      # ============================================================
-      # PUSH TO KAGGLE
-      # ============================================================
-
-      - name: Push GPU worker to Kaggle
-        working-directory: kaggle-worker
-        run: |
-
-          echo "========================================"
-          echo "PUSHING GPU WORKER TO KAGGLE"
+          echo "STARTING KAGGLE GPU WORKER"
           echo "========================================"
 
           kaggle kernels push -p .
 
-          echo "Kaggle worker submitted."
-
-
       # ============================================================
-      # MONITOR RAILWAY
+      # WAIT FOR KAGGLE
       # ============================================================
 
-      - name: Monitor worker
-        env:
-          MONITOR_API_URL: ${{ inputs.api_url }}
-          MONITOR_SESSION_ID: ${{ inputs.session_id }}
+      - name: Monitor Kaggle worker
+        shell: bash
         run: |
-
           set +e
 
           echo "========================================"
-          echo "MONITORING WORKER"
+          echo "WAITING FOR WORKER"
           echo "========================================"
 
-          for i in $(seq 1 150); do
+          KERNEL="${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
 
-            echo
-            echo "[$((i * 10))s]"
+          echo "Kernel:"
+          echo "$KERNEL"
 
-            RESPONSE=$(curl -s \
-              --max-time 15 \
-              "$MONITOR_API_URL/gpu/session/$MONITOR_SESSION_ID")
+          echo
 
-            echo "$RESPONSE"
+          for i in $(seq 1 120); do
 
-            STATUS=$(echo "$RESPONSE" | \
-              python -c '
-          import sys,json
-          try:
-              print(json.load(sys.stdin).get("status","unknown"))
-          except:
-              print("unknown")
-          ')
+            echo "----------------------------------------"
+            echo "CHECK $i / 120"
+            echo "----------------------------------------"
 
-            echo "STATUS=$STATUS"
+            STATUS="$(kaggle kernels status "$KERNEL" 2>&1)"
 
-            if [ "$STATUS" = "completed" ]; then
-              echo "SESSION COMPLETED"
+            echo "$STATUS"
+
+            if echo "$STATUS" | grep -qi "complete"; then
+              echo
+              echo "KAGGLE WORKER COMPLETED"
               break
             fi
 
-            if [ "$STATUS" = "error" ]; then
-              echo "SESSION ERROR"
+            if echo "$STATUS" | grep -qi "error"; then
+              echo
+              echo "KAGGLE WORKER ERROR"
               break
             fi
 
-            if [ "$STATUS" = "stopped" ]; then
-              echo "SESSION STOPPED"
+            if echo "$STATUS" | grep -qi "failed"; then
+              echo
+              echo "KAGGLE WORKER FAILED"
               break
             fi
 
-            sleep 10
+            sleep 5
 
           done
+
+      # ============================================================
+      # FINAL
+      # ============================================================
+
+      - name: Final status
+        if: always()
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "GPU SESSION WORKFLOW FINISHED"
+          echo "========================================"
+
+          echo "SESSION_ID:"
+          echo "$SESSION_ID"
+
+          echo
+          echo "KAGGLE KERNEL:"
+          echo "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
