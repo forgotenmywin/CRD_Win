@@ -60,7 +60,7 @@ jobs:
       # INSTALL
       # ======================================================
 
-      - name: Install Kaggle
+      - name: Install dependencies
         shell: bash
         run: |
           set -e
@@ -75,10 +75,10 @@ jobs:
 
 
       # ======================================================
-      # VALIDATE
+      # VALIDATION
       # ======================================================
 
-      - name: Validate
+      - name: Validate configuration
         shell: bash
         run: |
           set -e
@@ -105,16 +105,16 @@ jobs:
 
 
       # ======================================================
-      # BUILD FINAL SCRIPT
+      # BUILD FINAL KAGGLE SCRIPT
       # ======================================================
 
-      - name: Build Kaggle worker
+      - name: Build final Kaggle worker
         shell: bash
         run: |
           set -e
 
           echo "========================================"
-          echo "BUILDING KAGGLE WORKER"
+          echo "BUILDING FINAL KAGGLE WORKER"
           echo "========================================"
 
           rm -rf kaggle_upload
@@ -130,7 +130,7 @@ jobs:
           api_url = os.environ["API_URL"].rstrip("/")
           worker_token = os.environ["WORKER_TOKEN"]
 
-          worker = Path(
+          source = Path(
               "kaggle_worker/script.py"
           ).read_text(
               encoding="utf-8"
@@ -141,11 +141,12 @@ jobs:
               f"SESSION_ID = {session_id!r}\n"
               f"API_URL = {api_url!r}\n"
               f"WORKER_TOKEN = {worker_token!r}\n\n"
+              "# WORKER SOURCE\n"
           )
 
           final_script = (
               header
-              + worker
+              + source
           )
 
           Path(
@@ -156,7 +157,7 @@ jobs:
           )
 
           print(
-              "Final Kaggle script created."
+              "Final worker generated."
           )
 
           print(
@@ -168,7 +169,7 @@ jobs:
           )
 
           print(
-              "Token injected: YES"
+              "Worker token injected: YES"
           )
           PY
 
@@ -177,6 +178,10 @@ jobs:
             kaggle_upload/script.py
 
           echo "Python syntax OK."
+
+
+          # Do not print the actual token.
+          head -12 kaggle_upload/script.py
 
 
       # ======================================================
@@ -223,7 +228,6 @@ jobs:
 
           cd kaggle_upload
 
-          # Kaggle-side maximum runtime for this test.
           kaggle kernels push \
             -p . \
             --timeout 180
@@ -232,7 +236,7 @@ jobs:
 
 
       # ======================================================
-      # WAIT FOR WORKER READY
+      # WAIT FOR READY
       # ======================================================
 
       - name: Wait for worker ready
@@ -300,7 +304,7 @@ jobs:
 
             if [ "${STATUS}" = "error" ]; then
 
-              echo "Railway reported error."
+              echo "Railway error."
 
               exit 1
 
@@ -327,17 +331,17 @@ jobs:
 
 
       # ======================================================
-      # MONITOR 120 SECOND TEST
+      # MONITOR
       # ======================================================
 
-      - name: Monitor 120 second worker test
+      - name: Monitor 120 second test
         if: success()
         shell: bash
         run: |
           set +e
 
           echo "========================================"
-          echo "MONITORING 120 SECOND TEST"
+          echo "MONITORING WORKER"
           echo "========================================"
 
           STATUS_URL="${API_URL}/gpu/session/${SESSION_ID}"
@@ -350,14 +354,17 @@ jobs:
 
             elapsed=$((now - started))
 
+
             RESPONSE=$(curl \
               -sS \
               --max-time 15 \
               "${STATUS_URL}")
 
+
             echo
             echo "[${elapsed}s]"
             echo "${RESPONSE}"
+
 
             STATUS=$(echo "${RESPONSE}" | python -c '
           import json
@@ -374,12 +381,13 @@ jobs:
               print("")
           ')
 
+
             echo "STATUS=${STATUS}"
 
 
             if [ "${STATUS}" = "error" ]; then
 
-              echo "Session entered error."
+              echo "Session error."
 
               exit 1
 
@@ -406,8 +414,7 @@ jobs:
 
             if [ "${elapsed}" -ge 150 ]; then
 
-              echo
-              echo "120-second worker test window completed."
+              echo "120-second test window completed."
 
               exit 0
 
@@ -423,7 +430,7 @@ jobs:
       # ARTIFACT
       # ======================================================
 
-      - name: Upload worker artifact
+      - name: Upload debug files
         if: always()
         uses: actions/upload-artifact@v4
 
