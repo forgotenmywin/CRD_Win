@@ -2,8 +2,9 @@ import time
 import traceback
 import requests
 
+
 # ============================================================
-# THESE VALUES ARE INJECTED BY GITHUB ACTIONS
+# THESE ARE REPLACED BY GITHUB ACTIONS
 # ============================================================
 
 SESSION_ID = "__SESSION_ID__"
@@ -12,16 +13,10 @@ WORKER_TOKEN = "__WORKER_TOKEN__"
 
 API_URL = API_URL.rstrip("/")
 
+TEST_SECONDS = 120
 HEARTBEAT_INTERVAL = 3
 COMMAND_INTERVAL = 3
 
-# فقط برای تست
-TEST_SECONDS = 120
-
-
-# ============================================================
-# HEADERS
-# ============================================================
 
 HEADERS = {
     "X-Worker-Token": WORKER_TOKEN,
@@ -36,15 +31,14 @@ HEADERS = {
 def validate_config():
 
     if not SESSION_ID:
-        raise RuntimeError("SESSION_ID is empty")
+        raise RuntimeError(
+            "SESSION_ID is empty"
+        )
 
     if SESSION_ID.startswith("__"):
         raise RuntimeError(
-            f"SESSION_ID was not injected: {SESSION_ID}"
+            "SESSION_ID was not injected"
         )
-
-    if not API_URL:
-        raise RuntimeError("API_URL is empty")
 
     if not API_URL.startswith("http"):
         raise RuntimeError(
@@ -52,14 +46,21 @@ def validate_config():
         )
 
     if not WORKER_TOKEN:
-        raise RuntimeError("WORKER_TOKEN is empty")
+        raise RuntimeError(
+            "WORKER_TOKEN is empty"
+        )
+
+    if WORKER_TOKEN.startswith("__"):
+        raise RuntimeError(
+            "WORKER_TOKEN was not injected"
+        )
 
 
 # ============================================================
 # API
 # ============================================================
 
-def api_post(path, data=None):
+def post(path):
 
     url = API_URL + path
 
@@ -68,7 +69,6 @@ def api_post(path, data=None):
         r = requests.post(
             url,
             headers=HEADERS,
-            json=data or {},
             timeout=15,
         )
 
@@ -92,7 +92,7 @@ def api_post(path, data=None):
         return None
 
 
-def api_get(path):
+def get(path):
 
     url = API_URL + path
 
@@ -123,96 +123,96 @@ def api_get(path):
 
 
 # ============================================================
-# GPU TEST
+# GPU JOB
 # ============================================================
 
-def gpu_test():
+def gpu_job():
 
     print("=" * 60)
     print("CUDA TEST")
     print("=" * 60)
 
-    try:
+    from numba import cuda
+    import numpy as np
 
-        from numba import cuda
+    if not cuda.is_available():
 
-        if not cuda.is_available():
-            raise RuntimeError(
-                "CUDA is not available"
-            )
-
-        device = cuda.get_current_device()
-
-        print(
-            "GPU:",
-            device.name
+        raise RuntimeError(
+            "CUDA is not available"
         )
 
-        print(
-            "Compute capability:",
-            device.compute_capability
+    device = cuda.get_current_device()
+
+    print(
+        "GPU:",
+        device.name
+    )
+
+    print(
+        "Compute capability:",
+        device.compute_capability
+    )
+
+    n = 1024 * 1024
+
+    data = np.ones(
+        n,
+        dtype=np.float32
+    )
+
+    d_data = cuda.to_device(data)
+
+    @cuda.jit
+    def kernel(x):
+
+        i = cuda.grid(1)
+
+        if i < x.size:
+            x[i] = x[i] * 2
+
+    threads = 256
+    blocks = (
+        n + threads - 1
+    ) // threads
+
+    start = time.time()
+
+    kernel[
+        blocks,
+        threads
+    ](d_data)
+
+    cuda.synchronize()
+
+    elapsed = (
+        time.time() - start
+    )
+
+    result = d_data.copy_to_host()
+
+    if not np.allclose(
+        result,
+        2
+    ):
+
+        raise RuntimeError(
+            "GPU result invalid"
         )
 
-        import numpy as np
+    print(
+        f"GPU JOB SUCCESS: {n} elements"
+    )
 
-        n = 1024 * 1024
-
-        data = np.ones(n, dtype=np.float32)
-
-        d_data = cuda.to_device(data)
-
-        @cuda.jit
-        def kernel(x):
-
-            i = cuda.grid(1)
-
-            if i < x.size:
-                x[i] = x[i] * 2.0
-
-        threads = 256
-        blocks = (n + threads - 1) // threads
-
-        start = time.time()
-
-        kernel[blocks, threads](d_data)
-
-        cuda.synchronize()
-
-        elapsed = time.time() - start
-
-        result = d_data.copy_to_host()
-
-        if not np.allclose(result, 2.0):
-            raise RuntimeError(
-                "GPU calculation produced invalid result"
-            )
-
-        print(
-            f"GPU JOB SUCCESS: {n} elements"
-        )
-
-        print(
-            f"GPU kernel time: {elapsed:.4f}s"
-        )
-
-        return True
-
-    except Exception:
-
-        traceback.print_exc()
-
-        return False
+    print(
+        f"GPU kernel time: {elapsed:.4f}s"
+    )
 
 
 # ============================================================
-# WORKER READY
+# READY
 # ============================================================
 
 def notify_ready():
-
-    print("=" * 60)
-    print("NOTIFYING RAILWAY")
-    print("=" * 60)
 
     path = (
         f"/gpu/session/"
@@ -226,12 +226,15 @@ def notify_ready():
             f"{attempt}/10"
         )
 
-        r = api_post(path)
+        r = post(path)
 
-        if r is not None and r.status_code == 200:
+        if (
+            r is not None
+            and r.status_code == 200
+        ):
 
             print(
-                "WORKER READY accepted by Railway."
+                "WORKER READY accepted."
             )
 
             return True
@@ -252,27 +255,22 @@ def heartbeat():
         f"{SESSION_ID}/heartbeat"
     )
 
-    r = api_post(path)
+    r = post(path)
 
-    if r is not None and r.status_code == 200:
+    if (
+        r is not None
+        and r.status_code == 200
+    ):
 
         try:
 
             data = r.json()
 
-            remaining = data.get(
-                "remaining_seconds"
+            print(
+                "[KEEP-ALIVE] "
+                f"remaining="
+                f"{data.get('remaining_seconds')}s"
             )
-
-            if remaining is not None:
-                print(
-                    f"[KEEP-ALIVE] "
-                    f"remaining={remaining}s"
-                )
-            else:
-                print(
-                    "[KEEP-ALIVE] OK"
-                )
 
         except Exception:
 
@@ -281,10 +279,6 @@ def heartbeat():
             )
 
         return True
-
-    print(
-        "[KEEP-ALIVE] FAILED"
-    )
 
     return False
 
@@ -295,16 +289,14 @@ def heartbeat():
 
 def check_command():
 
-    path = (
+    return get(
         f"/internal/session/"
         f"{SESSION_ID}/command"
     )
 
-    return api_get(path)
-
 
 # ============================================================
-# MAIN WORKER LOOP
+# MAIN
 # ============================================================
 
 def main():
@@ -329,24 +321,16 @@ def main():
         "chars"
     )
 
-    print()
-
     validate_config()
 
     # --------------------------------------------------------
-    # GPU
+    # REAL GPU JOB
     # --------------------------------------------------------
 
-    success = gpu_test()
-
-    if not success:
-
-        raise RuntimeError(
-            "GPU test failed"
-        )
+    gpu_job()
 
     # --------------------------------------------------------
-    # READY
+    # REGISTER WORKER
     # --------------------------------------------------------
 
     if not notify_ready():
@@ -355,35 +339,29 @@ def main():
             "Could not notify Railway"
         )
 
-    print()
-
     print("=" * 60)
     print("GPU WORKER IS ACTIVE")
     print("=" * 60)
 
-    print(
-        f"Running for {TEST_SECONDS} seconds..."
-    )
-
     start = time.time()
-
     last_heartbeat = 0
 
     # --------------------------------------------------------
-    # KEEP WORKER ALIVE
+    # KEEP GPU JOB ALIVE
     # --------------------------------------------------------
 
     while True:
 
-        elapsed = time.time() - start
+        elapsed = (
+            time.time() - start
+        )
 
         if elapsed >= TEST_SECONDS:
-
             break
 
-        # heartbeat
         if (
-            time.time() - last_heartbeat
+            time.time()
+            - last_heartbeat
             >= HEARTBEAT_INTERVAL
         ):
 
@@ -391,59 +369,42 @@ def main():
 
             last_heartbeat = time.time()
 
-        # command polling
-        try:
+        command = check_command()
 
-            command = check_command()
-
-            if command:
-
-                print(
-                    "[COMMAND]",
-                    command
-                )
-
-        except Exception as e:
+        if command:
 
             print(
-                "[COMMAND ERROR]",
-                e
+                "[COMMAND]",
+                command
             )
 
         print(
             f"[WORKER] "
-            f"{int(elapsed)}/{TEST_SECONDS}s"
+            f"{int(elapsed)}/"
+            f"{TEST_SECONDS}s"
         )
 
-        time.sleep(COMMAND_INTERVAL)
-
-    print()
+        time.sleep(
+            COMMAND_INTERVAL
+        )
 
     print("=" * 60)
     print("GPU WORKER TEST FINISHED")
     print("=" * 60)
 
 
-# ============================================================
-# ENTRY
-# ============================================================
-
 if __name__ == "__main__":
 
     try:
-
         main()
 
     except Exception as e:
 
-        print()
         print("=" * 60)
         print("WORKER ERROR")
         print("=" * 60)
 
-        print(
-            repr(e)
-        )
+        print(repr(e))
 
         traceback.print_exc()
 
