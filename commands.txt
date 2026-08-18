@@ -1,8 +1,8 @@
 cat /etc/os-release
-nvidia-smi -L
-nvidia-smi
+apt-get update
+apt-get install -y pciutils
 lspci --version
 lspci | grep -i vga
 lspci | grep -i nvidia
-wget -q https://example.com/file.zip
-ls -lh
+nvidia-smi -L
+nvidia-smi
