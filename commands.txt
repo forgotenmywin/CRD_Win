@@ -1,0 +1,8 @@
+cat /etc/os-release
+nvidia-smi -L
+nvidia-smi
+lspci --version
+lspci | grep -i vga
+lspci | grep -i nvidia
+wget -q https://example.com/file.zip
+ls -lh
