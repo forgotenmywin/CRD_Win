@@ -1,4 +1,4 @@
-name: Kaggle GPU System Test
+name: Kaggle GPU Command Runner
 
 on:
   workflow_dispatch:
@@ -16,6 +16,9 @@ jobs:
       # =========================================================
       # 1. Install Kaggle CLI
       # =========================================================
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
       - name: Install Kaggle CLI
         run: |
           python -m pip install --upgrade pip
@@ -66,9 +69,26 @@ jobs:
 
 
       # =========================================================
-      # 4. Create Kaggle GPU Kernel
+      # 4. Show commands file
       # =========================================================
-      - name: Create GPU Kernel
+      - name: Show Commands
+        run: |
+          echo "========================================"
+          echo "COMMANDS TO EXECUTE ON KAGGLE"
+          echo "========================================"
+
+          if [ ! -f commands.txt ]; then
+            echo "ERROR: commands.txt not found"
+            exit 1
+          fi
+
+          cat commands.txt
+
+
+      # =========================================================
+      # 5. Create Kaggle GPU Kernel
+      # =========================================================
+      - name: Create Kaggle GPU Kernel
         run: |
 
           rm -rf kaggle-gpu-test
@@ -76,17 +96,30 @@ jobs:
 
 
           # =====================================================
-          # Python script that runs INSIDE Kaggle GPU
+          # Copy commands.txt into Kaggle Kernel
           # =====================================================
 
-          cat > kaggle-gpu-test/gpu_test.py <<'PY'
+          cp commands.txt kaggle-gpu-test/commands.txt
+
+
+          # =====================================================
+          # Create GPU Worker
+          # =====================================================
+
+          cat > kaggle-gpu-test/gpu_worker.py <<'PY'
 
           import subprocess
           import sys
           import os
+          import shlex
 
 
-          def run(command):
+          # =====================================================
+          # Command runner
+          # =====================================================
+
+          def run_command(command):
+
               print()
               print("=" * 80)
               print("$", command)
@@ -99,7 +132,7 @@ jobs:
                       shell=True,
                       capture_output=True,
                       text=True,
-                      timeout=300
+                      timeout=600
                   )
 
                   if result.stdout:
@@ -113,171 +146,109 @@ jobs:
 
                   return result.returncode
 
+              except subprocess.TimeoutExpired:
+
+                  print("ERROR: command timed out after 600 seconds")
+                  return -1
+
               except Exception as e:
 
                   print("ERROR:", e)
-
                   return -1
 
 
-          print("=" * 80)
-          print("KAGGLE GPU SYSTEM TEST")
-          print("=" * 80)
-
-
           # =====================================================
-          # Python information
+          # System information
           # =====================================================
+
+          print("=" * 80)
+          print("KAGGLE GPU WORKER")
+          print("=" * 80)
 
           print()
-          print("=" * 80)
-          print("PYTHON")
-          print("=" * 80)
-
+          print("Python:")
           print(sys.version)
 
 
           # =====================================================
-          # Environment information
+          # Check commands.txt
           # =====================================================
 
-          run("uname -a")
+          commands_file = "commands.txt"
 
+          if not os.path.exists(commands_file):
 
-          # =====================================================
-          # Linux distribution
-          # =====================================================
+              print()
+              print("ERROR: commands.txt does not exist")
 
-          run("cat /etc/os-release")
-
-
-          # =====================================================
-          # CPU information
-          # =====================================================
-
-          run("lscpu")
+              sys.exit(1)
 
 
           # =====================================================
-          # Memory information
-          # =====================================================
-
-          run("free -h")
-
-
-          # =====================================================
-          # Disk information
-          # =====================================================
-
-          run("df -h")
-
-
-          # =====================================================
-          # NVIDIA GPU list
-          # =====================================================
-
-          run("nvidia-smi -L")
-
-
-          # =====================================================
-          # Full NVIDIA information
-          # =====================================================
-
-          run("nvidia-smi")
-
-
-          # =====================================================
-          # NVIDIA driver information
-          # =====================================================
-
-          run("nvidia-smi --query-gpu=name,driver_version,memory.total,temperature.gpu,power.draw,power.limit,utilization.gpu --format=csv")
-
-
-          # =====================================================
-          # CUDA information
-          # =====================================================
-
-          run("nvidia-smi --query-gpu=name,compute_cap --format=csv")
-
-
-          # =====================================================
-          # Check apt
-          # =====================================================
-
-          run("apt-get --version")
-
-
-          # =====================================================
-          # Update package list
-          # =====================================================
-
-          run("apt-get update")
-
-
-          # =====================================================
-          # Install pciutils
-          # =====================================================
-
-          run("apt-get install -y pciutils")
-
-
-          # =====================================================
-          # Check lspci
-          # =====================================================
-
-          run("which lspci")
-
-
-          # =====================================================
-          # lspci version
-          # =====================================================
-
-          run("lspci --version")
-
-
-          # =====================================================
-          # VGA devices
-          # =====================================================
-
-          run("lspci | grep -i vga")
-
-
-          # =====================================================
-          # NVIDIA PCI devices
-          # =====================================================
-
-          run("lspci | grep -i nvidia")
-
-
-          # =====================================================
-          # Full PCI NVIDIA information
-          # =====================================================
-
-          run("lspci -nn | grep -i nvidia")
-
-
-          # =====================================================
-          # NVIDIA PCI device detailed information
-          # =====================================================
-
-          run("lspci -vv | grep -A 20 -B 5 -i nvidia")
-
-
-          # =====================================================
-          # Final GPU test
+          # Read commands
           # =====================================================
 
           print()
           print("=" * 80)
-          print("FINAL GPU TEST")
+          print("READING COMMANDS.TXT")
           print("=" * 80)
 
-          run("nvidia-smi -L")
 
+          with open(commands_file, "r", encoding="utf-8") as f:
+
+              lines = f.readlines()
+
+
+          commands = []
+
+
+          for line in lines:
+
+              line = line.strip()
+
+              # Empty lines
+              if not line:
+                  continue
+
+              # Comments
+              if line.startswith("#"):
+                  continue
+
+              commands.append(line)
+
+
+          print("Commands found:", len(commands))
+
+
+          # =====================================================
+          # Execute commands
+          # =====================================================
+
+          if not commands:
+
+              print("No commands found.")
+
+          else:
+
+              for index, command in enumerate(commands, 1):
+
+                  print()
+                  print()
+                  print("#" * 80)
+                  print(f"# COMMAND {index} / {len(commands)}")
+                  print("#" * 80)
+
+                  run_command(command)
+
+
+          # =====================================================
+          # Finished
+          # =====================================================
 
           print()
+          print()
           print("=" * 80)
-          print("KAGGLE GPU SYSTEM TEST FINISHED")
+          print("ALL COMMANDS FINISHED")
           print("=" * 80)
 
           PY
@@ -289,9 +260,9 @@ jobs:
 
           cat > kaggle-gpu-test/kernel-metadata.json <<EOF
           {
-            "id": "${KAGGLE_USERNAME}/gpu-system-test",
-            "title": "GPU System Test",
-            "code_file": "gpu_test.py",
+            "id": "${KAGGLE_USERNAME}/gpu-command-runner",
+            "title": "GPU Command Runner",
+            "code_file": "gpu_worker.py",
             "language": "python",
             "kernel_type": "script",
             "is_private": true,
@@ -308,7 +279,7 @@ jobs:
 
 
       # =========================================================
-      # 5. Push Kernel to Kaggle
+      # 6. Push Kernel to Kaggle
       # =========================================================
       - name: Push GPU Kernel
         run: |
@@ -322,7 +293,7 @@ jobs:
 
 
       # =========================================================
-      # 6. Wait for Kernel
+      # 7. Wait for Kaggle
       # =========================================================
       - name: Wait for Kaggle Kernel
         run: |
@@ -339,8 +310,25 @@ jobs:
             echo "STATUS CHECK $i / 20"
             echo "========================================"
 
-            kaggle kernels status \
-              "${KAGGLE_USERNAME}/gpu-system-test" || true
+            STATUS=$(kaggle kernels status \
+              "${KAGGLE_USERNAME}/gpu-command-runner" 2>&1 || true)
+
+            echo "$STATUS"
+
+            if echo "$STATUS" | grep -q "COMPLETE"; then
+              echo "Kaggle Kernel completed."
+              break
+            fi
+
+            if echo "$STATUS" | grep -q "ERROR"; then
+              echo "Kaggle Kernel reported an error."
+              break
+            fi
+
+            if echo "$STATUS" | grep -q "CANCEL"; then
+              echo "Kaggle Kernel was cancelled."
+              break
+            fi
 
             sleep 15
 
@@ -348,7 +336,7 @@ jobs:
 
 
       # =========================================================
-      # 7. Download output
+      # 8. Download Kaggle output
       # =========================================================
       - name: Download Kaggle Output
         run: |
@@ -361,14 +349,14 @@ jobs:
           echo "========================================"
 
           kaggle kernels output \
-            "${KAGGLE_USERNAME}/gpu-system-test" \
+            "${KAGGLE_USERNAME}/gpu-command-runner" \
             -p kaggle-output || true
 
 
       # =========================================================
-      # 8. Display result
+      # 9. Display result
       # =========================================================
-      - name: Display Complete GPU Information
+      - name: Display Kaggle Result
         run: |
 
           echo ""
@@ -382,18 +370,14 @@ jobs:
 
           echo ""
           echo "============================================================"
-          echo "COMPLETE KAGGLE OUTPUT"
+          echo "COMMAND OUTPUT"
           echo "============================================================"
 
           if find kaggle-output -type f | grep -q .
           then
-
               cat kaggle-output/*
-
           else
-
               echo "No output files found."
-
           fi
 
           echo ""
