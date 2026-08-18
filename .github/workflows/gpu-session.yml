@@ -7,31 +7,23 @@ jobs:
   gpu-test:
     runs-on: ubuntu-latest
 
+    env:
+      KAGGLE_USERNAME: ${{ vars.KAGGLE_USERNAME }}
+      KAGGLE_API_TOKEN: ${{ vars.KAGGLE_API_TOKEN }}
+
     steps:
       - name: Install Kaggle CLI
         run: |
           python -m pip install --upgrade pip
           pip install kaggle
 
-      - name: Configure Kaggle API
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      - name: Check Kaggle Authentication
         run: |
-          mkdir -p ~/.kaggle
-
-          cat > ~/.kaggle/kaggle.json <<EOF
-          {
-            "username": "$KAGGLE_USERNAME",
-            "key": "$KAGGLE_API_TOKEN"
-          }
-          EOF
-
-          chmod 600 ~/.kaggle/kaggle.json
+          echo "Kaggle username: $KAGGLE_USERNAME"
+          kaggle --version
+          kaggle kernels list --mine --page-size 1
 
       - name: Create GPU Kernel
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
           mkdir -p kaggle-gpu-test
 
@@ -51,7 +43,7 @@ jobs:
           for command in commands:
               print()
               print("=" * 70)
-              print("$", command)
+              print("$ " + command)
               print("=" * 70)
 
               result = subprocess.run(
@@ -85,19 +77,16 @@ jobs:
           }
           EOF
 
-      - name: Create and Run Kaggle Kernel
-        working-directory: kaggle-gpu-test
-        run: |
-          kaggle kernels push -p .
+          cat kaggle-gpu-test/kernel-metadata.json
 
-      - name: Wait for Kaggle GPU
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      - name: Push Kernel to Kaggle
         run: |
-          echo "Waiting for Kaggle..."
-          
-          for i in {1..12}; do
-            echo "Check $i/12"
+          kaggle kernels push -p kaggle-gpu-test
+
+      - name: Wait for Kaggle
+        run: |
+          for i in {1..20}; do
+            echo "========== CHECK $i/20 =========="
 
             kaggle kernels status \
               "${KAGGLE_USERNAME}/gpu-auto-test" || true
@@ -106,8 +95,6 @@ jobs:
           done
 
       - name: Download Kaggle Output
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
           mkdir -p kaggle-output
 
@@ -115,11 +102,10 @@ jobs:
             "${KAGGLE_USERNAME}/gpu-auto-test" \
             -p kaggle-output || true
 
-      - name: Show GPU Information
+      - name: Display GPU Result
         run: |
-          echo ""
           echo "========================================"
-          echo "KAGGLE GPU OUTPUT"
+          echo "KAGGLE GPU RESULT"
           echo "========================================"
 
           find kaggle-output -type f -print
