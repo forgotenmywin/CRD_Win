@@ -1,344 +1,128 @@
-name: Kaggle GPU Session
+name: Kaggle GPU Auto Test
 
 on:
   workflow_dispatch:
-    inputs:
-      session_id:
-        description: "GPU Session ID"
-        required: true
-        type: string
-
-      api_url:
-        description: "Railway API URL"
-        required: true
-        type: string
-
-      worker_token:
-        description: "Worker token"
-        required: true
-        type: string
 
 jobs:
-
-  gpu-session:
-
+  gpu-test:
     runs-on: ubuntu-latest
 
-    timeout-minutes: 25
-
-    env:
-      SESSION_ID: ${{ inputs.session_id }}
-      API_URL: ${{ inputs.api_url }}
-      WORKER_TOKEN: ${{ inputs.worker_token }}
-
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-
     steps:
-
-      # =====================================================
-      # CHECKOUT
-      # =====================================================
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # =====================================================
-      # PYTHON
-      # =====================================================
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # =====================================================
-      # INSTALL KAGGLE
-      # =====================================================
-
-      - name: Install Kaggle
+      - name: Install Kaggle CLI
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade kaggle
+          pip install kaggle
 
-      # =====================================================
-      # SHOW CONFIG
-      # =====================================================
-
-      - name: Verify configuration
-        shell: bash
+      - name: Configure Kaggle API
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
-          set -e
+          mkdir -p ~/.kaggle
 
-          echo "=============================================="
-          echo "CONFIGURATION"
-          echo "=============================================="
-
-          echo "SESSION_ID length: ${#SESSION_ID}"
-          echo "API_URL: ${API_URL}"
-          echo "WORKER_TOKEN length: ${#WORKER_TOKEN}"
-          echo "KAGGLE_USERNAME: ${KAGGLE_USERNAME}"
-
-          if [ -z "$SESSION_ID" ]; then
-            echo "ERROR: SESSION_ID is empty"
-            exit 1
-          fi
-
-          if [ -z "$API_URL" ]; then
-            echo "ERROR: API_URL is empty"
-            exit 1
-          fi
-
-          if [ -z "$WORKER_TOKEN" ]; then
-            echo "ERROR: WORKER_TOKEN is empty"
-            exit 1
-          fi
-
-          echo "Configuration OK."
-
-      # =====================================================
-      # CREATE KAGGLE WORKER DIRECTORY
-      # =====================================================
-
-      - name: Prepare Kaggle worker
-        run: |
-          set -e
-
-          rm -rf kaggle_worker
-
-          mkdir -p kaggle_worker
-
-          cp kaggle_worker.py kaggle_worker/worker.py
-
-      # =====================================================
-      # CREATE KAGGLE METADATA
-      # =====================================================
-
-      - name: Create Kaggle metadata
-        shell: bash
-        run: |
-
-          set -e
-
-          python <<'PY'
-
-          import json
-          import os
-
-          username = os.environ["KAGGLE_USERNAME"]
-          session_id = os.environ["SESSION_ID"]
-
-          metadata = {
-              "id": f"{username}/gpu-session-{session_id}",
-              "title": f"GPU Session {session_id}",
-              "code_file": "worker.py",
-              "language": "python",
-              "kernel_type": "script",
-              "is_private": True,
-              "enable_gpu": True,
-              "enable_internet": True
-          }
-
-          with open(
-              "kaggle_worker/kernel-metadata.json",
-              "w",
-              encoding="utf-8"
-          ) as f:
-
-              json.dump(
-                  metadata,
-                  f,
-                  indent=2
-              )
-
-          print("==============================================")
-          print("KAGGLE METADATA")
-          print("==============================================")
-
-          print(
-              json.dumps(
-                  metadata,
-                  indent=2
-              )
-          )
-
-          PY
-
-      # =====================================================
-      # CREATE KAGGLE ENVIRONMENT FILE
-      # =====================================================
-
-      - name: Create worker environment
-        shell: bash
-        run: |
-
-          set -e
-
-          cat > kaggle_worker/.env.json <<EOF
+          cat > ~/.kaggle/kaggle.json <<EOF
           {
-            "SESSION_ID": "${SESSION_ID}",
-            "API_URL": "${API_URL}",
-            "WORKER_TOKEN": "${WORKER_TOKEN}"
+            "username": "$KAGGLE_USERNAME",
+            "key": "$KAGGLE_API_TOKEN"
           }
           EOF
 
-          echo "Worker environment prepared."
+          chmod 600 ~/.kaggle/kaggle.json
 
-      # =====================================================
-      # CREATE WRAPPER
-      # =====================================================
-
-      - name: Create worker launcher
-        shell: bash
+      - name: Create GPU Kernel
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
+          mkdir -p kaggle-gpu-test
 
-          set -e
+          cat > kaggle-gpu-test/gpu_test.py <<'PY'
+          import subprocess
 
-          cat > kaggle_worker/launcher.py <<'PY'
+          print("=" * 70)
+          print("KAGGLE GPU TEST")
+          print("=" * 70)
 
-          import os
-          import runpy
+          commands = [
+              "nvidia-smi -L",
+              "nvidia-smi",
+              "lspci | grep -i nvidia"
+          ]
 
-          env_file = ".env.json"
+          for command in commands:
+              print()
+              print("=" * 70)
+              print("$", command)
+              print("=" * 70)
 
-          # -------------------------------------------------
-          # Read environment values
-          # -------------------------------------------------
+              result = subprocess.run(
+                  command,
+                  shell=True,
+                  capture_output=True,
+                  text=True
+              )
 
-          if os.path.exists(env_file):
+              print(result.stdout)
 
-              import json
+              if result.stderr:
+                  print("STDERR:")
+                  print(result.stderr)
 
-              with open(
-                  env_file,
-                  "r",
-                  encoding="utf-8"
-              ) as f:
-
-                  data = json.load(f)
-
-              for key, value in data.items():
-
-                  os.environ[key] = str(value)
-
-          # -------------------------------------------------
-          # Run worker
-          # -------------------------------------------------
-
-          runpy.run_path(
-              "worker.py",
-              run_name="__main__"
-          )
-
+          print()
+          print("=" * 70)
+          print("GPU TEST FINISHED")
+          print("=" * 70)
           PY
 
-      # =====================================================
-      # IMPORTANT:
-      # CREATE KAGGLE SCRIPT WITH VALUES EMBEDDED
-      # =====================================================
+          cat > kaggle-gpu-test/kernel-metadata.json <<EOF
+          {
+            "id": "${KAGGLE_USERNAME}/gpu-auto-test",
+            "title": "GPU Auto Test",
+            "code_file": "gpu_test.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": true,
+            "enable_gpu": true
+          }
+          EOF
 
-      - name: Inject session into worker
-        shell: bash
+      - name: Create and Run Kaggle Kernel
+        working-directory: kaggle-gpu-test
         run: |
-
-          set -e
-
-          python <<'PY'
-
-          import os
-          from pathlib import Path
-
-          session_id = os.environ["SESSION_ID"]
-          api_url = os.environ["API_URL"]
-          worker_token = os.environ["WORKER_TOKEN"]
-
-          source = Path(
-              "kaggle_worker/worker.py"
-          ).read_text(
-              encoding="utf-8"
-          )
-
-          # -------------------------------------------------
-          # Replace the environment reads with fallback
-          # values embedded into this specific Kaggle job.
-          # -------------------------------------------------
-
-          source = source.replace(
-              'os.environ.get("SESSION_ID", "").strip()',
-              repr(session_id)
-          )
-
-          source = source.replace(
-              'os.environ.get("API_URL", "").strip().rstrip("/")',
-              repr(api_url)
-          )
-
-          source = source.replace(
-              'os.environ.get("WORKER_TOKEN", "").strip()',
-              repr(worker_token)
-          )
-
-          Path(
-              "kaggle_worker/worker.py"
-          ).write_text(
-              source,
-              encoding="utf-8"
-          )
-
-          print("Session injected into Kaggle worker.")
-
-          PY
-
-      # =====================================================
-      # SHOW FINAL WORKER CONFIG
-      # =====================================================
-
-      - name: Verify Kaggle worker
-        shell: bash
-        run: |
-
-          set -e
-
-          echo "=============================================="
-          echo "FINAL WORKER"
-          echo "=============================================="
-
-          grep -n "SESSION_ID =" kaggle_worker/worker.py
-          grep -n "API_URL =" kaggle_worker/worker.py
-          grep -n "WORKER_TOKEN =" kaggle_worker/worker.py
-
-      # =====================================================
-      # PUSH KAGGLE KERNEL
-      # =====================================================
-
-      - name: Push Kaggle GPU worker
-        working-directory: kaggle_worker
-        shell: bash
-        run: |
-
-          set -e
-
-          echo "=============================================="
-          echo "PUSHING KAGGLE GPU WORKER"
-          echo "=============================================="
-
           kaggle kernels push -p .
 
-      # =====================================================
-      # WAIT
-      # =====================================================
-
-      - name: Wait for Kaggle worker
-        shell: bash
+      - name: Wait for Kaggle GPU
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
-
-          echo "Kaggle GPU worker submitted."
-
-          echo "Session:"
-          echo "$SESSION_ID"
-
           echo "Waiting for Kaggle..."
+          
+          for i in {1..12}; do
+            echo "Check $i/12"
 
-          sleep 10
+            kaggle kernels status \
+              "${KAGGLE_USERNAME}/gpu-auto-test" || true
 
-          echo "Done."
+            sleep 15
+          done
+
+      - name: Download Kaggle Output
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        run: |
+          mkdir -p kaggle-output
+
+          kaggle kernels output \
+            "${KAGGLE_USERNAME}/gpu-auto-test" \
+            -p kaggle-output || true
+
+      - name: Show GPU Information
+        run: |
+          echo ""
+          echo "========================================"
+          echo "KAGGLE GPU OUTPUT"
+          echo "========================================"
+
+          find kaggle-output -type f -print
+
+          echo ""
+          cat kaggle-output/* 2>/dev/null || true
