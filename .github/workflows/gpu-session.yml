@@ -1,4 +1,4 @@
-name: Kaggle GPU Auto Test
+name: Kaggle GPU System Test
 
 on:
   workflow_dispatch:
@@ -21,7 +21,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade kaggle
 
-          echo "Kaggle CLI version:"
+          echo "========================================"
+          echo "KAGGLE CLI"
+          echo "========================================"
+
           kaggle --version
 
 
@@ -51,7 +54,9 @@ jobs:
       # =========================================================
       - name: Test Kaggle API
         run: |
-          echo "Testing Kaggle API..."
+          echo "========================================"
+          echo "TESTING KAGGLE API"
+          echo "========================================"
 
           kaggle kernels list \
             --mine \
@@ -69,35 +74,23 @@ jobs:
           rm -rf kaggle-gpu-test
           mkdir -p kaggle-gpu-test
 
-          # -----------------------------------------------------
-          # Python program that will run INSIDE Kaggle GPU
-          # -----------------------------------------------------
+
+          # =====================================================
+          # Python script that runs INSIDE Kaggle GPU
+          # =====================================================
 
           cat > kaggle-gpu-test/gpu_test.py <<'PY'
 
           import subprocess
           import sys
+          import os
 
-          print("=" * 70)
-          print("KAGGLE GPU TEST")
-          print("=" * 70)
 
-          print()
-          print("Python:")
-          print(sys.version)
-
-          commands = [
-              "nvidia-smi -L",
-              "nvidia-smi",
-              "lspci | grep -i nvidia"
-          ]
-
-          for command in commands:
-
+          def run(command):
               print()
-              print("=" * 70)
+              print("=" * 80)
               print("$", command)
-              print("=" * 70)
+              print("=" * 80)
 
               try:
 
@@ -106,10 +99,11 @@ jobs:
                       shell=True,
                       capture_output=True,
                       text=True,
-                      timeout=60
+                      timeout=300
                   )
 
-                  print(result.stdout)
+                  if result.stdout:
+                      print(result.stdout)
 
                   if result.stderr:
                       print("STDERR:")
@@ -117,26 +111,186 @@ jobs:
 
                   print("Return code:", result.returncode)
 
+                  return result.returncode
+
               except Exception as e:
 
                   print("ERROR:", e)
 
+                  return -1
+
+
+          print("=" * 80)
+          print("KAGGLE GPU SYSTEM TEST")
+          print("=" * 80)
+
+
+          # =====================================================
+          # Python information
+          # =====================================================
+
           print()
-          print("=" * 70)
-          print("GPU TEST FINISHED")
-          print("=" * 70)
+          print("=" * 80)
+          print("PYTHON")
+          print("=" * 80)
+
+          print(sys.version)
+
+
+          # =====================================================
+          # Environment information
+          # =====================================================
+
+          run("uname -a")
+
+
+          # =====================================================
+          # Linux distribution
+          # =====================================================
+
+          run("cat /etc/os-release")
+
+
+          # =====================================================
+          # CPU information
+          # =====================================================
+
+          run("lscpu")
+
+
+          # =====================================================
+          # Memory information
+          # =====================================================
+
+          run("free -h")
+
+
+          # =====================================================
+          # Disk information
+          # =====================================================
+
+          run("df -h")
+
+
+          # =====================================================
+          # NVIDIA GPU list
+          # =====================================================
+
+          run("nvidia-smi -L")
+
+
+          # =====================================================
+          # Full NVIDIA information
+          # =====================================================
+
+          run("nvidia-smi")
+
+
+          # =====================================================
+          # NVIDIA driver information
+          # =====================================================
+
+          run("nvidia-smi --query-gpu=name,driver_version,memory.total,temperature.gpu,power.draw,power.limit,utilization.gpu --format=csv")
+
+
+          # =====================================================
+          # CUDA information
+          # =====================================================
+
+          run("nvidia-smi --query-gpu=name,compute_cap --format=csv")
+
+
+          # =====================================================
+          # Check apt
+          # =====================================================
+
+          run("apt-get --version")
+
+
+          # =====================================================
+          # Update package list
+          # =====================================================
+
+          run("apt-get update")
+
+
+          # =====================================================
+          # Install pciutils
+          # =====================================================
+
+          run("apt-get install -y pciutils")
+
+
+          # =====================================================
+          # Check lspci
+          # =====================================================
+
+          run("which lspci")
+
+
+          # =====================================================
+          # lspci version
+          # =====================================================
+
+          run("lspci --version")
+
+
+          # =====================================================
+          # VGA devices
+          # =====================================================
+
+          run("lspci | grep -i vga")
+
+
+          # =====================================================
+          # NVIDIA PCI devices
+          # =====================================================
+
+          run("lspci | grep -i nvidia")
+
+
+          # =====================================================
+          # Full PCI NVIDIA information
+          # =====================================================
+
+          run("lspci -nn | grep -i nvidia")
+
+
+          # =====================================================
+          # NVIDIA PCI device detailed information
+          # =====================================================
+
+          run("lspci -vv | grep -A 20 -B 5 -i nvidia")
+
+
+          # =====================================================
+          # Final GPU test
+          # =====================================================
+
+          print()
+          print("=" * 80)
+          print("FINAL GPU TEST")
+          print("=" * 80)
+
+          run("nvidia-smi -L")
+
+
+          print()
+          print("=" * 80)
+          print("KAGGLE GPU SYSTEM TEST FINISHED")
+          print("=" * 80)
 
           PY
 
 
-          # -----------------------------------------------------
-          # Kaggle Kernel metadata
-          # -----------------------------------------------------
+          # =====================================================
+          # Kaggle metadata
+          # =====================================================
 
           cat > kaggle-gpu-test/kernel-metadata.json <<EOF
           {
-            "id": "${KAGGLE_USERNAME}/gpu-auto-test",
-            "title": "GPU Auto Test",
+            "id": "${KAGGLE_USERNAME}/gpu-system-test",
+            "title": "GPU System Test",
             "code_file": "gpu_test.py",
             "language": "python",
             "kernel_type": "script",
@@ -154,26 +308,28 @@ jobs:
 
 
       # =========================================================
-      # 5. Create / Update Kaggle Kernel
+      # 5. Push Kernel to Kaggle
       # =========================================================
-      - name: Push GPU Kernel to Kaggle
+      - name: Push GPU Kernel
         run: |
 
-          echo "Uploading GPU Kernel to Kaggle..."
+          echo "========================================"
+          echo "SUBMITTING KAGGLE GPU KERNEL"
+          echo "========================================"
 
           kaggle kernels push \
             -p kaggle-gpu-test
 
-          echo "Kernel submitted."
-
 
       # =========================================================
-      # 6. Wait for Kaggle GPU
+      # 6. Wait for Kernel
       # =========================================================
-      - name: Wait for Kaggle GPU
+      - name: Wait for Kaggle Kernel
         run: |
 
-          echo "Waiting for Kaggle Kernel..."
+          echo "========================================"
+          echo "WAITING FOR KAGGLE"
+          echo "========================================"
 
           for i in {1..20}
           do
@@ -184,7 +340,7 @@ jobs:
             echo "========================================"
 
             kaggle kernels status \
-              "${KAGGLE_USERNAME}/gpu-auto-test" || true
+              "${KAGGLE_USERNAME}/gpu-system-test" || true
 
             sleep 15
 
@@ -192,7 +348,7 @@ jobs:
 
 
       # =========================================================
-      # 7. Download Kaggle Output
+      # 7. Download output
       # =========================================================
       - name: Download Kaggle Output
         run: |
@@ -200,45 +356,47 @@ jobs:
           rm -rf kaggle-output
           mkdir -p kaggle-output
 
-          echo "Downloading Kaggle output..."
+          echo "========================================"
+          echo "DOWNLOADING KAGGLE OUTPUT"
+          echo "========================================"
 
           kaggle kernels output \
-            "${KAGGLE_USERNAME}/gpu-auto-test" \
+            "${KAGGLE_USERNAME}/gpu-system-test" \
             -p kaggle-output || true
 
 
       # =========================================================
-      # 8. Show GPU Information
+      # 8. Display result
       # =========================================================
-      - name: Show GPU Information
+      - name: Display Complete GPU Information
         run: |
 
           echo ""
-          echo "########################################################"
-          echo "#              KAGGLE GPU RESULT                      #"
-          echo "########################################################"
+          echo "############################################################"
+          echo "#                  KAGGLE GPU RESULT                       #"
+          echo "############################################################"
 
           echo ""
-          echo "Output files:"
+          echo "OUTPUT FILES:"
           find kaggle-output -type f -print
 
           echo ""
-          echo "========================================================"
-          echo "GPU OUTPUT"
-          echo "========================================================"
+          echo "============================================================"
+          echo "COMPLETE KAGGLE OUTPUT"
+          echo "============================================================"
 
           if find kaggle-output -type f | grep -q .
           then
 
-            cat kaggle-output/*
+              cat kaggle-output/*
 
           else
 
-            echo "No output file was downloaded."
+              echo "No output files found."
 
           fi
 
           echo ""
-          echo "########################################################"
-          echo "#                  TEST FINISHED                      #"
-          echo "########################################################"
+          echo "############################################################"
+          echo "#                       FINISHED                            #"
+          echo "############################################################"
