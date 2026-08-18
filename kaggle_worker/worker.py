@@ -7,12 +7,17 @@ import requests
 
 
 # ============================================================
-# CONFIG
+# INJECTED BY GITHUB ACTIONS
 # ============================================================
 
-SESSION_ID = os.environ.get("SESSION_ID", "")
-API_URL = os.environ.get("API_URL", "").rstrip("/")
-WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
+SESSION_ID = "__SESSION_ID__"
+API_URL = "__API_URL__"
+WORKER_TOKEN = "__WORKER_TOKEN__"
+
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 TEST_SECONDS = 600
 
@@ -22,10 +27,6 @@ COMMAND_INTERVAL = 30
 REQUEST_TIMEOUT = 15
 
 
-# ============================================================
-# HEADERS
-# ============================================================
-
 HEADERS = {
     "X-Worker-Token": WORKER_TOKEN,
     "Content-Type": "application/json",
@@ -33,7 +34,7 @@ HEADERS = {
 
 
 # ============================================================
-# LOGGING
+# LOG
 # ============================================================
 
 def log(message=""):
@@ -41,33 +42,33 @@ def log(message=""):
 
 
 # ============================================================
-# CONFIG VALIDATION
+# VALIDATE
 # ============================================================
 
 def validate_config():
 
-    if not SESSION_ID:
+    if not SESSION_ID or SESSION_ID == "__SESSION_ID__":
         raise RuntimeError("SESSION_ID was not injected")
 
-    if not API_URL:
+    if not API_URL or API_URL == "__API_URL__":
         raise RuntimeError("API_URL was not injected")
 
-    if not API_URL.startswith("http://") and not API_URL.startswith("https://"):
+    if not API_URL.startswith(("http://", "https://")):
         raise RuntimeError(
             f"Invalid API_URL: {API_URL}"
         )
 
-    if not WORKER_TOKEN:
+    if not WORKER_TOKEN or WORKER_TOKEN == "__WORKER_TOKEN__":
         raise RuntimeError("WORKER_TOKEN was not injected")
 
 
 # ============================================================
-# API REQUEST
+# POST
 # ============================================================
 
 def api_post(path, payload=None):
 
-    url = f"{API_URL}{path}"
+    url = API_URL + path
 
     try:
 
@@ -95,16 +96,19 @@ def api_post(path, payload=None):
     except Exception as e:
 
         log(
-            f"[API] POST ERROR {path}: "
-            f"{e}"
+            f"[API] POST ERROR {path}: {e}"
         )
 
         return None, None
 
 
+# ============================================================
+# GET
+# ============================================================
+
 def api_get(path):
 
-    url = f"{API_URL}{path}"
+    url = API_URL + path
 
     try:
 
@@ -129,15 +133,14 @@ def api_get(path):
     except Exception as e:
 
         log(
-            f"[API] GET ERROR {path}: "
-            f"{e}"
+            f"[API] GET ERROR {path}: {e}"
         )
 
         return None, None
 
 
 # ============================================================
-# GPU INFORMATION
+# NVIDIA
 # ============================================================
 
 def show_gpu():
@@ -156,22 +159,14 @@ def show_gpu():
             timeout=20,
         )
 
-        print(
-            result.stdout,
-            flush=True
-        )
+        print(result.stdout, flush=True)
 
-        if result.returncode != 0:
-            print(
-                result.stderr,
-                flush=True
-            )
+        if result.stderr:
+            print(result.stderr, flush=True)
 
     except Exception as e:
 
-        log(
-            f"nvidia-smi error: {e}"
-        )
+        log(f"nvidia-smi error: {e}")
 
 
 # ============================================================
@@ -195,10 +190,7 @@ def gpu_test():
 
             return False
 
-        device = torch.device("cuda")
-
         gpu_name = torch.cuda.get_device_name(0)
-
         capability = torch.cuda.get_device_capability(0)
 
         log(
@@ -206,11 +198,11 @@ def gpu_test():
         )
 
         log(
-            f"Compute capability: "
-            f"{capability}"
+            f"Compute capability: {capability}"
         )
 
-        # Real GPU operation
+        device = torch.device("cuda")
+
         size = 1024 * 1024
 
         start = time.time()
@@ -227,9 +219,7 @@ def gpu_test():
 
         elapsed = time.time() - start
 
-        result = int(
-            y.sum().item()
-        )
+        result = int(y.sum().item())
 
         expected = size * 2
 
@@ -261,9 +251,7 @@ def gpu_test():
 
     except Exception as e:
 
-        log(
-            f"GPU TEST ERROR: {e}"
-        )
+        log(f"GPU TEST ERROR: {e}")
 
         traceback.print_exc()
 
@@ -314,8 +302,8 @@ def worker_ready():
             if response.status_code == 401:
 
                 log(
-                    "ERROR: Railway rejected "
-                    "WORKER_TOKEN (401)."
+                    "ERROR: WORKER_TOKEN "
+                    "rejected by Railway."
                 )
 
         time.sleep(3)
@@ -334,9 +322,7 @@ def heartbeat():
         f"{SESSION_ID}/heartbeat"
     )
 
-    response, data = api_post(
-        path
-    )
+    response, data = api_post(path)
 
     if response is None:
         return None
@@ -358,9 +344,7 @@ def get_command():
         f"{SESSION_ID}/command"
     )
 
-    response, data = api_get(
-        path
-    )
+    response, data = api_get(path)
 
     if response is None:
         return None
@@ -370,16 +354,11 @@ def get_command():
 
     if isinstance(data, dict):
 
-        command = data.get(
-            "command"
-        )
-
         log(
-            f"[COMMAND] "
-            f"{data}"
+            f"[COMMAND] {data}"
         )
 
-        return command
+        return data.get("command")
 
     return None
 
@@ -466,9 +445,7 @@ def worker_loop():
 
         now = time.time()
 
-        # -----------------------------
         # HEARTBEAT
-        # -----------------------------
 
         if (
             now - last_heartbeat
@@ -490,9 +467,7 @@ def worker_loop():
                     f"remaining={remaining}"
                 )
 
-        # -----------------------------
         # COMMAND
-        # -----------------------------
 
         if (
             now - last_command
@@ -504,10 +479,7 @@ def worker_loop():
             last_command = now
 
             if command:
-
-                execute_command(
-                    command
-                )
+                execute_command(command)
 
         log(
             f"[WORKER] "
@@ -536,8 +508,7 @@ def main():
     )
 
     log(
-        f"TOKEN: "
-        f"{len(WORKER_TOKEN)} chars"
+        f"TOKEN: {len(WORKER_TOKEN)} chars"
     )
 
     validate_config()
@@ -571,9 +542,7 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        log(
-            "Worker interrupted."
-        )
+        log("Worker interrupted.")
 
         sys.exit(0)
 
@@ -584,9 +553,7 @@ if __name__ == "__main__":
         log("WORKER ERROR")
         log("=" * 60)
 
-        log(
-            repr(e)
-        )
+        log(repr(e))
 
         traceback.print_exc()
 
