@@ -4,23 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       session_id:
-        description: "GPU Session ID"
         required: true
         type: string
-
       api_url:
-        description: "Railway API URL"
         required: true
         type: string
-
       worker_token:
-        description: "Worker Token"
         required: true
         type: string
-
 
 jobs:
-
   gpu-session:
 
     runs-on: ubuntu-latest
@@ -28,313 +21,259 @@ jobs:
     timeout-minutes: 25
 
     env:
-
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
 
       SESSION_ID: ${{ inputs.session_id }}
-
       API_URL: ${{ inputs.api_url }}
-
       WORKER_TOKEN: ${{ inputs.worker_token }}
-
 
     steps:
 
-      # ======================================================
+      # ============================================================
       # CHECKOUT
-      # ======================================================
+      # ============================================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-
-      # ======================================================
+      # ============================================================
       # PYTHON
-      # ======================================================
+      # ============================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
-
         with:
           python-version: "3.12"
 
-
-      # ======================================================
-      # INSTALL
-      # ======================================================
+      # ============================================================
+      # DEPENDENCIES
+      # ============================================================
 
       - name: Install dependencies
         run: |
-
           python -m pip install --upgrade pip
+          pip install kaggle requests
 
-          pip install --upgrade kaggle requests
+      # ============================================================
+      # CHECK VARIABLES
+      # ============================================================
 
-
-      # ======================================================
-      # VERIFY
-      # ======================================================
-
-      - name: Verify configuration
+      - name: Check configuration
         shell: bash
-
         run: |
-
           set -e
 
           echo "========================================"
-          echo "VERIFY"
+          echo "CHECKING CONFIGURATION"
           echo "========================================"
 
-          test -n "$KAGGLE_USERNAME" || {
-            echo "KAGGLE_USERNAME missing"
+          echo "SESSION_ID length: ${#SESSION_ID}"
+          echo "API_URL: ${API_URL}"
+          echo "WORKER_TOKEN length: ${#WORKER_TOKEN}"
+
+          if [ -z "$SESSION_ID" ]; then
+            echo "ERROR: SESSION_ID is empty"
             exit 1
-          }
+          fi
 
-          test -n "$KAGGLE_API_TOKEN" || {
-            echo "KAGGLE_API_TOKEN missing"
+          if [ -z "$API_URL" ]; then
+            echo "ERROR: API_URL is empty"
             exit 1
-          }
+          fi
 
-          test -n "$SESSION_ID" || {
-            echo "SESSION_ID missing"
+          if [ -z "$WORKER_TOKEN" ]; then
+            echo "ERROR: WORKER_TOKEN is empty"
             exit 1
-          }
+          fi
 
-          test -n "$API_URL" || {
-            echo "API_URL missing"
-            exit 1
-          }
-
-          test -n "$WORKER_TOKEN" || {
-            echo "WORKER_TOKEN missing"
-            exit 1
-          }
-
-          test -f kaggle_worker/worker.py || {
-            echo "worker.py missing"
-            exit 1
-          }
-
-          echo "KAGGLE_USERNAME: OK"
-
-          echo "KAGGLE_API_TOKEN: OK"
-
-          echo "SESSION_ID: $SESSION_ID"
-
-          echo "API_URL: $API_URL"
-
-          echo "WORKER_TOKEN: ${#WORKER_TOKEN} chars"
-
-          echo "worker.py: OK"
-
-
-      # ======================================================
+      # ============================================================
       # CREATE KAGGLE WORKER
-      # ======================================================
+      # ============================================================
 
-      - name: Build Kaggle worker
+      - name: Create Kaggle worker
         shell: bash
-
         run: |
 
           set -e
 
-          rm -rf kaggle_upload
+          rm -rf kaggle_worker
 
-          mkdir -p kaggle_upload
+          mkdir -p kaggle_worker
 
+          echo "========================================"
+          echo "CREATING KAGGLE WORKER"
+          echo "========================================"
 
-          # Copy original worker
+          # --------------------------------------------------------
+          # Copy worker template
+          # --------------------------------------------------------
 
-          cp kaggle_worker/worker.py \
-             kaggle_upload/worker.py
+          cp kaggle_worker.py kaggle_worker/worker.py
 
-
-          # ==================================================
-          # INJECT SESSION DATA
-          # ==================================================
+          # --------------------------------------------------------
+          # Inject REAL values into Python source
+          # --------------------------------------------------------
 
           python - <<'PY'
-
           import os
           from pathlib import Path
 
-          path = Path("kaggle_upload/worker.py")
-
-          text = path.read_text(
-              encoding="utf-8"
-          )
-
           session_id = os.environ["SESSION_ID"]
-
-          api_url = os.environ["API_URL"]
-
+          api_url = os.environ["API_URL"].rstrip("/")
           worker_token = os.environ["WORKER_TOKEN"]
 
+          source = Path("kaggle_worker/worker.py").read_text()
 
-          replacements = {
-
-              "__SESSION_ID__":
-                  session_id,
-
-              "__API_URL__":
-                  api_url,
-
-              "__WORKER_TOKEN__":
-                  worker_token,
-          }
-
-
-          for old, new in replacements.items():
-
-              text = text.replace(
-                  old,
-                  new
-              )
-
-
-          path.write_text(
-              text,
-              encoding="utf-8"
+          source = source.replace(
+              "__SESSION_ID__",
+              session_id
           )
 
-
-          # ==================================================
-          # VERIFY INJECTION
-          # ==================================================
-
-          text = path.read_text(
-              encoding="utf-8"
+          source = source.replace(
+              "__API_URL__",
+              api_url
           )
 
-
-          if "__SESSION_ID__" in text:
-
-              raise RuntimeError(
-                  "SESSION_ID injection failed"
-              )
-
-
-          if "__API_URL__" in text:
-
-              raise RuntimeError(
-                  "API_URL injection failed"
-              )
-
-
-          if "__WORKER_TOKEN__" in text:
-
-              raise RuntimeError(
-                  "WORKER_TOKEN injection failed"
-              )
-
-
-          print(
-              "SESSION_ID injected: OK"
+          source = source.replace(
+              "__WORKER_TOKEN__",
+              worker_token
           )
 
-          print(
-              "API_URL injected: OK"
-          )
+          Path("kaggle_worker/worker.py").write_text(source)
 
-          print(
-              "WORKER_TOKEN injected: OK"
-          )
-
+          print("Injected SESSION_ID:", session_id)
+          print("Injected API_URL:", api_url)
+          print("Injected TOKEN length:", len(worker_token))
           PY
 
+          # --------------------------------------------------------
+          # Create metadata
+          # --------------------------------------------------------
 
-          # ==================================================
-          # KAGGLE METADATA
-          # ==================================================
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-          cat > kaggle_upload/kernel-metadata.json <<EOF
-          {
-            "id": "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}",
-            "title": "GPU Session ${SESSION_ID}",
-            "code_file": "worker.py",
-            "language": "python",
-            "kernel_type": "script",
-            "is_private": true,
-            "enable_gpu": true,
-            "enable_internet": true
+          username = os.environ["KAGGLE_USERNAME"]
+          session_id = os.environ["SESSION_ID"]
+
+          metadata = {
+              "id": f"{username}/gpu-session-{session_id}",
+              "title": f"GPU Session {session_id}",
+              "code_file": "worker.py",
+              "language": "python",
+              "kernel_type": "script",
+              "is_private": True,
+              "enable_gpu": True,
+              "enable_internet": True
           }
-          EOF
 
+          Path("kaggle_worker/kernel-metadata.json").write_text(
+              json.dumps(metadata, indent=2)
+          )
+
+          print(json.dumps(metadata, indent=2))
+          PY
+
+          # --------------------------------------------------------
+          # Verify generated worker
+          # --------------------------------------------------------
 
           echo ""
           echo "========================================"
-
-          echo "KAGGLE METADATA"
-
+          echo "VERIFYING WORKER"
           echo "========================================"
 
-          cat kaggle_upload/kernel-metadata.json
-
+          grep -n "__SESSION_ID__" kaggle_worker/worker.py || true
+          grep -n "__API_URL__" kaggle_worker/worker.py || true
+          grep -n "__WORKER_TOKEN__" kaggle_worker/worker.py || true
 
           echo ""
-          echo "========================================"
+          echo "First configuration lines:"
 
-          echo "WORKER CONFIG CHECK"
+          grep -nE "SESSION_ID|API_URL|WORKER_TOKEN" \
+            kaggle_worker/worker.py | head -20
 
-          echo "========================================"
-
-
-          grep -q "$SESSION_ID" \
-            kaggle_upload/worker.py
-
-          grep -q "$API_URL" \
-            kaggle_upload/worker.py
-
-
-          echo "Worker configuration injected successfully."
-
-
-      # ======================================================
+      # ============================================================
       # PUSH TO KAGGLE
-      # ======================================================
+      # ============================================================
 
-      - name: Start Kaggle GPU worker
+      - name: Push GPU worker to Kaggle
         shell: bash
-
         run: |
 
           set -e
 
-          cd kaggle_upload
-
+          echo "========================================"
+          echo "PUSHING TO KAGGLE"
           echo "========================================"
 
-          echo "PUSHING KAGGLE GPU WORKER"
-
-          echo "========================================"
+          cd kaggle_worker
 
           kaggle kernels push
 
+      # ============================================================
+      # MONITOR KAGGLE WORKER
+      # ============================================================
 
-      # ======================================================
-      # DONE
-      # ======================================================
-
-      - name: Worker submitted
+      - name: Monitor worker
+        shell: bash
         run: |
 
-          echo "========================================"
-
-          echo "KAGGLE GPU WORKER SUBMITTED"
+          set +e
 
           echo "========================================"
+          echo "MONITORING KAGGLE WORKER"
+          echo "========================================"
 
-          echo "SESSION: $SESSION_ID"
+          for i in $(seq 1 120); do
 
-          echo "KERNEL:"
+            echo ""
+            echo "[$i/120]"
 
-          echo "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
+            RESPONSE=$(curl -s \
+              -H "X-Worker-Token: ${WORKER_TOKEN}" \
+              "${API_URL}/gpu/session/${SESSION_ID}")
 
-          echo ""
+            echo "$RESPONSE"
 
-          echo "Kaggle now has the injected SESSION_ID,"
-          echo "API_URL and WORKER_TOKEN."
+            STATUS=$(python -c "
+          import json
+          import sys
+
+          try:
+              data=json.loads(sys.stdin.read())
+              print(data.get('status','unknown'))
+          except:
+              print('unknown')
+          " <<< "$RESPONSE")
+
+            echo "STATUS=$STATUS"
+
+            case "$STATUS" in
+
+              completed)
+                echo "Worker completed."
+                exit 0
+                ;;
+
+              expired)
+                echo "Session expired."
+                exit 0
+                ;;
+
+              error)
+                echo "Worker reported error."
+                exit 1
+                ;;
+
+            esac
+
+            sleep 10
+
+          done
+
+          echo "Monitor timeout."
+          exit 0
