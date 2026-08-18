@@ -7,98 +7,249 @@ on:
         description: "GPU Session ID"
         required: true
         type: string
+
       api_url:
         description: "Railway API URL"
         required: true
         type: string
+
       worker_token:
-        description: "Worker token"
+        description: "Worker Token"
         required: true
         type: string
 
+
 jobs:
+
   gpu-session:
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 25
 
     env:
+
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
 
       SESSION_ID: ${{ inputs.session_id }}
+
       API_URL: ${{ inputs.api_url }}
+
       WORKER_TOKEN: ${{ inputs.worker_token }}
+
 
     steps:
 
-      - name: Checkout
+      # ======================================================
+      # CHECKOUT
+      # ======================================================
+
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+
+      # ======================================================
+      # PYTHON
+      # ======================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
+
         with:
           python-version: "3.12"
 
-      - name: Install Kaggle
+
+      # ======================================================
+      # INSTALL
+      # ======================================================
+
+      - name: Install dependencies
         run: |
+
           python -m pip install --upgrade pip
+
           pip install --upgrade kaggle requests
+
+
+      # ======================================================
+      # VERIFY
+      # ======================================================
 
       - name: Verify configuration
         shell: bash
+
         run: |
+
           set -e
 
           echo "========================================"
-          echo "VERIFY CONFIGURATION"
+          echo "VERIFY"
           echo "========================================"
 
           test -n "$KAGGLE_USERNAME" || {
-            echo "ERROR: KAGGLE_USERNAME missing"
+            echo "KAGGLE_USERNAME missing"
             exit 1
           }
 
           test -n "$KAGGLE_API_TOKEN" || {
-            echo "ERROR: KAGGLE_API_TOKEN missing"
+            echo "KAGGLE_API_TOKEN missing"
             exit 1
           }
 
           test -n "$SESSION_ID" || {
-            echo "ERROR: SESSION_ID missing"
+            echo "SESSION_ID missing"
             exit 1
           }
 
           test -n "$API_URL" || {
-            echo "ERROR: API_URL missing"
+            echo "API_URL missing"
             exit 1
           }
 
           test -n "$WORKER_TOKEN" || {
-            echo "ERROR: WORKER_TOKEN missing"
+            echo "WORKER_TOKEN missing"
             exit 1
           }
 
           test -f kaggle_worker/worker.py || {
-            echo "ERROR: kaggle_worker/worker.py missing"
+            echo "worker.py missing"
             exit 1
           }
 
           echo "KAGGLE_USERNAME: OK"
+
           echo "KAGGLE_API_TOKEN: OK"
+
           echo "SESSION_ID: $SESSION_ID"
+
           echo "API_URL: $API_URL"
+
           echo "WORKER_TOKEN: ${#WORKER_TOKEN} chars"
+
           echo "worker.py: OK"
 
-      - name: Prepare Kaggle kernel
+
+      # ======================================================
+      # CREATE KAGGLE WORKER
+      # ======================================================
+
+      - name: Build Kaggle worker
         shell: bash
+
         run: |
+
           set -e
 
           rm -rf kaggle_upload
+
           mkdir -p kaggle_upload
 
-          cp kaggle_worker/worker.py kaggle_upload/worker.py
+
+          # Copy original worker
+
+          cp kaggle_worker/worker.py \
+             kaggle_upload/worker.py
+
+
+          # ==================================================
+          # INJECT SESSION DATA
+          # ==================================================
+
+          python - <<'PY'
+
+          import os
+          from pathlib import Path
+
+          path = Path("kaggle_upload/worker.py")
+
+          text = path.read_text(
+              encoding="utf-8"
+          )
+
+          session_id = os.environ["SESSION_ID"]
+
+          api_url = os.environ["API_URL"]
+
+          worker_token = os.environ["WORKER_TOKEN"]
+
+
+          replacements = {
+
+              "__SESSION_ID__":
+                  session_id,
+
+              "__API_URL__":
+                  api_url,
+
+              "__WORKER_TOKEN__":
+                  worker_token,
+          }
+
+
+          for old, new in replacements.items():
+
+              text = text.replace(
+                  old,
+                  new
+              )
+
+
+          path.write_text(
+              text,
+              encoding="utf-8"
+          )
+
+
+          # ==================================================
+          # VERIFY INJECTION
+          # ==================================================
+
+          text = path.read_text(
+              encoding="utf-8"
+          )
+
+
+          if "__SESSION_ID__" in text:
+
+              raise RuntimeError(
+                  "SESSION_ID injection failed"
+              )
+
+
+          if "__API_URL__" in text:
+
+              raise RuntimeError(
+                  "API_URL injection failed"
+              )
+
+
+          if "__WORKER_TOKEN__" in text:
+
+              raise RuntimeError(
+                  "WORKER_TOKEN injection failed"
+              )
+
+
+          print(
+              "SESSION_ID injected: OK"
+          )
+
+          print(
+              "API_URL injected: OK"
+          )
+
+          print(
+              "WORKER_TOKEN injected: OK"
+          )
+
+          PY
+
+
+          # ==================================================
+          # KAGGLE METADATA
+          # ==================================================
 
           cat > kaggle_upload/kernel-metadata.json <<EOF
           {
@@ -113,40 +264,77 @@ jobs:
           }
           EOF
 
+
+          echo ""
           echo "========================================"
+
           echo "KAGGLE METADATA"
+
           echo "========================================"
 
           cat kaggle_upload/kernel-metadata.json
 
-      - name: Upload and start Kaggle GPU worker
+
+          echo ""
+          echo "========================================"
+
+          echo "WORKER CONFIG CHECK"
+
+          echo "========================================"
+
+
+          grep -q "$SESSION_ID" \
+            kaggle_upload/worker.py
+
+          grep -q "$API_URL" \
+            kaggle_upload/worker.py
+
+
+          echo "Worker configuration injected successfully."
+
+
+      # ======================================================
+      # PUSH TO KAGGLE
+      # ======================================================
+
+      - name: Start Kaggle GPU worker
         shell: bash
+
         run: |
+
           set -e
 
           cd kaggle_upload
 
           echo "========================================"
-          echo "STARTING KAGGLE GPU WORKER"
+
+          echo "PUSHING KAGGLE GPU WORKER"
+
           echo "========================================"
 
           kaggle kernels push
 
-      - name: Monitor Kaggle worker
-        shell: bash
+
+      # ======================================================
+      # DONE
+      # ======================================================
+
+      - name: Worker submitted
         run: |
-          set +e
 
           echo "========================================"
-          echo "KAGGLE WORKER STARTED"
+
+          echo "KAGGLE GPU WORKER SUBMITTED"
+
           echo "========================================"
 
-          echo "SESSION_ID: $SESSION_ID"
-          echo "KAGGLE KERNEL:"
+          echo "SESSION: $SESSION_ID"
+
+          echo "KERNEL:"
+
           echo "${KAGGLE_USERNAME}/gpu-session-${SESSION_ID}"
 
           echo ""
-          echo "Kaggle GPU worker has been submitted."
-          echo "The worker itself maintains the Railway session."
 
-          exit 0
+          echo "Kaggle now has the injected SESSION_ID,"
+          echo "API_URL and WORKER_TOKEN."
