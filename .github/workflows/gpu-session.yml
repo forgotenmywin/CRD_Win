@@ -4,462 +4,113 @@ on:
   workflow_dispatch:
 
 jobs:
-  gpu-run:
+  gpu:
     runs-on: ubuntu-latest
 
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-      KERNEL_SLUG: gpu-command-runner
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # ==========================================================
-      # 1. INSTALL KAGGLE
-      # ==========================================================
-
-      - name: Install Kaggle CLI
+      - name: Install Kaggle
         run: |
-          python -m pip install --upgrade pip
-          pip install --upgrade kaggle
+          pip install -U kaggle
 
-          echo "========================================"
-          echo "KAGGLE CLI"
-          echo "========================================"
-
-          kaggle --version
-
-      # ==========================================================
-      # 2. CHECK AUTH
-      # ==========================================================
-
-      - name: Check Authentication
+      - name: Create Kaggle files
         run: |
-          echo "========================================"
-          echo "AUTHENTICATION"
-          echo "========================================"
+          mkdir -p kaggle-gpu-test
 
-          if [ -z "$KAGGLE_USERNAME" ]; then
-            echo "ERROR: KAGGLE_USERNAME is empty"
-            exit 1
-          fi
-
-          if [ -z "$KAGGLE_API_TOKEN" ]; then
-            echo "ERROR: KAGGLE_API_TOKEN is empty"
-            exit 1
-          fi
-
-          echo "Username:"
-          echo "$KAGGLE_USERNAME"
-
-          echo ""
-          echo "Token length:"
-          echo "${#KAGGLE_API_TOKEN}"
-
-      # ==========================================================
-      # 3. LIST EXISTING KERNELS
-      # ==========================================================
-
-      - name: Find Existing Kernel
-        run: |
-          echo "========================================"
-          echo "MY KAGGLE KERNELS"
-          echo "========================================"
-
-          kaggle kernels list \
-            --mine \
-            --page-size 100
-
-      # ==========================================================
-      # 4. CHECK TARGET KERNEL
-      # ==========================================================
-
-      - name: Check GPU Kernel
-        run: |
-          echo "========================================"
-          echo "TARGET KERNEL"
-          echo "========================================"
-
-          KERNEL="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
-
-          echo "Kernel:"
-          echo "$KERNEL"
-
-          echo ""
-          echo "STATUS:"
-          
-          set +e
-
-          kaggle kernels status "$KERNEL"
-
-          CODE=$?
-
-          set -e
-
-          echo ""
-          echo "Status return code:"
-          echo "$CODE"
-
-          if [ "$CODE" -ne 0 ]; then
-            echo ""
-            echo "========================================"
-            echo "KERNEL DOES NOT EXIST OR IS NOT ACCESSIBLE"
-            echo "========================================"
-
-            echo ""
-            echo "Create the kernel ONCE manually on Kaggle"
-            echo "with the slug:"
-            echo "$KERNEL_SLUG"
-
-            exit 1
-          fi
-
-      # ==========================================================
-      # 5. PULL EXISTING KERNEL
-      # ==========================================================
-
-      - name: Get Existing Kernel
-        run: |
-          echo "========================================"
-          echo "GETTING EXISTING KERNEL"
-          echo "========================================"
-
-          rm -rf kaggle-gpu
-
-          mkdir -p kaggle-gpu
-
-          KERNEL="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
-
-          kaggle kernels get \
-            "$KERNEL" \
-            -p kaggle-gpu \
-            -m
-
-          echo ""
-          echo "========================================"
-          echo "KERNEL FILES"
-          echo "========================================"
-
-          find kaggle-gpu -maxdepth 2 -type f -print
-
-          echo ""
-          echo "========================================"
-          echo "CURRENT METADATA"
-          echo "========================================"
-
-          cat kaggle-gpu/kernel-metadata.json
-
-      # ==========================================================
-      # 6. CREATE COMMANDS
-      # ==========================================================
-
-      - name: Create Commands File
-        run: |
-          echo "========================================"
-          echo "CREATING COMMANDS"
-          echo "========================================"
-
-          cat > kaggle-gpu/commands.txt <<'EOF'
-          cat /etc/os-release
+          cat > kaggle-gpu-test/commands.txt <<'EOF'
           nvidia-smi -L
           nvidia-smi
-          apt-get update
-          apt-get install -y pciutils
+          cat /etc/os-release
           lspci --version
           lspci | grep -i vga
           lspci | grep -i nvidia
           EOF
 
-          echo ""
-          echo "COMMANDS:"
-          cat kaggle-gpu/commands.txt
-
-      # ==========================================================
-      # 7. CREATE GPU WORKER
-      # ==========================================================
-
-      - name: Create GPU Worker
-        run: |
-          echo "========================================"
-          echo "CREATING GPU WORKER"
-          echo "========================================"
-
-          cat > kaggle-gpu/gpu_worker.py <<'PY'
-          import os
+          cat > kaggle-gpu-test/gpu_worker.py <<'PY'
           import subprocess
-          import sys
-          import time
+          from pathlib import Path
 
-          print("=" * 80)
-          print("KAGGLE GPU COMMAND RUNNER")
-          print("=" * 80)
+          commands = Path("/kaggle/src/commands.txt")
 
-          print()
-          print("Python:")
-          print(sys.version)
+          for command in commands.read_text().splitlines():
+              command = command.strip()
 
-          print()
-          print("Working directory:")
-          print(os.getcwd())
+              if not command or command.startswith("#"):
+                  continue
 
-          print()
-
-          COMMAND_FILE = "commands.txt"
-
-          if not os.path.exists(COMMAND_FILE):
-              print("ERROR: commands.txt NOT FOUND")
-              sys.exit(1)
-
-          with open(COMMAND_FILE, "r", encoding="utf-8") as f:
-              commands = []
-
-              for line in f:
-                  line = line.strip()
-
-                  if not line:
-                      continue
-
-                  if line.startswith("#"):
-                      continue
-
-                  commands.append(line)
-
-          print("Commands loaded:", len(commands))
-          print()
-
-          for number, command in enumerate(commands, 1):
-
-              print()
-              print("#" * 80)
-              print(f"# COMMAND {number} / {len(commands)}")
-              print("#" * 80)
-
-              print()
+              print("=" * 80)
               print("$", command)
+              print("=" * 80)
 
-              print()
+              p = subprocess.run(
+                  command,
+                  shell=True,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT
+              )
 
-              try:
+              print(p.stdout)
+              print("Return code:", p.returncode)
 
-                  process = subprocess.run(
-                      command,
-                      shell=True,
-                      text=True,
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.STDOUT,
-                      timeout=600
-                  )
-
-                  if process.stdout:
-                      print(process.stdout)
-
-                  print()
-                  print("Return code:", process.returncode)
-
-              except subprocess.TimeoutExpired:
-
-                  print()
-                  print("COMMAND TIMEOUT")
-
-              except Exception as e:
-
-                  print()
-                  print("COMMAND ERROR:")
-                  print(repr(e))
-
-          print()
           print("=" * 80)
-          print("ALL COMMANDS FINISHED")
+          print("GPU TEST FINISHED")
           print("=" * 80)
           PY
 
-      # ==========================================================
-      # 8. FIX METADATA
-      # ==========================================================
-
-      - name: Fix Kernel Metadata
-        run: |
-          echo "========================================"
-          echo "KERNEL METADATA"
-          echo "========================================"
-
-          cat > kaggle-gpu/kernel-metadata.json <<EOF
+          cat > kaggle-gpu-test/kernel-metadata.json <<EOF
           {
-            "id": "${KAGGLE_USERNAME}/${KERNEL_SLUG}",
+            "id": "${KAGGLE_USERNAME}/gpu-command-runner",
             "title": "gpu-command-runner",
             "code_file": "gpu_worker.py",
             "language": "python",
             "kernel_type": "script",
             "is_private": true,
             "enable_gpu": true,
-            "enable_internet": true,
-            "machine_shape": "NvidiaTeslaP100"
+            "enable_internet": true
           }
           EOF
 
-          echo ""
-          cat kaggle-gpu/kernel-metadata.json
-
-      # ==========================================================
-      # 9. UPDATE EXISTING KERNEL
-      # ==========================================================
-
-      - name: Update GPU Kernel
+      - name: Show metadata
         run: |
-          echo "========================================"
-          echo "UPDATING GPU KERNEL"
-          echo "========================================"
+          cat kaggle-gpu-test/kernel-metadata.json
+          echo "================ COMMANDS ================"
+          cat kaggle-gpu-test/commands.txt
 
-          KERNEL="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
-
-          echo ""
-          echo "Kernel:"
-          echo "$KERNEL"
-
-          echo ""
-
-          set +e
-
-          kaggle kernels update \
-            -p kaggle-gpu
-
-          CODE=$?
-
-          set -e
-
-          echo ""
-          echo "Update return code:"
-          echo "$CODE"
-
-          if [ "$CODE" -ne 0 ]; then
-            echo ""
-            echo "========================================"
-            echo "UPDATE FAILED"
-            echo "========================================"
-
-            exit "$CODE"
-          fi
-
-          echo ""
-          echo "========================================"
-          echo "UPDATE SUCCESS"
-          echo "========================================"
-
-      # ==========================================================
-      # 10. WAIT FOR KERNEL
-      # ==========================================================
-
-      - name: Wait For Kernel
+      - name: Push to Kaggle
         run: |
-          echo "========================================"
-          echo "WAITING FOR KAGGLE"
-          echo "========================================"
+          kaggle kernels push -p kaggle-gpu-test
 
-          KERNEL="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+      - name: Wait
+        run: |
+          KERNEL="${KAGGLE_USERNAME}/gpu-command-runner"
 
           for i in $(seq 1 30); do
+            echo "CHECK $i / 30"
 
-            echo ""
-            echo "STATUS CHECK $i / 30"
-
-            set +e
-
-            STATUS=$(kaggle kernels status "$KERNEL" 2>&1)
-
-            CODE=$?
-
-            set -e
+            STATUS=$(kaggle kernels status "$KERNEL" 2>&1 || true)
 
             echo "$STATUS"
 
-            if echo "$STATUS" | grep -qi "complete"; then
-              echo ""
-              echo "KERNEL COMPLETE"
-              exit 0
-            fi
-
-            if echo "$STATUS" | grep -qi "error"; then
-              echo ""
-              echo "KERNEL ERROR"
-              exit 1
+            if echo "$STATUS" | grep -qi "COMPLETE"; then
+              break
             fi
 
             sleep 10
-
           done
 
-          echo ""
-          echo "TIMEOUT WAITING FOR KAGGLE"
-
-      # ==========================================================
-      # 11. DOWNLOAD OUTPUT
-      # ==========================================================
-
-      - name: Download Output
-        if: always()
+      - name: Get output
         run: |
-          echo "========================================"
-          echo "DOWNLOADING OUTPUT"
-          echo "========================================"
-
-          rm -rf result
-
-          mkdir -p result
-
-          KERNEL="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
-
-          set +e
+          mkdir -p output
 
           kaggle kernels output \
-            "$KERNEL" \
-            -p result \
-            -o
+            "${KAGGLE_USERNAME}/gpu-command-runner" \
+            -p output || true
 
-          CODE=$?
-
-          set -e
-
-          echo ""
-          echo "Download return code:"
-          echo "$CODE"
-
-          echo ""
-          echo "========================================"
-          echo "RESULT FILES"
-          echo "========================================"
-
-          find result -type f -print 2>/dev/null || true
-
-      # ==========================================================
-      # 12. SHOW RESULT
-      # ==========================================================
-
-      - name: Show Result
-        if: always()
-        run: |
-          echo "========================================"
-          echo "FINAL RESULT"
-          echo "========================================"
-
-          if [ -d result ]; then
-            find result -type f -maxdepth 2 -print 2>/dev/null || true
-
-            echo ""
-
-            for file in result/*; do
-              if [ -f "$file" ]; then
-                echo "========================================"
-                echo "FILE: $file"
-                echo "========================================"
-
-                cat "$file" 2>/dev/null || true
-
-                echo ""
-              fi
-            done
-          fi
-
-          echo ""
-          echo "========================================"
-          echo "FINISHED"
-          echo "========================================"
+          find output -type f -print || true
