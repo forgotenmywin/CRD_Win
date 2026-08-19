@@ -1,10 +1,10 @@
-name: Kaggle Permission Test
+name: Kaggle GPU Command Runner
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  gpu-run:
     runs-on: ubuntu-latest
 
     env:
@@ -13,7 +13,11 @@ jobs:
 
     steps:
 
-      - name: Install Kaggle
+      # ============================================================
+      # INSTALL
+      # ============================================================
+
+      - name: Install Kaggle CLI
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade kaggle
@@ -24,155 +28,347 @@ jobs:
 
           kaggle --version
 
-      - name: Check Secrets
+      # ============================================================
+      # CHECK AUTH
+      # ============================================================
+
+      - name: Check Kaggle Authentication
         run: |
           echo "========================================"
-          echo "CHECK SECRETS"
+          echo "KAGGLE AUTH"
           echo "========================================"
+
+          if [ -z "$KAGGLE_USERNAME" ]; then
+            echo "ERROR: KAGGLE_USERNAME is empty"
+            exit 1
+          fi
+
+          if [ -z "$KAGGLE_API_TOKEN" ]; then
+            echo "ERROR: KAGGLE_API_TOKEN is empty"
+            exit 1
+          fi
 
           echo "Username:"
           echo "$KAGGLE_USERNAME"
-
-          echo ""
-          echo "Username length:"
-          echo "${#KAGGLE_USERNAME}"
 
           echo ""
           echo "Token length:"
           echo "${#KAGGLE_API_TOKEN}"
 
-          if [ -z "$KAGGLE_USERNAME" ]; then
-            echo "ERROR: KAGGLE_USERNAME EMPTY"
-            exit 1
-          fi
+      # ============================================================
+      # CREATE KERNEL DIRECTORY
+      # ============================================================
 
-          if [ -z "$KAGGLE_API_TOKEN" ]; then
-            echo "ERROR: KAGGLE_API_TOKEN EMPTY"
-            exit 1
-          fi
-
-          echo ""
-          echo "Secrets OK."
-
-      - name: Test Kaggle API
+      - name: Create GPU Kernel
         run: |
           echo "========================================"
-          echo "TEST 1 - KAGGLE API"
+          echo "CREATING KAGGLE GPU KERNEL"
           echo "========================================"
 
-          set +e
+          rm -rf kaggle-gpu
 
-          kaggle kernels list \
-            --mine \
-            --page-size 5
+          mkdir -p kaggle-gpu
 
-          CODE=$?
+          cat > kaggle-gpu/gpu_worker.py <<'PY'
+          import os
+          import subprocess
+          import sys
+          import time
 
-          set -e
+          print("=" * 80)
+          print("KAGGLE GPU COMMAND RUNNER")
+          print("=" * 80)
 
-          echo ""
-          echo "Return code: $CODE"
+          print()
+          print("Python:")
+          print(sys.version)
 
-          if [ "$CODE" -ne 0 ]; then
-            echo ""
-            echo "Kaggle API test FAILED."
-            exit "$CODE"
-          fi
+          print()
+          print("Working directory:")
+          print(os.getcwd())
 
-          echo ""
-          echo "Kaggle API test SUCCESS."
+          print()
 
-      - name: Create Test Kernel
-        run: |
-          echo "========================================"
-          echo "TEST 2 - CREATE KERNEL"
-          echo "========================================"
+          commands_file = "commands.txt"
 
-          rm -rf test-kernel
+          if not os.path.exists(commands_file):
+              print("ERROR: commands.txt not found")
+              sys.exit(1)
 
-          mkdir test-kernel
+          with open(commands_file, "r", encoding="utf-8") as f:
+              commands = [
+                  line.strip()
+                  for line in f
+                  if line.strip()
+                  and not line.strip().startswith("#")
+              ]
 
-          SLUG="permission-test-${GITHUB_RUN_ID}"
+          print("Commands loaded:", len(commands))
+          print()
 
-          echo "SLUG=$SLUG" >> "$GITHUB_ENV"
+          for index, command in enumerate(commands, 1):
 
-          cat > test-kernel/test.py <<'PY'
-          print("=" * 60)
-          print("KAGGLE API TEST KERNEL")
-          print("=" * 60)
-          print("Kernel creation worked.")
+              print("=" * 80)
+              print(f"COMMAND {index} / {len(commands)}")
+              print("=" * 80)
+
+              print("$", command)
+              print()
+
+              try:
+                  result = subprocess.run(
+                      command,
+                      shell=True,
+                      text=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      timeout=600
+                  )
+
+                  if result.stdout:
+                      print(result.stdout)
+
+                  print()
+                  print("Return code:", result.returncode)
+
+              except subprocess.TimeoutExpired:
+                  print("COMMAND TIMEOUT")
+
+              except Exception as e:
+                  print("COMMAND ERROR:")
+                  print(repr(e))
+
+              print()
+
+          print("=" * 80)
+          print("ALL COMMANDS FINISHED")
+          print("=" * 80)
           PY
 
-          cat > test-kernel/kernel-metadata.json <<EOF
+          # --------------------------------------------------------
+          # commands.txt
+          # --------------------------------------------------------
+
+          cat > kaggle-gpu/commands.txt <<'EOF'
+          cat /etc/os-release
+          nvidia-smi -L
+          nvidia-smi
+          apt-get update
+          apt-get install -y pciutils
+          lspci --version
+          lspci | grep -i vga
+          lspci | grep -i nvidia
+          EOF
+
+          # --------------------------------------------------------
+          # KERNEL SLUG
+          # --------------------------------------------------------
+
+          KERNEL_SLUG="gpu-command-runner"
+
+          echo "KERNEL_SLUG=$KERNEL_SLUG" >> "$GITHUB_ENV"
+
+          # --------------------------------------------------------
+          # METADATA
+          # --------------------------------------------------------
+
+          cat > kaggle-gpu/kernel-metadata.json <<EOF
           {
-            "id": "${KAGGLE_USERNAME}/${SLUG}",
-            "title": "${SLUG}",
-            "code_file": "test.py",
+            "id": "${KAGGLE_USERNAME}/${KERNEL_SLUG}",
+            "title": "gpu-command-runner",
+            "code_file": "gpu_worker.py",
             "language": "python",
             "kernel_type": "script",
-            "is_private": false,
-            "enable_gpu": false
+            "is_private": true,
+            "enable_gpu": true,
+            "enable_internet": true
           }
           EOF
 
           echo ""
-          echo "Files:"
-          find test-kernel -type f -maxdepth 1 -print
+          echo "========================================"
+          echo "FILES"
+          echo "========================================"
+
+          find kaggle-gpu -maxdepth 1 -type f -print
 
           echo ""
-          echo "Metadata:"
-          cat test-kernel/kernel-metadata.json
+          echo "========================================"
+          echo "METADATA"
+          echo "========================================"
 
-      - name: Push Test Kernel
+          cat kaggle-gpu/kernel-metadata.json
+
+          echo ""
+          echo "========================================"
+          echo "COMMANDS"
+          echo "========================================"
+
+          cat kaggle-gpu/commands.txt
+
+      # ============================================================
+      # CHECK EXISTING KERNEL
+      # ============================================================
+
+      - name: Check Existing Kernel
         run: |
           echo "========================================"
-          echo "TEST 3 - SAVE KERNEL"
+          echo "CHECKING EXISTING KERNEL"
           echo "========================================"
-
-          echo ""
-          echo "Kernel:"
-          echo "${KAGGLE_USERNAME}/${SLUG}"
-
-          echo ""
 
           set +e
 
-          kaggle kernels push \
-            -p test-kernel
+          kaggle kernels status \
+            "${KAGGLE_USERNAME}/${KERNEL_SLUG}"
 
           CODE=$?
 
           set -e
 
           echo ""
-          echo "SaveKernel return code: $CODE"
+          echo "Status return code: $CODE"
+
+      # ============================================================
+      # UPDATE / CREATE
+      # ============================================================
+
+      - name: Upload GPU Kernel
+        run: |
+          echo "========================================"
+          echo "UPLOADING GPU KERNEL"
+          echo "========================================"
+
+          echo ""
+          echo "Kernel:"
+          echo "${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+
+          echo ""
+
+          set +e
+
+          kaggle kernels update \
+            -p kaggle-gpu
+
+          CODE=$?
+
+          set -e
+
+          echo ""
+          echo "Update return code: $CODE"
 
           if [ "$CODE" -ne 0 ]; then
+
             echo ""
             echo "========================================"
-            echo "SAVE KERNEL FAILED"
+            echo "KERNEL UPLOAD FAILED"
             echo "========================================"
+
+            echo ""
+            echo "The error above is the actual Kaggle API response."
 
             exit "$CODE"
           fi
 
           echo ""
           echo "========================================"
-          echo "SAVE KERNEL SUCCESS"
+          echo "KERNEL UPLOAD SUCCESS"
           echo "========================================"
 
-      - name: Finished
+      # ============================================================
+      # WAIT
+      # ============================================================
+
+      - name: Wait For GPU
+        run: |
+          echo "========================================"
+          echo "WAITING FOR KAGGLE"
+          echo "========================================"
+
+          for i in $(seq 1 30); do
+
+            echo ""
+            echo "STATUS CHECK $i / 30"
+
+            set +e
+
+            OUTPUT=$(kaggle kernels status \
+              "${KAGGLE_USERNAME}/${KERNEL_SLUG}" 2>&1)
+
+            CODE=$?
+
+            set -e
+
+            echo "$OUTPUT"
+
+            if echo "$OUTPUT" | grep -qi "complete"; then
+              echo ""
+              echo "KERNEL COMPLETE"
+              break
+            fi
+
+            if echo "$OUTPUT" | grep -qi "error"; then
+              echo ""
+              echo "KERNEL ERROR"
+              break
+            fi
+
+            sleep 10
+
+          done
+
+      # ============================================================
+      # DOWNLOAD OUTPUT
+      # ============================================================
+
+      - name: Download Result
+        if: always()
+        run: |
+          echo "========================================"
+          echo "DOWNLOADING RESULT"
+          echo "========================================"
+
+          mkdir -p result
+
+          set +e
+
+          kaggle kernels output \
+            "${KAGGLE_USERNAME}/${KERNEL_SLUG}" \
+            -p result \
+            -o
+
+          CODE=$?
+
+          set -e
+
+          echo ""
+          echo "Download return code: $CODE"
+
+          echo ""
+          echo "========================================"
+          echo "OUTPUT FILES"
+          echo "========================================"
+
+          find result -type f -maxdepth 2 -print 2>/dev/null || true
+
+      # ============================================================
+      # FINAL
+      # ============================================================
+
+      - name: Final
         if: always()
         run: |
           echo ""
-          echo "========================================"
-          echo "TEST FINISHED"
-          echo "========================================"
-
-          echo ""
-          echo "Username:"
-          echo "$KAGGLE_USERNAME"
+          echo "############################################################"
+          echo "#                  KAGGLE GPU FINISHED                     #"
+          echo "############################################################"
 
           echo ""
           echo "Kernel:"
-          echo "${KAGGLE_USERNAME}/${SLUG:-not-created}"
+          echo "${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+
+          echo ""
+          echo "Commands:"
+          cat kaggle-gpu/commands.txt
+
+          echo ""
+          echo "############################################################"
