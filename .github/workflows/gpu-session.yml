@@ -1,10 +1,10 @@
-name: Kaggle GPU Command Runner
+name: Kaggle GPU One Time Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  gpu:
+  gpu-test:
     runs-on: ubuntu-latest
 
     env:
@@ -12,21 +12,26 @@ jobs:
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Kaggle
         run: |
           pip install -U kaggle
+          kaggle --version
 
-      - name: Create Kaggle files
+      - name: Create GPU Kernel
         run: |
-          mkdir -p kaggle-gpu-test
+          rm -rf kaggle-gpu-test
+          mkdir kaggle-gpu-test
 
           cat > kaggle-gpu-test/commands.txt <<'EOF'
           nvidia-smi -L
           nvidia-smi
           cat /etc/os-release
+          apt-get update
+          apt-get install -y pciutils
           lspci --version
           lspci | grep -i vga
           lspci | grep -i nvidia
@@ -36,29 +41,53 @@ jobs:
           import subprocess
           from pathlib import Path
 
-          commands = Path("/kaggle/src/commands.txt")
+          commands_file = Path("/kaggle/src/commands.txt")
+          result_file = Path("/kaggle/working/result.txt")
 
-          for command in commands.read_text().splitlines():
-              command = command.strip()
+          print("=" * 80)
+          print("KAGGLE GPU TEST")
+          print("=" * 80)
 
-              if not command or command.startswith("#"):
-                  continue
+          with result_file.open("w") as result:
 
-              print("=" * 80)
-              print("$", command)
-              print("=" * 80)
+              for number, line in enumerate(
+                  commands_file.read_text().splitlines(), 1
+              ):
 
-              p = subprocess.run(
-                  command,
-                  shell=True,
-                  text=True,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT
-              )
+                  command = line.strip()
 
-              print(p.stdout)
-              print("Return code:", p.returncode)
+                  if not command:
+                      continue
 
+                  print()
+                  print("=" * 80)
+                  print(f"COMMAND {number}")
+                  print("$", command)
+                  print("=" * 80)
+
+                  process = subprocess.run(
+                      command,
+                      shell=True,
+                      text=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT
+                  )
+
+                  output = process.stdout or ""
+
+                  print(output)
+                  print("Return code:", process.returncode)
+
+                  result.write(
+                      f"\n{'=' * 80}\n"
+                      f"COMMAND {number}\n"
+                      f"$ {command}\n"
+                      f"{'=' * 80}\n"
+                      f"{output}\n"
+                      f"Return code: {process.returncode}\n"
+                  )
+
+          print()
           print("=" * 80)
           print("GPU TEST FINISHED")
           print("=" * 80)
@@ -77,35 +106,63 @@ jobs:
           }
           EOF
 
-      - name: Show metadata
+      - name: Show Kernel
         run: |
-          cat kaggle-gpu-test/kernel-metadata.json
-          echo "================ COMMANDS ================"
-          cat kaggle-gpu-test/commands.txt
+          echo "========================================"
+          echo "KERNEL"
+          echo "========================================"
 
-      - name: Push to Kaggle
+          cat kaggle-gpu-test/kernel-metadata.json
+
+          echo ""
+          echo "========================================"
+          echo "COMMANDS"
+          echo "========================================"
+
+          nl -ba kaggle-gpu-test/commands.txt
+
+      - name: Push Kernel
         run: |
+          echo "========================================"
+          echo "PUSHING ONE GPU KERNEL"
+          echo "========================================"
+
           kaggle kernels push -p kaggle-gpu-test
 
-      - name: Wait
+      - name: Wait for completion
         run: |
           KERNEL="${KAGGLE_USERNAME}/gpu-command-runner"
 
+          echo "========================================"
+          echo "WAITING"
+          echo "========================================"
+
           for i in $(seq 1 30); do
-            echo "CHECK $i / 30"
+
+            echo "STATUS $i / 30"
 
             STATUS=$(kaggle kernels status "$KERNEL" 2>&1 || true)
 
             echo "$STATUS"
 
             if echo "$STATUS" | grep -qi "COMPLETE"; then
-              break
+              echo "DONE"
+              exit 0
+            fi
+
+            if echo "$STATUS" | grep -qi "ERROR"; then
+              echo "KAGGLE KERNEL ERROR"
+              exit 1
             fi
 
             sleep 10
+
           done
 
-      - name: Get output
+          echo "TIMEOUT"
+
+      - name: Download result
+        if: always()
         run: |
           mkdir -p output
 
@@ -113,4 +170,12 @@ jobs:
             "${KAGGLE_USERNAME}/gpu-command-runner" \
             -p output || true
 
+          echo "========================================"
+          echo "OUTPUT"
+          echo "========================================"
+
           find output -type f -print || true
+
+          if [ -f output/result.txt ]; then
+            cat output/result.txt
+          fi
