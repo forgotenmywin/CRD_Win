@@ -29,18 +29,19 @@ jobs:
         run: |
 
           echo "========================================"
-          echo "CHECKING commands.txt"
+          echo "CHECKING COMMANDS"
           echo "========================================"
 
           if [ ! -f commands.txt ]; then
-            echo "ERROR: commands.txt not found!"
+            echo "ERROR: commands.txt does not exist."
             echo ""
+            echo "Repository files:"
             find . -maxdepth 3 -type f -print
             exit 1
           fi
 
           echo ""
-          echo "Commands:"
+          echo "commands.txt:"
           echo "----------------------------------------"
 
           cat commands.txt
@@ -49,41 +50,54 @@ jobs:
 
 
       # =========================================================
-      # 3. Install Kaggle
+      # 3. Install Kaggle CLI
       # =========================================================
 
       - name: Install Kaggle CLI
         run: |
 
           python -m pip install --upgrade pip
+
           pip install --upgrade kaggle
 
           echo ""
+          echo "Kaggle version:"
           kaggle --version
 
 
       # =========================================================
-      # 4. Authentication Check
+      # 4. Check Secrets
       # =========================================================
 
-      - name: Check Kaggle Authentication
+      - name: Check Kaggle Credentials
         run: |
 
-          echo "Kaggle username length: ${#KAGGLE_USERNAME}"
-          echo "Kaggle token length: ${#KAGGLE_API_TOKEN}"
+          echo "========================================"
+          echo "CHECKING KAGGLE CREDENTIALS"
+          echo "========================================"
+
+          echo "Username length:"
+          echo "${#KAGGLE_USERNAME}"
+
+          echo ""
+
+          echo "Token length:"
+          echo "${#KAGGLE_API_TOKEN}"
 
           if [ -z "$KAGGLE_USERNAME" ]; then
-            echo "ERROR: KAGGLE_USERNAME is empty"
+            echo ""
+            echo "ERROR: KAGGLE_USERNAME is empty."
             exit 1
           fi
 
           if [ -z "$KAGGLE_API_TOKEN" ]; then
-            echo "ERROR: KAGGLE_API_TOKEN is empty"
+            echo ""
+            echo "ERROR: KAGGLE_API_TOKEN is empty."
             exit 1
           fi
 
           echo ""
-          echo "Kaggle credentials detected."
+          echo "Credentials exist."
 
 
       # =========================================================
@@ -97,29 +111,45 @@ jobs:
           echo "TESTING KAGGLE API"
           echo "========================================"
 
+          set +e
+
           kaggle kernels list \
             --mine \
-            --page-size 1
+            --page-size 10
+
+          RESULT=$?
+
+          set -e
 
           echo ""
-          echo "Kaggle API OK."
+          echo "API return code: $RESULT"
+
+          if [ "$RESULT" -ne 0 ]; then
+            echo ""
+            echo "ERROR: Kaggle API test failed."
+            exit "$RESULT"
+          fi
+
+          echo ""
+          echo "Kaggle API is working."
 
 
       # =========================================================
-      # 6. Create unique Kernel ID
+      # 6. Create Unique Kernel ID
       # =========================================================
 
       - name: Create Unique Kernel ID
         run: |
 
-          KERNEL_SLUG="gpu-command-runner-${GITHUB_RUN_ID}"
+          echo "========================================"
+          echo "CREATING UNIQUE KERNEL"
+          echo "========================================"
+
+          KERNEL_SLUG="gpu-command-runner-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           echo "KERNEL_SLUG=$KERNEL_SLUG" >> "$GITHUB_ENV"
 
-          echo "========================================"
-          echo "KAGGLE KERNEL"
-          echo "========================================"
-
+          echo ""
           echo "Kernel slug:"
           echo "$KERNEL_SLUG"
 
@@ -135,6 +165,10 @@ jobs:
       - name: Create GPU Worker
         run: |
 
+          echo "========================================"
+          echo "CREATING GPU WORKER"
+          echo "========================================"
+
           rm -rf kaggle-gpu-test
 
           mkdir -p kaggle-gpu-test
@@ -142,6 +176,11 @@ jobs:
           python3 <<'PY'
 
           from pathlib import Path
+
+
+          # =====================================================
+          # Read commands.txt
+          # =====================================================
 
           commands = Path(
               "commands.txt"
@@ -151,7 +190,7 @@ jobs:
 
 
           # =====================================================
-          # Worker
+          # Worker source
           # =====================================================
 
           worker = r'''
@@ -165,7 +204,7 @@ jobs:
 
 
           # =====================================================
-          # Open result file
+          # Result file
           # =====================================================
 
           result_file = open(
@@ -177,12 +216,15 @@ jobs:
 
 
           # =====================================================
-          # Output function
+          # Output
           # =====================================================
 
           def output(text=""):
 
-              print(text, flush=True)
+              print(
+                  text,
+                  flush=True
+              )
 
               result_file.write(
                   str(text) + "\n"
@@ -206,14 +248,32 @@ jobs:
 
           output()
 
-          output("Current directory:")
+          output("Working directory:")
           output(os.getcwd())
 
           output()
 
+          output("User:")
+
+          try:
+
+              output(
+                  subprocess.check_output(
+                      "whoami",
+                      shell=True,
+                      text=True
+                  ).strip()
+              )
+
+          except Exception:
+
+              output(
+                  "unknown"
+              )
+
 
           # =====================================================
-          # Commands from GitHub
+          # Commands
           # =====================================================
 
           COMMANDS_TEXT = """COMMANDS_PLACEHOLDER"""
@@ -235,9 +295,12 @@ jobs:
               if line.startswith("#"):
                   continue
 
-              commands.append(line)
+              commands.append(
+                  line
+              )
 
 
+          output()
           output("=" * 80)
           output("COMMANDS LOADED")
           output("=" * 80)
@@ -249,7 +312,7 @@ jobs:
 
 
           # =====================================================
-          # Run command
+          # Execute command
           # =====================================================
 
           def run_command(command):
@@ -328,7 +391,9 @@ jobs:
 
                   output("#" * 80)
 
-                  run_command(command)
+                  run_command(
+                      command
+                  )
 
 
           # =====================================================
@@ -339,6 +404,7 @@ jobs:
           output("=" * 80)
           output("ALL COMMANDS FINISHED")
           output("=" * 80)
+
 
           result_file.close()
 
@@ -359,6 +425,7 @@ jobs:
               '\\"\\"\\"'
           )
 
+
           worker = worker.replace(
               "COMMANDS_PLACEHOLDER",
               commands
@@ -366,7 +433,7 @@ jobs:
 
 
           # =====================================================
-          # Save worker
+          # Write worker
           # =====================================================
 
           Path(
@@ -385,19 +452,28 @@ jobs:
 
 
           echo ""
-          echo "========================================"
-          echo "WORKER CREATED"
-          echo "========================================"
+          echo "Worker files:"
+          find kaggle-gpu-test \
+            -maxdepth 2 \
+            -type f \
+            -print
 
-          ls -lh kaggle-gpu-test/
+          echo ""
+          echo "Worker size:"
+          wc -c \
+            kaggle-gpu-test/gpu_worker.py
 
 
       # =========================================================
-      # 8. Create Kaggle Metadata
+      # 8. Create Metadata
       # =========================================================
 
       - name: Create Kaggle Metadata
         run: |
+
+          echo "========================================"
+          echo "CREATING KAGGLE METADATA"
+          echo "========================================"
 
           cat > kaggle-gpu-test/kernel-metadata.json <<EOF
           {
@@ -411,34 +487,108 @@ jobs:
           }
           EOF
 
-          echo "========================================"
-          echo "KAGGLE METADATA"
-          echo "========================================"
-
+          echo ""
+          echo "Metadata:"
           cat kaggle-gpu-test/kernel-metadata.json
 
 
       # =========================================================
-      # 9. Push Kernel
+      # 9. Debug Kaggle Account
+      # =========================================================
+
+      - name: Debug Kaggle Account
+        run: |
+
+          echo "========================================"
+          echo "KAGGLE ACCOUNT DEBUG"
+          echo "========================================"
+
+          echo ""
+          echo "Username:"
+          echo "$KAGGLE_USERNAME"
+
+          echo ""
+          echo "Kernel:"
+          echo "${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+
+          echo ""
+          echo "Kaggle CLI:"
+          kaggle --version
+
+          echo ""
+          echo "Existing kernels:"
+          
+          set +e
+
+          kaggle kernels list \
+            --mine \
+            --page-size 10
+
+          LIST_RESULT=$?
+
+          set -e
+
+          echo ""
+          echo "List return code:"
+          echo "$LIST_RESULT"
+
+
+      # =========================================================
+      # 10. Push Kernel
       # =========================================================
 
       - name: Push GPU Kernel
         run: |
 
-          echo ""
           echo "========================================"
           echo "PUSHING GPU KERNEL"
           echo "========================================"
 
+          echo ""
           echo "Kernel:"
           echo "${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+
+          echo ""
+          echo "Metadata:"
+          cat kaggle-gpu-test/kernel-metadata.json
+
+          echo ""
+
+          set +e
 
           kaggle kernels push \
             -p kaggle-gpu-test
 
+          PUSH_RESULT=$?
+
+          set -e
+
+          echo ""
+          echo "Push return code:"
+          echo "$PUSH_RESULT"
+
+          if [ "$PUSH_RESULT" -ne 0 ]; then
+
+            echo ""
+            echo "========================================"
+            echo "KAGGLE PUSH FAILED"
+            echo "========================================"
+
+            echo ""
+            echo "Possible causes:"
+            echo "1. Kaggle account permission"
+            echo "2. GPU quota unavailable"
+            echo "3. Invalid kernel metadata"
+            echo "4. API token permissions"
+            echo "5. Kaggle kernel creation restriction"
+
+            exit "$PUSH_RESULT"
+
+          fi
+
 
       # =========================================================
-      # 10. Wait for Kernel
+      # 11. Wait for Kernel
       # =========================================================
 
       - name: Wait for Kaggle
@@ -446,43 +596,58 @@ jobs:
 
           KERNEL="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
 
-          echo ""
           echo "========================================"
           echo "WAITING FOR KAGGLE"
           echo "========================================"
 
+          echo ""
           echo "Kernel:"
           echo "$KERNEL"
 
 
-          for i in {1..30}
+          FINISHED=false
+
+
+          for i in {1..40}
           do
 
             echo ""
             echo "========================================"
-            echo "STATUS CHECK $i / 30"
+            echo "STATUS CHECK $i / 40"
             echo "========================================"
+
+
+            set +e
 
             STATUS="$(
               kaggle kernels status \
                 "$KERNEL" \
-                2>&1 || true
+                2>&1
             )"
+
+            STATUS_RESULT=$?
+
+            set -e
+
 
             echo "$STATUS"
 
+            echo ""
+            echo "Status command return code:"
+            echo "$STATUS_RESULT"
+
 
             # ---------------------------------------------------
-            # Complete
+            # COMPLETE
             # ---------------------------------------------------
 
             if echo "$STATUS" | grep -qi "COMPLETE"
             then
 
               echo ""
-              echo "========================================"
-              echo "KAGGLE KERNEL COMPLETE"
-              echo "========================================"
+              echo "Kaggle Kernel completed."
+
+              FINISHED=true
 
               break
 
@@ -490,14 +655,16 @@ jobs:
 
 
             # ---------------------------------------------------
-            # Error
+            # ERROR
             # ---------------------------------------------------
 
             if echo "$STATUS" | grep -qi "ERROR"
             then
 
               echo ""
-              echo "Kaggle kernel reported ERROR."
+              echo "Kaggle Kernel reported ERROR."
+
+              FINISHED=true
 
               break
 
@@ -505,16 +672,38 @@ jobs:
 
 
             # ---------------------------------------------------
-            # Cancelled
+            # CANCEL
             # ---------------------------------------------------
 
             if echo "$STATUS" | grep -qi "CANCEL"
             then
 
               echo ""
-              echo "Kaggle kernel was cancelled."
+              echo "Kaggle Kernel cancelled."
+
+              FINISHED=true
 
               break
+
+            fi
+
+
+            # ---------------------------------------------------
+            # Permission problem
+            # ---------------------------------------------------
+
+            if echo "$STATUS" | grep -qi "Permission"
+            then
+
+              echo ""
+              echo "WARNING:"
+              echo "Kaggle status API returned a permission error."
+
+              echo ""
+              echo "The Kernel may still be running."
+
+              echo ""
+              echo "Continuing to wait..."
 
             fi
 
@@ -524,11 +713,18 @@ jobs:
           done
 
 
+          echo ""
+          echo "========================================"
+          echo "WAIT FINISHED"
+          echo "========================================"
+
+
       # =========================================================
-      # 11. Download Output
+      # 12. Download Output
       # =========================================================
 
       - name: Download Kaggle Output
+        if: always()
         run: |
 
           KERNEL="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
@@ -537,35 +733,44 @@ jobs:
 
           mkdir -p kaggle-output
 
-          echo ""
           echo "========================================"
           echo "DOWNLOADING KAGGLE OUTPUT"
           echo "========================================"
 
+          echo ""
           echo "Kernel:"
           echo "$KERNEL"
 
 
+          set +e
+
           kaggle kernels output \
             "$KERNEL" \
-            -p kaggle-output || true
+            -p kaggle-output
+
+          OUTPUT_RESULT=$?
+
+          set -e
 
 
           echo ""
-          echo "========================================"
-          echo "DOWNLOADED FILES"
-          echo "========================================"
+          echo "Output command return code:"
+          echo "$OUTPUT_RESULT"
 
+
+          echo ""
+          echo "Downloaded files:"
           find kaggle-output \
             -type f \
             -print
 
 
       # =========================================================
-      # 12. Display Result
+      # 13. Display Result
       # =========================================================
 
       - name: Display Command Results
+        if: always()
         run: |
 
           echo ""
@@ -586,25 +791,19 @@ jobs:
 
             cat "$RESULT"
 
-
           else
 
             echo ""
             echo "WARNING: result.txt was not found."
 
             echo ""
-            echo "All downloaded files:"
-            echo "----------------------------------------"
-
+            echo "Files received from Kaggle:"
             find kaggle-output \
               -type f \
               -print
 
-
             echo ""
-            echo "Trying to display all output files:"
-            echo "----------------------------------------"
-
+            echo "Trying all output files:"
 
             find kaggle-output \
               -type f \
@@ -624,7 +823,7 @@ jobs:
 
 
       # =========================================================
-      # 13. Upload result as GitHub artifact
+      # 14. Upload Result
       # =========================================================
 
       - name: Upload Kaggle Result
