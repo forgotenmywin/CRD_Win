@@ -121,6 +121,18 @@ jobs:
 
           nl -ba kaggle-gpu-test/commands.txt
 
+      - name: Pull Existing Kernel
+        run: |
+          echo "========================================"
+          echo "PULLING EXISTING KERNEL (if any)"
+          echo "========================================"
+
+          kaggle kernels pull \
+            "${KAGGLE_USERNAME}/gpu-command-runner" \
+            -p kaggle-gpu-test --metadata 2>/dev/null \
+            && echo "Pulled existing kernel metadata" \
+            || echo "No existing kernel found — will create new"
+
       - name: Push Kernel
         run: |
           echo "========================================"
