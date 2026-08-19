@@ -10,6 +10,7 @@ jobs:
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      KERNEL_SLUG: gpu-runner-${{ github.run_number }}
 
     steps:
 
@@ -95,8 +96,8 @@ jobs:
 
           cat > kaggle-gpu-test/kernel-metadata.json <<EOF
           {
-            "id": "${KAGGLE_USERNAME}/gpu-command-runner",
-            "title": "gpu-command-runner",
+            "id": "${KAGGLE_USERNAME}/${KERNEL_SLUG}",
+            "title": "${KERNEL_SLUG}",
             "code_file": "gpu_worker.py",
             "language": "python",
             "kernel_type": "script",
@@ -109,7 +110,7 @@ jobs:
       - name: Show Kernel
         run: |
           echo "========================================"
-          echo "KERNEL"
+          echo "KERNEL SLUG: ${KERNEL_SLUG}"
           echo "========================================"
 
           cat kaggle-gpu-test/kernel-metadata.json
@@ -121,32 +122,20 @@ jobs:
 
           nl -ba kaggle-gpu-test/commands.txt
 
-      - name: Pull Existing Kernel
-        run: |
-          echo "========================================"
-          echo "PULLING EXISTING KERNEL (if any)"
-          echo "========================================"
-
-          kaggle kernels pull \
-            "${KAGGLE_USERNAME}/gpu-command-runner" \
-            -p kaggle-gpu-test --metadata 2>/dev/null \
-            && echo "Pulled existing kernel metadata" \
-            || echo "No existing kernel found — will create new"
-
       - name: Push Kernel
         run: |
           echo "========================================"
-          echo "PUSHING ONE GPU KERNEL"
+          echo "PUSHING KERNEL: ${KERNEL_SLUG}"
           echo "========================================"
 
           kaggle kernels push -p kaggle-gpu-test
 
       - name: Wait for completion
         run: |
-          KERNEL="${KAGGLE_USERNAME}/gpu-command-runner"
+          KERNEL="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
 
           echo "========================================"
-          echo "WAITING"
+          echo "WAITING FOR: ${KERNEL}"
           echo "========================================"
 
           for i in $(seq 1 30); do
@@ -179,7 +168,7 @@ jobs:
           mkdir -p output
 
           kaggle kernels output \
-            "${KAGGLE_USERNAME}/gpu-command-runner" \
+            "${KAGGLE_USERNAME}/${KERNEL_SLUG}" \
             -p output || true
 
           echo "========================================"
